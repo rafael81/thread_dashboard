@@ -1,0 +1,11 @@
+.DS_Store
+node_modules/
+.memory/
+.data/
+downloads/
+mirror-events.jsonl
+mirror-history.json
+mirror-server.out
+mirror_server.out
+x-scheduled-slots.json
+thread-dashboard-runtime-*.zip

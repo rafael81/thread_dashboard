@@ -1,0 +1,21 @@
+{
+  "name": "thread_dashboard",
+  "version": "1.0.0",
+  "description": "Threads discovery dashboard and Threads-to-X mirror server.",
+  "main": "index.js",
+  "scripts": {
+    "export-runtime": "node scripts/export-runtime-state.js",
+    "import-runtime": "node scripts/import-runtime-state.js",
+    "memory": "node scripts/ai-memory.js",
+    "mirror-server": "node mirror_server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@tursodatabase/database": "^0.6.1",
+    "ws": "^8.21.0"
+  }
+}
