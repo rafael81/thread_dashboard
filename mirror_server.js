@@ -1611,9 +1611,9 @@ async function saveDiscoveryCandidates(candidates) {
       await db.prepare(`
         UPDATE thread_discoveries
         SET author = ?, text_preview = ?, media_preview_url = COALESCE(NULLIF(?, ''), media_preview_url), like_count = ?,
-            media_count = ?, viral_score = ?,
+            media_count = ?, viral_score = ?, status = 'review',
             criteria = ?, discovered_at = CURRENT_TIMESTAMP
-        WHERE canonical_url = ? AND status IN ('review', 'draft', 'queued', 'failed', 'failed_post', 'discovered')
+        WHERE canonical_url = ? AND status IN ('review', 'draft', 'queued', 'failed', 'failed_post', 'failed_draft', 'failed_schedule', 'discovered', 'skipped')
       `).run(candidate.author, candidate.textPreview, candidate.mediaPreviewUrl || "", candidate.likeCount, candidate.mediaCount, candidate.viralScore || 0, candidate.criteria || "", candidate.canonicalUrl);
       updated += 1;
       continue;
@@ -1655,9 +1655,10 @@ async function addDiscoveryPlaceholder(url, options = {}) {
             ELSE text_preview
           END,
           criteria = CASE WHEN criteria = '' THEN ? ELSE criteria END,
+          status = 'review',
           last_error = NULL,
           discovered_at = CURRENT_TIMESTAMP
-      WHERE canonical_url = ? AND status IN ('review', 'draft', 'queued', 'failed', 'failed_post', 'failed_draft', 'failed_schedule', 'discovered')
+      WHERE canonical_url = ? AND status IN ('review', 'draft', 'queued', 'failed', 'failed_post', 'failed_draft', 'failed_schedule', 'discovered', 'skipped')
     `).run(author, textPreview, criteria, canonicalUrl);
     return { canonicalUrl, inserted: 0, updated: 1, skippedCompleted: 0 };
   }
@@ -1678,7 +1679,7 @@ async function markDiscoveryDetailError(canonicalUrl, error) {
   await db.prepare(`
     UPDATE thread_discoveries
     SET last_error = ?, attempts = attempts + 1
-    WHERE canonical_url = ? AND status IN ('review', 'draft', 'queued', 'failed', 'failed_post', 'failed_draft', 'failed_schedule', 'discovered')
+    WHERE canonical_url = ? AND status IN ('review', 'draft', 'queued', 'failed', 'failed_post', 'failed_draft', 'failed_schedule', 'discovered', 'skipped')
   `).run(error.message || String(error), canonicalUrl);
 }
 
