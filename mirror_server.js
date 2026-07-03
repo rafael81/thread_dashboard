@@ -1637,6 +1637,51 @@ async function saveDiscoveryCandidates(candidates) {
   return { inserted, updated, skippedCompleted };
 }
 
+async function addDiscoveryPlaceholder(url, options = {}) {
+  const canonicalUrl = validateThreadsUrl(url);
+  const db = await getDiscoveryDb();
+  const author = new URL(canonicalUrl).pathname.split("/")[1].replace("@", "");
+  const textPreview = String(options.text || "").trim() || "수집 중";
+  const criteria = JSON.stringify({ pendingDetailExtract: true, source: options.origin || "manual" });
+  const existing = await db.prepare(`
+    SELECT canonical_url, status FROM thread_discoveries WHERE canonical_url = ?
+  `).get(canonicalUrl);
+  if (existing) {
+    await db.prepare(`
+      UPDATE thread_discoveries
+      SET author = ?,
+          text_preview = CASE
+            WHEN text_preview = '' OR text_preview = '수집 중' OR text_preview = '(본문 없음)' THEN ?
+            ELSE text_preview
+          END,
+          criteria = CASE WHEN criteria = '' THEN ? ELSE criteria END,
+          last_error = NULL,
+          discovered_at = CURRENT_TIMESTAMP
+      WHERE canonical_url = ? AND status IN ('review', 'draft', 'queued', 'failed', 'failed_post', 'failed_draft', 'failed_schedule', 'discovered')
+    `).run(author, textPreview, criteria, canonicalUrl);
+    return { canonicalUrl, inserted: 0, updated: 1, skippedCompleted: 0 };
+  }
+  if (findCompletedMirror(canonicalUrl)) {
+    return { canonicalUrl, inserted: 0, updated: 0, skippedCompleted: 1 };
+  }
+  await db.prepare(`
+    INSERT INTO thread_discoveries
+      (canonical_url, author, text_preview, media_preview_url, like_count, media_count, viral_score, criteria, status, scheduled_post_at)
+    VALUES (?, ?, ?, '', 0, 0, 0, ?, 'review', NULL)
+  `).run(canonicalUrl, author, textPreview, criteria);
+  logEvent("discovery_placeholder_added", { canonicalUrl, origin: options.origin || null });
+  return { canonicalUrl, inserted: 1, updated: 0, skippedCompleted: 0 };
+}
+
+async function markDiscoveryDetailError(canonicalUrl, error) {
+  const db = await getDiscoveryDb();
+  await db.prepare(`
+    UPDATE thread_discoveries
+    SET last_error = ?, attempts = attempts + 1
+    WHERE canonical_url = ? AND status IN ('review', 'draft', 'queued', 'failed', 'failed_post', 'failed_draft', 'failed_schedule', 'discovered')
+  `).run(error.message || String(error), canonicalUrl);
+}
+
 async function addThreadToDiscoveryReview(url, options = {}) {
   const canonicalUrl = validateThreadsUrl(url);
   const post = await extractThreadPost(canonicalUrl, { allowEmptyText: true });
@@ -2300,7 +2345,7 @@ async function renderDiscoveryDashboard(requestUrl = "/discovery") {
       button.disabled = true;
       button.textContent = "추가 중";
       try {
-        await postJson("/api/discovery/add-url", { url });
+        await postJson("/api/discovery/add-url-async", { url, origin: "dashboard" });
         location.reload();
       } catch (error) {
         alert(error.message);
@@ -3014,8 +3059,26 @@ const server = http.createServer(async (req, res) => {
     try {
       const body = await readRequestBody(req);
       const payload = JSON.parse(body || "{}");
-      const result = await addThreadToDiscoveryReview(payload.url, { text: payload.text });
-      json(res, 200, { ok: true, ...result });
+      const placeholder = await addDiscoveryPlaceholder(payload.url, { text: payload.text, origin: payload.origin || "sync_api" });
+      json(res, 202, {
+        ok: true,
+        accepted: true,
+        canonicalUrl: placeholder.canonicalUrl,
+        saved: placeholder,
+        message: "대시보드에 즉시 추가됨. 미리보기는 백그라운드에서 보강 중입니다.",
+      });
+      setImmediate(async () => {
+        try {
+          await addThreadToDiscoveryReview(placeholder.canonicalUrl, { text: payload.text });
+        } catch (error) {
+          await markDiscoveryDetailError(placeholder.canonicalUrl, error).catch(() => {});
+          logEvent("discovery_add_url_async_error", {
+            canonicalUrl: placeholder.canonicalUrl,
+            origin: payload.origin || "sync_api",
+            error: error.message,
+          });
+        }
+      });
     } catch (error) {
       logEvent("discovery_add_url_error", { error: error.message });
       json(res, 500, { ok: false, error: error.message });
@@ -3026,19 +3089,21 @@ const server = http.createServer(async (req, res) => {
     try {
       const body = await readRequestBody(req);
       const payload = JSON.parse(body || "{}");
-      const canonicalUrl = validateThreadsUrl(payload.url);
+      const placeholder = await addDiscoveryPlaceholder(payload.url, { text: payload.text, origin: payload.origin || "async_api" });
       json(res, 202, {
         ok: true,
         accepted: true,
-        canonicalUrl,
-        message: "대시보드에 추가됨. 미리보기는 백그라운드에서 보강 중입니다.",
+        canonicalUrl: placeholder.canonicalUrl,
+        saved: placeholder,
+        message: "대시보드에 즉시 추가됨. 미리보기는 백그라운드에서 보강 중입니다.",
       });
       setImmediate(async () => {
         try {
-          await addThreadToDiscoveryReview(canonicalUrl, { text: payload.text });
+          await addThreadToDiscoveryReview(placeholder.canonicalUrl, { text: payload.text });
         } catch (error) {
+          await markDiscoveryDetailError(placeholder.canonicalUrl, error).catch(() => {});
           logEvent("discovery_add_url_async_error", {
-            canonicalUrl,
+            canonicalUrl: placeholder.canonicalUrl,
             origin: payload.origin || null,
             error: error.message,
           });
