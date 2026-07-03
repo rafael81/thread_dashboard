@@ -30,11 +30,13 @@ const TERAFABX_LOCK_PATH = process.env.TERAFABX_LOCK_PATH || path.join(os.tmpdir
 const TERAFABX_COMMENT_INTERVAL_MS = Number(process.env.TERAFABX_COMMENT_INTERVAL_MS || 20 * 60 * 1000);
 const TERAFABX_HEART_INTERVAL_MS = Number(process.env.TERAFABX_HEART_INTERVAL_MS || 10 * 60 * 1000);
 const TERAFABX_HEART_LIMIT = Number(process.env.TERAFABX_HEART_LIMIT || 5);
+const TERAFABX_JOB_GAP_MS = Number(process.env.TERAFABX_JOB_GAP_MS || 90 * 1000);
 
 let busy = false;
 let discoveryScanBusy = false;
 let discoveryDbPromise = null;
 let terafabxBusy = false;
+let terafabxSchedulerBusy = false;
 
 function loadDiscoverySettings() {
   try {
@@ -649,6 +651,8 @@ function getTerafabxAutomationStatus() {
     chromePort: CHROME_PORT,
     requiredXHandle: REQUIRED_X_HANDLE,
     busy: terafabxBusy,
+    schedulerBusy: terafabxSchedulerBusy,
+    jobGapMs: TERAFABX_JOB_GAP_MS,
     lock: getTerafabxLockState(),
     comment: {
       enabled: Boolean(state.commentEnabled),
@@ -676,17 +680,48 @@ function getTerafabxAutomationStatus() {
 }
 
 async function maybeRunTerafabxAutomation() {
-  if (terafabxBusy) return;
+  if (terafabxSchedulerBusy || terafabxBusy) return;
+  terafabxSchedulerBusy = true;
+  const runStartedAt = new Date().toISOString();
+  const jobs = [];
   const state = loadTerafabxState();
   const now = Date.now();
   const lastCommentMs = state.lastCommentRunAt ? new Date(state.lastCommentRunAt).getTime() : 0;
   const lastHeartMs = state.lastHeartRunAt ? new Date(state.lastHeartRunAt).getTime() : 0;
   if (state.commentEnabled && now - lastCommentMs >= TERAFABX_COMMENT_INTERVAL_MS) {
-    await runTerafabxCommentOnce({ manual: false }).catch((error) => logEvent("terafabx_auto_comment_error", { error: error.message }));
-    return;
+    jobs.push({ name: "comment", overdueMs: now - lastCommentMs - TERAFABX_COMMENT_INTERVAL_MS });
   }
   if (state.heartEnabled && now - lastHeartMs >= TERAFABX_HEART_INTERVAL_MS) {
-    await runTerafabxHeartOnce({ manual: false }).catch((error) => logEvent("terafabx_auto_heart_error", { error: error.message }));
+    jobs.push({ name: "heart", overdueMs: now - lastHeartMs - TERAFABX_HEART_INTERVAL_MS });
+  }
+  jobs.sort((a, b) => b.overdueMs - a.overdueMs);
+  if (!jobs.length) {
+    terafabxSchedulerBusy = false;
+    return;
+  }
+  logEvent("terafabx_auto_queue_start", { runStartedAt, jobs });
+  try {
+    for (let index = 0; index < jobs.length; index += 1) {
+      const job = jobs[index];
+      try {
+        logEvent("terafabx_auto_job_start", { job: job.name, index, total: jobs.length });
+        if (job.name === "comment") {
+          await runTerafabxCommentOnce({ manual: false });
+        } else {
+          await runTerafabxHeartOnce({ manual: false });
+        }
+        logEvent("terafabx_auto_job_done", { job: job.name, index, total: jobs.length });
+      } catch (error) {
+        logEvent(`terafabx_auto_${job.name}_error`, { error: error.message });
+      }
+      if (index < jobs.length - 1) {
+        logEvent("terafabx_auto_job_gap", { after: job.name, gapMs: TERAFABX_JOB_GAP_MS });
+        await sleep(TERAFABX_JOB_GAP_MS);
+      }
+    }
+  } finally {
+    terafabxSchedulerBusy = false;
+    logEvent("terafabx_auto_queue_done", { runStartedAt });
   }
 }
 
