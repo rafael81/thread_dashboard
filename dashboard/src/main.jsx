@@ -6,7 +6,9 @@ import {
   Clock3,
   ExternalLink,
   FilePenLine,
+  Heart,
   Loader2,
+  MessageCircle,
   PauseCircle,
   PlayCircle,
   RefreshCcw,
@@ -66,6 +68,7 @@ function Dashboard() {
   const [urlInput, setUrlInput] = useState("");
   const [titleEdits, setTitleEdits] = useState({});
   const [scheduleEdits, setScheduleEdits] = useState({});
+  const [terafabxResult, setTerafabxResult] = useState(null);
   const [autoRefresh, setAutoRefresh] = useState(localStorage.getItem("threadDashboard.autoRefreshEnabled") !== "false");
   const [error, setError] = useState("");
 
@@ -121,6 +124,16 @@ function Dashboard() {
 
   function rowText(url) {
     return (titleEdits[url] || "").trim();
+  }
+
+  async function runTerafabx(job, action) {
+    await runAction(`terafabx-${job}-${action}`, async () => {
+      const result = await api("/api/terafabx/automation", {
+        method: "POST",
+        body: JSON.stringify({ job, action }),
+      });
+      setTerafabxResult(result);
+    });
   }
 
   return (
@@ -179,6 +192,47 @@ function Dashboard() {
             </article>
           );
         })}
+      </section>
+
+      <section className="terafabx-panel">
+        <div className="terafabx-head">
+          <div>
+            <h2>과즙루피 자동화</h2>
+            <p>Hermes CLI 미사용 · 댓글 생성 Grok CLI · 댓글/하트 실행 mirror_server.js CDP 코드 · Chrome {data?.terafabx?.chromePort || 9224}</p>
+          </div>
+          <button className="btn btn-outline" disabled={Boolean(busy)} onClick={() => runAction("terafabx-refresh", async () => setTerafabxResult(await api("/api/terafabx/automation")))}>
+            {busy === "terafabx-refresh" ? <Loader2 className="spin" /> : <RefreshCcw />}
+            상태 새로고침
+          </button>
+        </div>
+        <div className="terafabx-grid">
+          <article className="terafabx-card">
+            <div className="terafabx-title"><strong><MessageCircle /> 자동댓글</strong><span>{data?.terafabx?.comment?.enabled ? "ON" : "OFF"}</span></div>
+            <p>엔진: Grok CLI · 상태: {data?.terafabx?.comment?.lastStatus || "대기"}</p>
+            <p>최근 실행: {formatDate(data?.terafabx?.comment?.lastRunAt)} · 다음 자동: {formatDate(data?.terafabx?.comment?.nextRunAt)}</p>
+            <p className="terafabx-last">최근 댓글: {data?.terafabx?.comment?.lastComment || "-"}</p>
+            {data?.terafabx?.comment?.lastReplyUrl ? <a className="btn btn-outline full" href={data.terafabx.comment.lastReplyUrl} target="_blank" rel="noreferrer"><ExternalLink /> 최근 답글 열기</a> : null}
+            {data?.terafabx?.comment?.lastError ? <p className="terafabx-error">오류: {data.terafabx.comment.lastError}</p> : null}
+            <div className="terafabx-actions">
+              <button className="btn btn-primary" disabled={Boolean(busy)} onClick={() => runTerafabx("comment", "run")}>{busy === "terafabx-comment-run" ? <Loader2 className="spin" /> : <MessageCircle />} 지금 댓글 1회</button>
+              <button className="btn btn-outline" disabled={Boolean(busy)} onClick={() => runTerafabx("comment", "enable")}>ON</button>
+              <button className="btn btn-outline" disabled={Boolean(busy)} onClick={() => runTerafabx("comment", "disable")}>OFF</button>
+            </div>
+          </article>
+          <article className="terafabx-card">
+            <div className="terafabx-title"><strong><Heart /> 하트</strong><span>{data?.terafabx?.heart?.enabled ? "ON" : "OFF"}</span></div>
+            <p>엔진: 로컬 CDP 스크립트 · 상태: {data?.terafabx?.heart?.lastStatus || "대기"}</p>
+            <p>최근 실행: {formatDate(data?.terafabx?.heart?.lastRunAt)} · 최근 {compact(data?.terafabx?.heart?.lastCount || 0)}개 · 다음 자동: {formatDate(data?.terafabx?.heart?.nextRunAt)}</p>
+            <p className="terafabx-last">대상: X 홈/For You/Following 공개 타임라인</p>
+            {data?.terafabx?.heart?.lastError ? <p className="terafabx-error">오류: {data.terafabx.heart.lastError}</p> : null}
+            <div className="terafabx-actions">
+              <button className="btn btn-primary" disabled={Boolean(busy)} onClick={() => runTerafabx("heart", "run")}>{busy === "terafabx-heart-run" ? <Loader2 className="spin" /> : <Heart />} 지금 하트 1회</button>
+              <button className="btn btn-outline" disabled={Boolean(busy)} onClick={() => runTerafabx("heart", "enable")}>ON</button>
+              <button className="btn btn-outline" disabled={Boolean(busy)} onClick={() => runTerafabx("heart", "disable")}>OFF</button>
+            </div>
+          </article>
+        </div>
+        <pre className="terafabx-result">{terafabxResult ? JSON.stringify(terafabxResult, null, 2) : `락: ${data?.terafabx?.lock?.busy ? `사용 중 ${data.terafabx.lock.action || ""}` : "대기"}`}</pre>
       </section>
 
       <nav className="tabs">

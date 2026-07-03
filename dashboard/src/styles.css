@@ -117,6 +117,7 @@ textarea {
 
 .url-card,
 .metrics-grid,
+.terafabx-panel,
 .tabs,
 .content-grid,
 .error {
@@ -155,6 +156,8 @@ textarea {
 }
 
 .metric-card,
+.terafabx-panel,
+.terafabx-card,
 .post-card,
 .empty-state,
 .error {
@@ -197,6 +200,100 @@ textarea {
   font-size: 12px;
   line-height: 1.35;
   overflow-wrap: anywhere;
+}
+
+.terafabx-panel {
+  margin-top: 14px;
+  padding: 14px;
+}
+
+.terafabx-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.terafabx-head h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.terafabx-head p,
+.terafabx-card p {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.terafabx-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.terafabx-card {
+  min-width: 0;
+  padding: 12px;
+  background: #f8fafc;
+}
+
+.terafabx-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.terafabx-title strong {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 14px;
+}
+
+.terafabx-title svg {
+  width: 15px;
+  height: 15px;
+}
+
+.terafabx-title span {
+  border-radius: 999px;
+  background: var(--primary);
+  color: var(--primary-foreground);
+  padding: 3px 7px;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.terafabx-last {
+  overflow-wrap: anywhere;
+}
+
+.terafabx-error {
+  color: var(--danger) !important;
+}
+
+.terafabx-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.terafabx-result {
+  max-height: 180px;
+  margin: 12px 0 0;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #0f172a;
+  color: #e2e8f0;
+  padding: 10px;
+  font-size: 12px;
+  white-space: pre-wrap;
 }
 
 .tabs {
@@ -428,9 +525,18 @@ textarea {
 
   .url-card,
   .metrics-grid,
+  .terafabx-panel,
   .content-grid {
     grid-template-columns: 1fr;
     padding-inline: 10px;
+  }
+
+  .terafabx-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .terafabx-head {
+    flex-direction: column;
   }
 
   .tabs {
