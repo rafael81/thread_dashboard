@@ -12,9 +12,12 @@ const MAX_MEDIA = 4;
 const LOG_PATH = path.join(__dirname, "mirror-events.jsonl");
 const SCHEDULE_SLOTS_PATH = path.join(__dirname, "x-scheduled-slots.json");
 const MIRROR_HISTORY_PATH = path.join(__dirname, "mirror-history.json");
+const DISCOVERY_SETTINGS_PATH = path.join(__dirname, "discovery-settings.json");
 const SCHEDULE_SPACING_MS = 15 * 60 * 1000;
 const DISCOVERY_DB_PATH = process.env.DISCOVERY_DB_PATH || path.join(__dirname, ".data", "thread-discovery.db");
-const DISCOVERY_MIN_LIKES = Number(process.env.DISCOVERY_MIN_LIKES || 500);
+const DASHBOARD_DIST_DIR = path.join(__dirname, "dashboard", "dist");
+const DASHBOARD_INDEX_PATH = path.join(DASHBOARD_DIST_DIR, "index.html");
+const DISCOVERY_MIN_LIKES = Number(process.env.DISCOVERY_MIN_LIKES || 1000);
 const DISCOVERY_POST_INTERVAL_MS = Number(process.env.DISCOVERY_POST_INTERVAL_MS || 10 * 60 * 1000);
 const DISCOVERY_WORKER_INTERVAL_MS = Number(process.env.DISCOVERY_WORKER_INTERVAL_MS || 60 * 1000);
 const DISCOVERY_SCAN_INTERVAL_MS = Number(process.env.DISCOVERY_SCAN_INTERVAL_MS || 5 * 60 * 1000);
@@ -24,6 +27,33 @@ const DISCOVERY_MAX_SCROLLS = Number(process.env.DISCOVERY_MAX_SCROLLS || 20);
 let busy = false;
 let discoveryScanBusy = false;
 let discoveryDbPromise = null;
+
+function loadDiscoverySettings() {
+  try {
+    const settings = JSON.parse(fs.readFileSync(DISCOVERY_SETTINGS_PATH, "utf8"));
+    return {
+      autoDiscoveryEnabled: settings.autoDiscoveryEnabled !== false,
+    };
+  } catch {
+    return { autoDiscoveryEnabled: true };
+  }
+}
+
+function saveDiscoverySettings(settings) {
+  fs.writeFileSync(DISCOVERY_SETTINGS_PATH, JSON.stringify(settings, null, 2));
+}
+
+function isAutoDiscoveryEnabled() {
+  return loadDiscoverySettings().autoDiscoveryEnabled;
+}
+
+function setAutoDiscoveryEnabled(enabled) {
+  const settings = loadDiscoverySettings();
+  settings.autoDiscoveryEnabled = Boolean(enabled);
+  saveDiscoverySettings(settings);
+  logEvent("discovery_auto_scan_setting_changed", { autoDiscoveryEnabled: settings.autoDiscoveryEnabled });
+  return settings;
+}
 
 function logEvent(type, data = {}) {
   const entry = {
@@ -46,6 +76,36 @@ function json(res, status, body) {
 function html(res, status, body) {
   res.writeHead(status, { "content-type": "text/html; charset=utf-8" });
   res.end(body);
+}
+
+function contentTypeFor(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === ".html") return "text/html; charset=utf-8";
+  if (ext === ".js") return "text/javascript; charset=utf-8";
+  if (ext === ".css") return "text/css; charset=utf-8";
+  if (ext === ".svg") return "image/svg+xml";
+  if (ext === ".png") return "image/png";
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".webp") return "image/webp";
+  return "application/octet-stream";
+}
+
+function serveFile(res, filePath) {
+  const body = fs.readFileSync(filePath);
+  res.writeHead(200, { "content-type": contentTypeFor(filePath) });
+  res.end(body);
+}
+
+function tryServeDashboardAsset(req, res) {
+  if (!req.url.startsWith("/assets/")) return false;
+  const requested = decodeURIComponent(new URL(req.url, "http://localhost").pathname.slice(1));
+  const fullPath = path.resolve(DASHBOARD_DIST_DIR, requested);
+  const rootPath = path.resolve(DASHBOARD_DIST_DIR);
+  if (!fullPath.startsWith(rootPath + path.sep) || !fs.existsSync(fullPath) || !fs.statSync(fullPath).isFile()) {
+    return false;
+  }
+  serveFile(res, fullPath);
+  return true;
 }
 
 function escapeHtml(value) {
@@ -608,6 +668,9 @@ async function processDiscoveryDraft(options = {}) {
 }
 
 async function runDiscoveryScan(options = {}) {
+  if (!options.manual && !isAutoDiscoveryEnabled()) {
+    return { ok: true, skipped: true, reason: "auto_discovery_disabled" };
+  }
   if (discoveryScanBusy) return { ok: true, skipped: true, reason: "scan_busy" };
   discoveryScanBusy = true;
   try {
@@ -902,6 +965,37 @@ function nextAvailableScheduleTime() {
   return candidate;
 }
 
+async function nextAutoScheduleTime() {
+  const now = Date.now();
+  const times = [
+    ...loadScheduleSlots().map((entry) => entry.scheduledAt),
+    ...loadMirrorHistory().filter((entry) => entry.status === "scheduled").map((entry) => entry.scheduledAt),
+  ]
+    .map((value) => new Date(value).getTime())
+    .filter((time) => Number.isFinite(time) && time > now);
+  try {
+    const db = await getDiscoveryDb();
+    const rows = await db.prepare(`
+      SELECT scheduled_post_at AS scheduledAt
+      FROM thread_discoveries
+      WHERE scheduled_post_at IS NOT NULL
+    `).all();
+    for (const row of rows) {
+      const time = new Date(row.scheduledAt).getTime();
+      if (Number.isFinite(time) && time > now) times.push(time);
+    }
+  } catch (error) {
+    logEvent("auto_schedule_time_db_error", { error: error.message });
+  }
+  const latest = times.length ? Math.max(...times) : 0;
+  const candidate = new Date(Math.max(latest, now) + 30 * 60 * 1000);
+  if (candidate.getSeconds() || candidate.getMilliseconds()) {
+    candidate.setMinutes(candidate.getMinutes() + 1);
+  }
+  candidate.setSeconds(0, 0);
+  return candidate;
+}
+
 function recordScheduleSlot(scheduledAt) {
   const slots = loadScheduleSlots();
   slots.push({ scheduledAt: scheduledAt.toISOString(), recordedAt: new Date().toISOString() });
@@ -1137,6 +1231,36 @@ async function markDiscoveryDraftFailed(canonicalUrl, error) {
   `).run(error.message || String(error), canonicalUrl);
 }
 
+async function markDiscoveryScheduled(canonicalUrl, mediaCount, scheduledAt) {
+  const db = await getDiscoveryDb();
+  await db.prepare(`
+    UPDATE thread_discoveries
+    SET status = 'scheduled', scheduled_post_at = ?, posted_at = CURRENT_TIMESTAMP,
+        last_error = NULL, media_count = MAX(media_count, ?)
+    WHERE canonical_url = ?
+  `).run(scheduledAt || null, mediaCount || 0, canonicalUrl);
+}
+
+async function markDiscoveryScheduleFailed(canonicalUrl, error) {
+  const db = await getDiscoveryDb();
+  await db.prepare(`
+    UPDATE thread_discoveries
+    SET status = 'failed_schedule', last_error = ?, attempts = attempts + 1
+    WHERE canonical_url = ?
+  `).run(error.message || String(error), canonicalUrl);
+}
+
+async function discardDiscoveredRows() {
+  const db = await getDiscoveryDb();
+  const result = await db.prepare(`
+    UPDATE thread_discoveries
+    SET status = 'skipped', last_error = 'discarded_by_user'
+    WHERE status IN ('review', 'draft', 'failed_post', 'failed_draft', 'failed_schedule')
+  `).run();
+  logEvent("discovery_discovered_rows_discarded", { changes: result.changes || 0 });
+  return { discarded: result.changes || 0 };
+}
+
 async function updateDiscoveryTitle(canonicalUrl, text) {
   const title = String(text || "").trim();
   if (!title) {
@@ -1186,14 +1310,69 @@ async function refreshDiscoveryPreviews(limit = 20) {
   return { refreshed, failed };
 }
 
-async function renderDiscoveryDashboard() {
-  const rows = await listDiscoveryRows(200);
-  const counts = rows.reduce((acc, row) => {
+function formatDashboardDateTime(value) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "-";
+  const parts = new Intl.DateTimeFormat("sv-SE", {
+    timeZone: "Asia/Seoul",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(date);
+  return parts.replace("T", " ");
+}
+
+async function renderDiscoveryDashboard(requestUrl = "/discovery") {
+  const parsedUrl = new URL(requestUrl, "http://localhost");
+  const activeView = parsedUrl.searchParams.get("view") || "discovered";
+  const autoDiscoveryEnabled = isAutoDiscoveryEnabled();
+  const allRows = await listDiscoveryRows(300);
+  const nowMs = Date.now();
+  const discoveredStatuses = new Set(["review", "draft", "failed_post", "failed_draft", "failed_schedule"]);
+  const viewRows = {
+    discovered: allRows.filter((row) => discoveredStatuses.has(row.status)),
+    scheduled: allRows.filter((row) => {
+      const time = new Date(row.scheduledPostAt || 0).getTime();
+      return row.status === "scheduled" && Number.isFinite(time) && time > nowMs;
+    }),
+    posted: allRows.filter((row) => row.status === "posted"),
+  };
+  const rows = (viewRows[activeView] || viewRows.discovered).sort((a, b) => {
+    if (activeView === "scheduled") {
+      return new Date(a.scheduledPostAt || 0).getTime() - new Date(b.scheduledPostAt || 0).getTime();
+    }
+    if (activeView === "posted") {
+      return new Date(b.postedAt || 0).getTime() - new Date(a.postedAt || 0).getTime();
+    }
+    return new Date(b.discoveredAt || 0).getTime() - new Date(a.discoveredAt || 0).getTime();
+  });
+  const counts = allRows.reduce((acc, row) => {
     acc[row.status] = (acc[row.status] || 0) + 1;
     return acc;
   }, {});
+  const discoveredCount = viewRows.discovered.length;
+  const scheduledCount = viewRows.scheduled.length;
+  const postedCount = viewRows.posted.length;
+  const failedCount = Number((counts.failed_post || 0) + (counts.failed_draft || 0) + (counts.failed_schedule || 0));
+  const nextScheduledAt = viewRows.scheduled
+    .map((row) => new Date(row.scheduledPostAt || 0).getTime())
+    .filter((time) => Number.isFinite(time) && time > nowMs)
+    .sort((a, b) => a - b)[0];
+  const latestPostedAt = viewRows.posted
+    .map((row) => new Date(row.postedAt || 0).getTime())
+    .filter((time) => Number.isFinite(time))
+    .sort((a, b) => b - a)[0];
+  const activeViewLabel = {
+    discovered: "발굴됨",
+    scheduled: "게시예정",
+    posted: "게시됨",
+  }[activeView] || "발굴됨";
   const cards = rows.map((row) => {
-    const canPost = ["review", "draft", "failed_post", "failed_draft"].includes(row.status);
+    const canPost = ["review", "draft", "failed_post", "failed_draft", "failed_schedule"].includes(row.status);
     const criteria = (() => {
       try {
         return JSON.parse(row.criteria || "{}");
@@ -1207,7 +1386,17 @@ async function renderDiscoveryDashboard() {
       `점수 ${row.viralScore}`,
       row.status,
     ];
-    if (row.postedAt) badges.push(`게시 ${new Date(row.postedAt).toLocaleString("ko-KR")}`);
+    if (row.scheduledPostAt) badges.push(`예약 ${formatDashboardDateTime(row.scheduledPostAt)}`);
+    if (row.postedAt && !row.scheduledPostAt) badges.push(`게시 ${formatDashboardDateTime(row.postedAt)}`);
+    const timelineTime = row.scheduledPostAt || row.postedAt || row.discoveredAt;
+    const timelineLabel = row.scheduledPostAt ? "예약" : row.postedAt ? "처리" : "발굴";
+    const timelineText = `${timelineLabel} ${formatDashboardDateTime(timelineTime)}`;
+    const timelineState = row.scheduledPostAt ? "is-scheduled" : row.postedAt ? "is-posted" : "is-review";
+    const publishTimeHtml = row.scheduledPostAt
+      ? `<div class="publish-time is-scheduled"><span>게시 예정 시간</span><strong>${escapeHtml(formatDashboardDateTime(row.scheduledPostAt))}</strong></div>`
+      : row.postedAt
+        ? `<div class="publish-time is-posted"><span>게시된 시간</span><strong>${escapeHtml(formatDashboardDateTime(row.postedAt))}</strong></div>`
+        : "";
     const mediaPreview = row.mediaPreviewUrl
       ? (/\.mp4|\/o1\/v\/t16\//i.test(row.mediaPreviewUrl)
         ? `<video class="media-preview" src="${escapeHtml(row.mediaPreviewUrl)}" muted playsinline controls loop preload="metadata"></video>`
@@ -1229,11 +1418,12 @@ async function renderDiscoveryDashboard() {
       <button class="save-title" data-save-title="${escapeHtml(row.canonicalUrl)}">제목 저장</button>
     `;
     return `
-      <article class="card" data-url="${escapeHtml(row.canonicalUrl)}">
+      <article class="card ${timelineState}" data-url="${escapeHtml(row.canonicalUrl)}" data-time="${escapeHtml(timelineText)}">
         <div class="media-frame">${mediaPreview}</div>
         <div class="meta">
           ${badges.map((badge) => `<span>${escapeHtml(badge)}</span>`).join("")}
         </div>
+        ${publishTimeHtml}
         <h2>@${escapeHtml(row.author)}</h2>
         ${previewHtml}
         ${titleEditor}
@@ -1246,6 +1436,9 @@ async function renderDiscoveryDashboard() {
           <a class="source-link" href="${escapeHtml(row.canonicalUrl)}" target="_blank" rel="noreferrer">원문 열기</a>
           <button ${canPost ? "" : "disabled"} data-post="${escapeHtml(row.canonicalUrl)}">${canPost ? "게시" : "처리됨"}</button>
           <button ${canPost ? "" : "disabled"} data-draft="${escapeHtml(row.canonicalUrl)}">${canPost ? "초안 저장" : "처리됨"}</button>
+          <input ${canPost ? "" : "disabled"} class="schedule-input" data-schedule-input="${escapeHtml(row.canonicalUrl)}" type="datetime-local" />
+          <button ${canPost ? "" : "disabled"} data-schedule="${escapeHtml(row.canonicalUrl)}">${canPost ? "예약 게시" : "처리됨"}</button>
+          <button ${canPost ? "" : "disabled"} class="auto-schedule" data-auto-schedule="${escapeHtml(row.canonicalUrl)}">${canPost ? "자동 예약" : "처리됨"}</button>
         </div>
         ${row.lastError && !/superseded by short_hook_strong_media_controversy filter/i.test(row.lastError) ? `<details class="diagnostic"><summary>오류 로그</summary><p>${escapeHtml(row.lastError)}</p></details>` : ""}
       </article>
@@ -1258,18 +1451,50 @@ async function renderDiscoveryDashboard() {
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Threads 발굴 대시보드</title>
   <style>
-    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f6f7f8; color: #111; }
-    header { position: sticky; top: 0; z-index: 1; background: #fff; border-bottom: 1px solid #ddd; padding: 14px 18px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    :root { --bg: #f8fafc; --card: #fff; --border: #e5e7eb; --muted: #64748b; --soft: #f1f5f9; --ink: #0f172a; --primary: #111827; }
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--ink); }
+    header { position: sticky; top: 0; z-index: 3; background: rgba(255,255,255,.94); backdrop-filter: blur(10px); border-bottom: 1px solid var(--border); padding: 14px 18px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
     h1 { margin: 0; font-size: 18px; }
-    main { max-width: 1800px; margin: 0 auto; padding: 14px; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; align-items: start; }
-    .summary { color: #555; font-size: 13px; }
-    .card { min-width: 0; min-height: 430px; background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 10px; display: flex; flex-direction: column; gap: 8px; }
-    .media-frame { width: 100%; aspect-ratio: 4 / 3; max-height: 210px; background: #111; border-radius: 6px; overflow: hidden; display: grid; place-items: center; }
+    .summary { color: var(--muted); font-size: 13px; }
+    .add-url { max-width: 1180px; margin: 0 auto; padding: 14px 16px 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+    .add-url input { min-width: 0; border: 1px solid var(--border); border-radius: 8px; padding: 9px 10px; font-size: 14px; background: var(--card); }
+    .add-url button { flex: none; }
+    .timeline-summary { max-width: 1180px; margin: 0 auto; padding: 14px 16px 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+    .summary-card { min-width: 0; border: 1px solid var(--border); border-radius: 14px; background: var(--card); padding: 14px; box-shadow: 0 1px 2px rgba(15,23,42,.04); }
+    .summary-card span { display: block; color: var(--muted); font-size: 12px; }
+    .summary-card strong { display: block; margin-top: 6px; font-size: 22px; line-height: 1.1; }
+    .posting-timeline { max-width: 1180px; margin: 14px auto 24px; border: 1px solid var(--border); border-radius: 16px; background: var(--card); color: var(--ink); overflow: hidden; }
+    .view-tabs { max-width: 1180px; margin: 0 auto; padding: 14px 16px 0; display: flex; flex-wrap: wrap; gap: 8px; }
+    .view-tab { flex: 0 0 auto; border: 1px solid var(--border); border-radius: 999px; padding: 8px 12px; background: var(--card); color: var(--ink); font-size: 13px; text-decoration: none; }
+    .view-tab[aria-current="page"] { background: var(--primary); border-color: var(--primary); color: #fff; }
+    .timeline-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; border-bottom: 1px solid var(--border); padding: 12px 16px; }
+    .toolbar-badges { display: flex; flex-wrap: wrap; gap: 8px; }
+    .toolbar-badges span, .meta span, .criteria span { background: var(--soft); border: 1px solid transparent; border-radius: 999px; padding: 4px 8px; color: #334155; font-size: 12px; }
+    main { padding: 0 16px 16px; display: flex; flex-direction: column; }
+    .card { position: relative; min-width: 0; display: grid; grid-template-columns: minmax(7.5rem, .24fr) 2.5rem minmax(0, 1fr); gap: 12px; padding: 16px 0; background: linear-gradient(to right, transparent calc(24% + 1.25rem - .5px), var(--border) calc(24% + 1.25rem - .5px), var(--border) calc(24% + 1.25rem + .5px), transparent calc(24% + 1.25rem + .5px)); border: 0; }
+    .card::before { content: attr(data-time); grid-column: 1; align-self: start; padding-top: 4px; color: var(--muted); font-size: 12px; line-height: 1.45; text-align: right; }
+    .card::after { content: ""; grid-column: 2; grid-row: 1; width: 36px; height: 36px; border-radius: 999px; border: 1px solid var(--border); background: var(--soft); box-shadow: inset 0 0 0 9px var(--card); justify-self: center; align-self: start; z-index: 1; }
+    .card.is-scheduled::after { border-color: var(--primary); background: var(--primary); box-shadow: inset 0 0 0 10px var(--primary); }
+    .card.is-posted::after { background: #e2e8f0; }
+    .card.is-review::after { background: #fff; }
+    .card > * { grid-column: 3; min-width: 0; }
+    .card > .media-frame, .card > .meta, .card > h2, .card > .preview-box, .card > .title-editor, .card > .save-title, .card > .criteria, .card > .actions, .card > .diagnostic { background: var(--card); }
+    .card > .media-frame { border-top-left-radius: 14px; border-top-right-radius: 14px; }
+    .card > .meta { order: -1; border: 1px solid var(--border); border-bottom: 0; border-radius: 14px 14px 0 0; padding: 14px 14px 0; }
+    .card > h2 { margin: 0; border-left: 1px solid var(--border); border-right: 1px solid var(--border); padding: 10px 14px 0; font-size: 15px; }
+    .card > .preview-box, .card > .title-editor, .card > .save-title, .card > .criteria, .card > .actions, .card > .diagnostic { border-left: 1px solid var(--border); border-right: 1px solid var(--border); padding-left: 14px; padding-right: 14px; }
+    .card > .actions, .card > .diagnostic { border-bottom: 1px solid var(--border); }
+    .card > .actions { border-radius: 0 0 14px 14px; padding-bottom: 14px; }
+    .card > .diagnostic { border-radius: 0 0 14px 14px; padding-bottom: 14px; }
+    .media-frame { width: 100%; height: clamp(260px, 28vw, 420px); background: #111; overflow: hidden; display: grid; place-items: center; border-left: 1px solid var(--border); border-right: 1px solid var(--border); }
     .media-preview { width: 100%; height: 100%; object-fit: contain; display: block; background: #111; }
     .media-empty { color: #555; font-size: 12px; border: 0; padding: 0; background: transparent; text-decoration: underline; }
     .meta, .criteria { display: flex; flex-wrap: wrap; gap: 6px; font-size: 12px; }
-    .meta span, .criteria span { background: #eef0f2; border-radius: 999px; padding: 4px 8px; }
-    h2 { margin: 0; font-size: 15px; }
+    .publish-time { display: grid; gap: 3px; border: 1px solid #d8dee8; border-radius: 6px; background: #f8fafc; padding: 7px 8px; overflow-wrap: anywhere; }
+    .publish-time span { color: var(--muted); font-size: 11px; line-height: 1.2; }
+    .publish-time strong { color: #0f172a; font-size: 13px; line-height: 1.25; white-space: normal; }
+    .publish-time.is-scheduled { border-color: #111827; background: #eef2ff; }
+    .publish-time.is-posted { background: #f1f5f9; }
     .preview-box { min-height: 48px; font-size: 13px; }
     .preview-box summary { list-style: none; cursor: pointer; display: flex; flex-direction: column; gap: 3px; }
     .preview-box summary::-webkit-details-marker { display: none; }
@@ -1279,35 +1504,88 @@ async function renderDiscoveryDashboard() {
     .preview-box[open] summary { display: none; }
     .preview-box p { white-space: pre-wrap; line-height: 1.4; margin: 0; overflow-wrap: anywhere; }
     .preview-full { min-height: 36px; }
-    .title-editor { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: #555; }
-    .title-editor textarea { width: 100%; box-sizing: border-box; resize: vertical; min-height: 68px; max-height: 140px; border: 1px solid #bbb; border-radius: 6px; padding: 7px 8px; font: inherit; font-size: 13px; color: #111; line-height: 1.35; }
+    .title-editor { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+    .title-editor textarea { width: 100%; box-sizing: border-box; resize: vertical; min-height: 76px; max-height: 160px; border: 1px solid var(--border); border-radius: 8px; padding: 8px 9px; font: inherit; font-size: 13px; color: #111; line-height: 1.45; background: #fff; }
     .save-title { background: #fff; color: #111; }
     .diagnostic { color: #8a1f11; font-size: 12px; }
     .diagnostic p { margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
-    .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: auto; }
-    a, button { flex: 1; min-width: 0; border: 1px solid #111; border-radius: 6px; padding: 8px 8px; font-size: 13px; text-align: center; text-decoration: none; color: #111; background: #fff; cursor: pointer; }
-    .source-link { grid-column: 1 / -1; }
-    button { background: #111; color: #fff; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; padding-top: 10px; }
+    a, button { flex: 0 0 auto; min-width: 0; border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px; font-size: 12px; line-height: 1.3; text-align: center; text-decoration: none; color: #111; background: #fff; cursor: pointer; }
+    .schedule-input { min-width: 190px; box-sizing: border-box; border: 1px solid var(--border); border-radius: 8px; padding: 7px 9px; font: inherit; font-size: 12px; color: #111; background: #fff; }
+    .schedule-input:disabled { opacity: .45; cursor: not-allowed; }
+    .auto-schedule { background: #111; color: #fff; }
+    button { background: #111; color: #fff; border-color: #111; }
     button:disabled { opacity: .45; cursor: not-allowed; }
-    #scan, #refresh { background: #fff; color: #111; }
+    #scan, #refresh, #auto-refresh-toggle, #auto-discovery-toggle { background: #fff; color: #111; }
+    #auto-refresh-toggle[data-enabled="false"] { background: #111; color: #fff; }
+    #auto-discovery-toggle[data-enabled="false"] { background: #111; color: #fff; }
     .header-actions { display: flex; gap: 8px; }
     .header-actions button { flex: none; }
-    .add-url { max-width: 1800px; margin: 0 auto; padding: 12px 14px 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
-    .add-url input { min-width: 0; border: 1px solid #bbb; border-radius: 6px; padding: 9px 10px; font-size: 14px; }
-    .add-url button { flex: none; }
+    .dashboard-overview { max-width: 1800px; margin: 0 auto; padding: 12px 14px 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+    .metric-card { min-width: 0; border: 1px solid var(--border); border-radius: 8px; background: #fff; padding: 14px; box-shadow: 0 1px 2px rgba(15, 23, 42, .04); }
+    .metric-card span { display: block; color: var(--muted); font-size: 12px; font-weight: 600; }
+    .metric-card strong { display: block; margin-top: 8px; color: var(--ink); font-size: 24px; line-height: 1; letter-spacing: 0; }
+    .metric-card p { margin: 8px 0 0; color: var(--muted); font-size: 12px; line-height: 1.35; overflow-wrap: anywhere; }
+    .empty-state { grid-column: 1 / -1; margin: 0; border: 1px dashed var(--border); border-radius: 8px; background: #fff; padding: 32px 16px; color: var(--muted); text-align: center; font-size: 14px; }
+    .view-tabs, .timeline-summary, .add-url { max-width: 1800px; }
+    header { padding: 12px 18px; }
+    header h1 { font-size: 17px; font-weight: 700; letter-spacing: 0; }
+    .add-url { padding-top: 12px; }
+    .add-url input { border-radius: 8px; box-shadow: 0 1px 2px rgba(15, 23, 42, .03); }
+    .view-tabs { padding-top: 12px; border: 0; }
+    .view-tab { border-radius: 8px; padding: 8px 11px; box-shadow: 0 1px 2px rgba(15, 23, 42, .03); }
+    .posting-timeline { max-width: 1800px; margin: 12px auto 24px; border: 0; border-radius: 0; background: transparent; overflow: visible; }
+    .timeline-toolbar { display: none; }
+    main { max-width: 1800px; margin: 0 auto; padding: 0 14px 14px; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; align-items: start; }
+    .card { min-width: 0; min-height: 430px; display: flex; flex-direction: column; gap: 8px; padding: 10px; background: #fff; border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 1px 2px rgba(15, 23, 42, .04); }
+    .card:hover { box-shadow: 0 4px 12px rgba(15, 23, 42, .07); }
+    .card::before, .card::after { content: none; display: none; }
+    .card > * { grid-column: auto; min-width: 0; }
+    .card > .media-frame, .card > .meta, .card > .publish-time, .card > h2, .card > .preview-box, .card > .title-editor, .card > .save-title, .card > .criteria, .card > .actions, .card > .diagnostic { border: 0; padding-left: 0; padding-right: 0; background: transparent; }
+    .card > .publish-time { border: 1px solid #d8dee8; padding: 7px 8px; background: #f8fafc; }
+    .card > .publish-time.is-scheduled { border-color: #111827; background: #eef2ff; }
+    .card > .publish-time.is-posted { background: #f1f5f9; }
+    .card > .meta { order: 0; padding: 0; }
+    .card > h2 { padding: 0; }
+    .card > .actions, .card > .diagnostic { border: 0; }
+    .card > .actions { border-radius: 0; padding-bottom: 0; }
+    .card > .diagnostic { border-radius: 0; padding-bottom: 0; }
+    .media-frame { border: 0; border-radius: 6px; height: clamp(220px, 18vw, 320px); }
+    .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: auto; padding-top: 0; }
+    .schedule-input { min-width: 0; width: 100%; }
+    .source-link, .auto-schedule { grid-column: 1 / -1; }
+    a, button { flex: 1; padding: 8px 8px; font-size: 13px; }
+    .meta span, .criteria span { border-radius: 6px; padding: 4px 7px; font-size: 11px; font-weight: 500; }
+    .preview-box { color: #111827; }
+    .title-editor span { font-weight: 600; }
+    .save-title { border-color: var(--border); }
+    .actions button, .actions a { border-radius: 6px; font-weight: 600; }
+    .actions a, .save-title { background: #fff; color: #111827; border-color: var(--border); }
     @media (max-width: 1400px) { main { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
-    @media (max-width: 1100px) { main { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
-    @media (max-width: 760px) { main { grid-template-columns: repeat(2, minmax(0, 1fr)); padding: 10px; } header { align-items: flex-start; flex-direction: column; } .add-url { grid-template-columns: 1fr; padding: 10px 10px 0; } }
-    @media (max-width: 520px) { main { grid-template-columns: 1fr; } }
+    @media (max-width: 1100px) { main { grid-template-columns: repeat(3, minmax(0, 1fr)); } .dashboard-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    @media (max-width: 760px) {
+      header { align-items: flex-start; flex-direction: column; }
+      .add-url { grid-template-columns: 1fr; padding: 10px 10px 0; }
+      .dashboard-overview { grid-template-columns: 1fr 1fr; padding: 10px 10px 0; gap: 8px; }
+      .timeline-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); padding: 10px 10px 0; }
+      .view-tabs { padding: 10px 10px 0; }
+      .posting-timeline { margin: 10px 10px 20px; }
+      main { grid-template-columns: repeat(2, minmax(0, 1fr)); padding: 0 10px 10px; }
+      .actions { display: grid; grid-template-columns: 1fr 1fr; }
+      .source-link, .schedule-input, .auto-schedule { grid-column: 1 / -1; width: 100%; }
+    }
+    @media (max-width: 520px) { .timeline-summary, .dashboard-overview { grid-template-columns: 1fr; } main { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
   <header>
     <div>
       <h1>Threads 발굴 대시보드</h1>
-      <div class="summary">5분마다 스캔 · 좋아요 500+ · 미디어 포함 · X 초안 저장 안 함 · ${escapeHtml(JSON.stringify(counts))}</div>
+      <div class="summary">5분마다 스캔 · 좋아요 1000+ · 미디어 포함 · X 초안 저장 안 함 · ${escapeHtml(JSON.stringify(counts))}</div>
     </div>
     <div class="header-actions">
+      <button id="auto-discovery-toggle" type="button" aria-pressed="${autoDiscoveryEnabled ? "true" : "false"}" data-enabled="${autoDiscoveryEnabled ? "true" : "false"}">${autoDiscoveryEnabled ? "자동 발굴 중지" : "자동 발굴 재개"}</button>
+      <button id="auto-refresh-toggle" type="button" aria-pressed="true" data-enabled="true">자동새로고침 끄기</button>
       <button id="refresh">미리보기 보강</button>
       <button id="scan">지금 스캔</button>
     </div>
@@ -1316,18 +1594,104 @@ async function renderDiscoveryDashboard() {
     <input id="add-url-input" type="url" placeholder="Threads URL 추가" autocomplete="off" />
     <button id="add-url-button" type="submit">추가</button>
   </form>
-  <main>${cards || "<p>아직 발굴된 항목이 없습니다.</p>"}</main>
+  <section class="dashboard-overview" aria-label="대시보드 요약">
+    <article class="metric-card">
+      <span>발굴 대기</span>
+      <strong>${Number(discoveredCount).toLocaleString("ko-KR")}</strong>
+      <p>수동 검토 대상</p>
+    </article>
+    <article class="metric-card">
+      <span>게시 예정</span>
+      <strong>${Number(scheduledCount).toLocaleString("ko-KR")}</strong>
+      <p>다음 ${nextScheduledAt ? escapeHtml(formatDashboardDateTime(nextScheduledAt)) : "-"}</p>
+    </article>
+    <article class="metric-card">
+      <span>게시됨</span>
+      <strong>${Number(postedCount).toLocaleString("ko-KR")}</strong>
+      <p>최근 ${latestPostedAt ? escapeHtml(formatDashboardDateTime(latestPostedAt)) : "-"}</p>
+    </article>
+    <article class="metric-card">
+      <span>자동 발굴</span>
+      <strong>${autoDiscoveryEnabled ? "ON" : "OFF"}</strong>
+      <p>${failedCount ? `재시도 ${Number(failedCount).toLocaleString("ko-KR")}개` : "오류 없음"}</p>
+    </article>
+  </section>
+  <nav class="view-tabs" aria-label="대시보드 보기">
+    <a class="view-tab" href="/discovery?view=discovered" ${activeView === "discovered" ? 'aria-current="page"' : ""}>발굴됨 ${Number(discoveredCount).toLocaleString("ko-KR")}</a>
+    <a class="view-tab" href="/discovery?view=scheduled" ${activeView === "scheduled" ? 'aria-current="page"' : ""}>게시예정 ${Number(scheduledCount).toLocaleString("ko-KR")}</a>
+    <a class="view-tab" href="/discovery?view=posted" ${activeView === "posted" ? 'aria-current="page"' : ""}>게시됨 ${Number(postedCount).toLocaleString("ko-KR")}</a>
+  </nav>
+  <section class="posting-timeline" aria-label="게시 타임라인">
+    <div class="timeline-toolbar">
+      <div class="toolbar-badges">
+        <span>예약 예정 ${Number(counts.scheduled || 0).toLocaleString("ko-KR")}</span>
+        <span>게시 완료 ${Number(counts.posted || 0).toLocaleString("ko-KR")}</span>
+      </div>
+      <span class="summary">예약은 위, 최신 발굴은 아래 흐름으로 확인합니다.</span>
+    </div>
+    <main>${cards || `<p class="empty-state">${escapeHtml(activeViewLabel)} 항목이 없습니다.</p>`}</main>
+  </section>
   <script>
     const initialDashboardState = {
-      firstUrl: ${JSON.stringify(rows[0]?.canonicalUrl || "")},
-      rowCount: ${rows.length}
+      firstUrl: ${JSON.stringify(allRows[0]?.canonicalUrl || "")},
+      rowCount: ${allRows.length},
+      view: ${JSON.stringify(activeView)}
     };
+    const autoRefreshStorageKey = "threadDashboard.autoRefreshEnabled";
+    const autoRefreshToggle = document.getElementById("auto-refresh-toggle");
+    const autoDiscoveryToggle = document.getElementById("auto-discovery-toggle");
+    function isAutoRefreshEnabled() {
+      return localStorage.getItem(autoRefreshStorageKey) !== "false";
+    }
+    function renderAutoRefreshToggle() {
+      const enabled = isAutoRefreshEnabled();
+      autoRefreshToggle.dataset.enabled = String(enabled);
+      autoRefreshToggle.setAttribute("aria-pressed", String(enabled));
+      autoRefreshToggle.textContent = enabled ? "자동새로고침 끄기" : "자동새로고침 켜기";
+    }
+    renderAutoRefreshToggle();
+    autoRefreshToggle.addEventListener("click", () => {
+      localStorage.setItem(autoRefreshStorageKey, String(!isAutoRefreshEnabled()));
+      renderAutoRefreshToggle();
+    });
+    function renderAutoDiscoveryToggle(enabled) {
+      autoDiscoveryToggle.dataset.enabled = String(enabled);
+      autoDiscoveryToggle.setAttribute("aria-pressed", String(enabled));
+      autoDiscoveryToggle.textContent = enabled ? "자동 발굴 중지" : "자동 발굴 재개";
+    }
+    autoDiscoveryToggle.addEventListener("click", async () => {
+      const nextEnabled = autoDiscoveryToggle.dataset.enabled !== "true";
+      autoDiscoveryToggle.disabled = true;
+      autoDiscoveryToggle.textContent = nextEnabled ? "재개 중" : "중지 중";
+      try {
+        const data = await postJson("/api/discovery/auto-scan", { enabled: nextEnabled });
+        renderAutoDiscoveryToggle(data.autoDiscoveryEnabled);
+      } catch (error) {
+        alert(error.message);
+      } finally {
+        autoDiscoveryToggle.disabled = false;
+      }
+    });
     async function postJson(url, body) {
       const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body || {}) });
       const data = await res.json();
       if (!res.ok || !data.ok) throw new Error(data.error || "요청 실패");
       return data;
     }
+    function toDatetimeLocalValue(date) {
+      const pad = (value) => String(value).padStart(2, "0");
+      return [
+        date.getFullYear(),
+        pad(date.getMonth() + 1),
+        pad(date.getDate())
+      ].join("-") + "T" + [pad(date.getHours()), pad(date.getMinutes())].join(":");
+    }
+    const defaultScheduleTime = new Date(Date.now() + 15 * 60 * 1000);
+    const minScheduleTime = new Date(Date.now() + 5 * 60 * 1000);
+    document.querySelectorAll("[data-schedule-input]").forEach((input) => {
+      input.min = toDatetimeLocalValue(minScheduleTime);
+      if (!input.value) input.value = toDatetimeLocalValue(defaultScheduleTime);
+    });
     document.getElementById("add-url-form").addEventListener("submit", async (event) => {
       event.preventDefault();
       const input = document.getElementById("add-url-input");
@@ -1350,7 +1714,7 @@ async function renderDiscoveryDashboard() {
       button.disabled = true;
       button.textContent = "스캔 중";
       try {
-        await postJson("/api/discovery/run", { minLikes: 500, maxScrolls: 20 });
+        await postJson("/api/discovery/run", { minLikes: 1000, maxScrolls: 20 });
         location.reload();
       } catch (error) {
         alert(error.message);
@@ -1428,7 +1792,52 @@ async function renderDiscoveryDashboard() {
         }
       });
     });
+    document.querySelectorAll("[data-schedule]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const titleInput = document.querySelector('[data-title-input="' + CSS.escape(button.dataset.schedule) + '"]');
+        const scheduleInput = document.querySelector('[data-schedule-input="' + CSS.escape(button.dataset.schedule) + '"]');
+        const text = titleInput ? titleInput.value.trim() : "";
+        const scheduledAt = scheduleInput ? scheduleInput.value : "";
+        if (!scheduledAt) {
+          alert("예약 시간을 선택해 주세요.");
+          return;
+        }
+        button.disabled = true;
+        button.textContent = "예약 중";
+        try {
+          await postJson("/api/discovery/schedule", {
+            url: button.dataset.schedule,
+            text,
+            scheduledAt,
+            scheduledAtTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+            scheduledAtOffsetMinutes: new Date(scheduledAt).getTimezoneOffset(),
+          });
+          location.reload();
+        } catch (error) {
+          alert(error.message);
+          button.disabled = false;
+          button.textContent = "예약 게시";
+        }
+      });
+    });
+    document.querySelectorAll("[data-auto-schedule]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const titleInput = document.querySelector('[data-title-input="' + CSS.escape(button.dataset.autoSchedule) + '"]');
+        const text = titleInput ? titleInput.value.trim() : "";
+        button.disabled = true;
+        button.textContent = "자동 예약 중";
+        try {
+          await postJson("/api/discovery/auto-schedule", { url: button.dataset.autoSchedule, text });
+          location.reload();
+        } catch (error) {
+          alert(error.message);
+          button.disabled = false;
+          button.textContent = "자동 예약";
+        }
+      });
+    });
     setInterval(async () => {
+      if (!isAutoRefreshEnabled()) return;
       try {
         const res = await fetch("/api/discovery/status", { cache: "no-store" });
         const data = await res.json();
@@ -1442,6 +1851,69 @@ async function renderDiscoveryDashboard() {
   </script>
 </body>
 </html>`;
+}
+
+async function getDiscoveryDashboardData(requestUrl = "/api/discovery/dashboard") {
+  const parsedUrl = new URL(requestUrl, "http://localhost");
+  const activeView = parsedUrl.searchParams.get("view") || "discovered";
+  const autoDiscoveryEnabled = isAutoDiscoveryEnabled();
+  const allRows = await listDiscoveryRows(300);
+  const nowMs = Date.now();
+  const discoveredStatuses = new Set(["review", "draft", "failed_post", "failed_draft", "failed_schedule"]);
+  const viewRows = {
+    discovered: allRows.filter((row) => discoveredStatuses.has(row.status)),
+    scheduled: allRows.filter((row) => {
+      const time = new Date(row.scheduledPostAt || 0).getTime();
+      return row.status === "scheduled" && Number.isFinite(time) && time > nowMs;
+    }),
+    posted: allRows.filter((row) => row.status === "posted"),
+  };
+  const rows = (viewRows[activeView] || viewRows.discovered).sort((a, b) => {
+    if (activeView === "scheduled") {
+      return new Date(a.scheduledPostAt || 0).getTime() - new Date(b.scheduledPostAt || 0).getTime();
+    }
+    if (activeView === "posted") {
+      return new Date(b.postedAt || 0).getTime() - new Date(a.postedAt || 0).getTime();
+    }
+    return new Date(b.discoveredAt || 0).getTime() - new Date(a.discoveredAt || 0).getTime();
+  });
+  const counts = allRows.reduce((acc, row) => {
+    acc[row.status] = (acc[row.status] || 0) + 1;
+    return acc;
+  }, {});
+  const failedCount = Number((counts.failed_post || 0) + (counts.failed_draft || 0) + (counts.failed_schedule || 0));
+  const nextScheduledAt = viewRows.scheduled
+    .map((row) => new Date(row.scheduledPostAt || 0).getTime())
+    .filter((time) => Number.isFinite(time) && time > nowMs)
+    .sort((a, b) => a - b)[0];
+  const latestPostedAt = viewRows.posted
+    .map((row) => new Date(row.postedAt || 0).getTime())
+    .filter((time) => Number.isFinite(time))
+    .sort((a, b) => b - a)[0];
+  return {
+    ok: true,
+    view: activeView,
+    summary: {
+      discoveredCount: viewRows.discovered.length,
+      scheduledCount: viewRows.scheduled.length,
+      postedCount: viewRows.posted.length,
+      failedCount,
+      autoDiscoveryEnabled,
+      nextScheduledAt: nextScheduledAt ? new Date(nextScheduledAt).toISOString() : null,
+      latestPostedAt: latestPostedAt ? new Date(latestPostedAt).toISOString() : null,
+    },
+    rows: rows.map((row) => {
+      let criteria = {};
+      try {
+        criteria = JSON.parse(row.criteria || "{}");
+      } catch {}
+      return {
+        ...row,
+        criteria,
+        canPost: ["review", "draft", "failed_post", "failed_draft", "failed_schedule"].includes(row.status),
+      };
+    }),
+  };
 }
 
 function scheduleParts(date) {
@@ -1702,14 +2174,14 @@ async function mirrorThread(url, options = {}) {
   if (options.textOverride && String(options.textOverride).trim()) {
     threadPost.text = String(options.textOverride).trim().slice(0, 280);
   }
-  if (options.schedule && threadPost.imageMediaUrls?.length) {
+  if (options.schedule) {
     logEvent("schedule_media_strategy", {
       canonicalUrl,
-      reason: "prefer_images_for_x_scheduled_post",
-      originalMediaCount: threadPost.mediaUrls.length,
+      reason: "keep_original_media_for_x_scheduled_post",
+      mediaCount: threadPost.mediaUrls.length,
+      videoCount: threadPost.videoMediaUrls?.length || 0,
       imageCount: threadPost.imageMediaUrls.length,
     });
-    threadPost.mediaUrls = threadPost.imageMediaUrls;
   }
   const media = await downloadMedia(threadPost.mediaUrls);
   try {
@@ -1784,7 +2256,30 @@ async function createXDraftFromThread(url, options = {}) {
 
 function parseRequestedScheduleTime(value) {
   if (!value) return null;
-  const date = new Date(value);
+  if (value instanceof Date) {
+    if (!Number.isFinite(value.getTime())) {
+      throw new Error(`예약 시간을 해석하지 못했습니다: ${value}`);
+    }
+    if (value.getTime() <= Date.now() + 5 * 60 * 1000) {
+      throw new Error("예약 시간은 현재보다 최소 5분 이후여야 합니다.");
+    }
+    return value;
+  }
+  const raw = String(value).trim();
+  const localMatch = raw.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/);
+  if (!localMatch && /(?:Z|[+-]\d{2}:?\d{2})$/i.test(raw)) {
+    throw new Error(`예약 시간은 대시보드 로컬 시간 형식이어야 합니다. 시간대가 포함된 값은 거부합니다: ${raw}`);
+  }
+  const date = localMatch
+    ? new Date(
+      Number(localMatch[1]),
+      Number(localMatch[2]) - 1,
+      Number(localMatch[3]),
+      Number(localMatch[4]),
+      Number(localMatch[5]),
+      Number(localMatch[6] || 0),
+    )
+    : new Date(raw);
   if (!Number.isFinite(date.getTime())) {
     throw new Error(`예약 시간을 해석하지 못했습니다: ${value}`);
   }
@@ -1795,13 +2290,20 @@ function parseRequestedScheduleTime(value) {
 }
 
 const server = http.createServer(async (req, res) => {
+  if (req.method === "GET" && tryServeDashboardAsset(req, res)) {
+    return;
+  }
   if (req.method === "GET" && req.url === "/health") {
     json(res, 200, { ok: true, chromePort: CHROME_PORT, requiredXHandle: REQUIRED_X_HANDLE });
     return;
   }
   if (req.method === "GET" && req.url.startsWith("/discovery")) {
     try {
-      html(res, 200, await renderDiscoveryDashboard());
+      if (fs.existsSync(DASHBOARD_INDEX_PATH)) {
+        serveFile(res, DASHBOARD_INDEX_PATH);
+      } else {
+        html(res, 200, await renderDiscoveryDashboard(req.url));
+      }
     } catch (error) {
       logEvent("discovery_dashboard_error", { error: error.message });
       html(res, 500, `<pre>${escapeHtml(error.message)}</pre>`);
@@ -1834,6 +2336,7 @@ const server = http.createServer(async (req, res) => {
       const body = await readRequestBody(req);
       const payload = JSON.parse(body || "{}");
       const result = await runDiscoveryScan({
+        manual: true,
         minLikes: payload.minLikes || DISCOVERY_MIN_LIKES,
         maxScrolls: payload.maxScrolls || DISCOVERY_MAX_SCROLLS,
       });
@@ -1960,6 +2463,118 @@ const server = http.createServer(async (req, res) => {
     }
     return;
   }
+  if (req.method === "GET" && req.url.startsWith("/api/discovery/dashboard")) {
+    try {
+      json(res, 200, await getDiscoveryDashboardData(req.url));
+    } catch (error) {
+      logEvent("discovery_dashboard_api_error", { error: error.message });
+      json(res, 500, { ok: false, error: error.message });
+    }
+    return;
+  }
+  if (req.method === "POST" && req.url === "/api/discovery/auto-scan") {
+    try {
+      const body = await readRequestBody(req);
+      const payload = JSON.parse(body || "{}");
+      const settings = setAutoDiscoveryEnabled(payload.enabled === true);
+      json(res, 200, { ok: true, autoDiscoveryEnabled: settings.autoDiscoveryEnabled });
+    } catch (error) {
+      logEvent("discovery_auto_scan_setting_error", { error: error.message });
+      json(res, 500, { ok: false, error: error.message });
+    }
+    return;
+  }
+  if (req.method === "POST" && req.url === "/api/discovery/discard-discovered") {
+    try {
+      const result = await discardDiscoveredRows();
+      json(res, 200, { ok: true, ...result });
+    } catch (error) {
+      logEvent("discovery_discard_discovered_error", { error: error.message });
+      json(res, 500, { ok: false, error: error.message });
+    }
+    return;
+  }
+  if (req.method === "POST" && req.url === "/api/discovery/schedule") {
+    if (busy) {
+      json(res, 429, { ok: false, error: "다른 미러링 작업이 진행 중입니다." });
+      return;
+    }
+    let canonicalUrl = "";
+    busy = true;
+    try {
+      const body = await readRequestBody(req);
+      const payload = JSON.parse(body || "{}");
+      canonicalUrl = validateThreadsUrl(payload.url);
+      if (payload.text && String(payload.text).trim()) {
+        await updateDiscoveryTitle(canonicalUrl, payload.text);
+      }
+      logEvent("discovery_manual_schedule_request", {
+        canonicalUrl,
+        scheduledAtRaw: payload.scheduledAt || null,
+        browserTimezone: payload.scheduledAtTimezone || null,
+        browserOffsetMinutes: Number.isFinite(Number(payload.scheduledAtOffsetMinutes)) ? Number(payload.scheduledAtOffsetMinutes) : null,
+      });
+      const result = await mirrorThread(canonicalUrl, {
+        textOverride: payload.text,
+        schedule: true,
+        scheduledAt: payload.scheduledAt,
+      });
+      await markDiscoveryScheduled(canonicalUrl, result.mediaCount, result.scheduledAt);
+      json(res, 200, { ok: true, ...result });
+    } catch (error) {
+      if (canonicalUrl) await markDiscoveryScheduleFailed(canonicalUrl, error);
+      if (error instanceof DuplicateMirrorError) {
+        logEvent("discovery_manual_schedule_duplicate", { error: error.message, ...error.details });
+        json(res, 409, { ok: false, duplicate: true, error: error.message, ...error.details });
+      } else {
+        logEvent("discovery_manual_schedule_error", { canonicalUrl, error: error.message });
+        json(res, 500, { ok: false, error: error.message });
+      }
+    } finally {
+      busy = false;
+    }
+    return;
+  }
+  if (req.method === "POST" && req.url === "/api/discovery/auto-schedule") {
+    if (busy) {
+      json(res, 429, { ok: false, error: "다른 미러링 작업이 진행 중입니다." });
+      return;
+    }
+    let canonicalUrl = "";
+    busy = true;
+    try {
+      const body = await readRequestBody(req);
+      const payload = JSON.parse(body || "{}");
+      canonicalUrl = validateThreadsUrl(payload.url);
+      if (payload.text && String(payload.text).trim()) {
+        await updateDiscoveryTitle(canonicalUrl, payload.text);
+      }
+      const scheduledAt = await nextAutoScheduleTime();
+      logEvent("discovery_auto_schedule_request", {
+        canonicalUrl,
+        scheduledAt: scheduledAt.toISOString(),
+      });
+      const result = await mirrorThread(canonicalUrl, {
+        textOverride: payload.text,
+        schedule: true,
+        scheduledAt,
+      });
+      await markDiscoveryScheduled(canonicalUrl, result.mediaCount, result.scheduledAt);
+      json(res, 200, { ok: true, autoScheduled: true, ...result });
+    } catch (error) {
+      if (canonicalUrl) await markDiscoveryScheduleFailed(canonicalUrl, error);
+      if (error instanceof DuplicateMirrorError) {
+        logEvent("discovery_auto_schedule_duplicate", { error: error.message, ...error.details });
+        json(res, 409, { ok: false, duplicate: true, error: error.message, ...error.details });
+      } else {
+        logEvent("discovery_auto_schedule_error", { canonicalUrl, error: error.message });
+        json(res, 500, { ok: false, error: error.message });
+      }
+    } finally {
+      busy = false;
+    }
+    return;
+  }
   if (req.method === "GET" && req.url.startsWith("/api/discovery/status")) {
     try {
       const rows = await listDiscoveryRows(50);
@@ -1967,6 +2582,7 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         mode: "dashboard_manual_post",
         xDraftOnly: false,
+        autoDiscoveryEnabled: isAutoDiscoveryEnabled(),
         minLikes: DISCOVERY_MIN_LIKES,
         maxScrolls: DISCOVERY_MAX_SCROLLS,
         scanIntervalMs: DISCOVERY_SCAN_INTERVAL_MS,

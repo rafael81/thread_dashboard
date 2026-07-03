@@ -22,10 +22,12 @@
 ## Discovery Dashboard Rules
 
 - Discovery scans run every 5 minutes by default.
-- Discovery mode is dashboard/manual-review first: collect Threads timeline posts with at least 500 likes and confirmed media, save them as `review`, and show them on `/discovery`.
+- Discovery mode is dashboard/manual-review first: collect Threads timeline posts with at least 1000 likes and confirmed media, save them as `review`, and show them on `/discovery`.
 - Do not auto-post discovered items and do not auto-save them to X drafts.
 - Dashboard `게시` posts immediately with no confirmation popup.
 - Dashboard `초안 저장` is manual only; it uses X compose and marks the row `x_draft` only after X draft save succeeds.
+- Dashboard `예약 게시` is manual only; it uses the real X schedule UI with the dashboard-selected time and marks the row `scheduled` only after X schedule confirmation succeeds.
+- Dashboard `자동 예약` is manual only; it schedules at 30 minutes after the latest known future X scheduled slot and marks the row `scheduled` only after X schedule confirmation succeeds.
 - Do not show stale `skipped` rows in the dashboard. Old timeline-only previews can differ from the real Threads post if detail extraction failed.
 - Dashboard cards should include fixed-size media previews, playable video controls, posted time for processed rows, and collapsed diagnostics for real errors only.
 

@@ -163,7 +163,7 @@ Useful environment variables:
 - `PORT` default `3131`
 - `CHROME_PORT` default `9224`
 - `X_HANDLE` default `terafabXai`
-- `DISCOVERY_MIN_LIKES` default `500`
+- `DISCOVERY_MIN_LIKES` default `1000`
 - `DISCOVERY_SCAN_INTERVAL_MS` default `300000`
 - `DISCOVERY_MAX_SCROLLS` default `20`
 

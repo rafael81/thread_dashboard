@@ -4,6 +4,7 @@
   "description": "Threads discovery dashboard and Threads-to-X mirror server.",
   "main": "index.js",
   "scripts": {
+    "build:dashboard": "vite build --config dashboard/vite.config.js",
     "export-runtime": "node scripts/export-runtime-state.js",
     "import-runtime": "node scripts/import-runtime-state.js",
     "memory": "node scripts/ai-memory.js",
@@ -16,6 +17,9 @@
   "type": "commonjs",
   "dependencies": {
     "@tursodatabase/database": "^0.6.1",
+    "lucide-react": "^1.23.0",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
     "ws": "^8.21.0"
   }
 }
