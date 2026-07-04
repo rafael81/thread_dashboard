@@ -1,31 +1,52 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
-  CalendarClock,
-  CheckCircle2,
-  Clock3,
-  ExternalLink,
-  FilePenLine,
-  Heart,
-  Loader2,
-  MessageCircle,
-  PauseCircle,
-  PlayCircle,
-  RefreshCcw,
-  Send,
-  Sparkles,
+  ExternalLinkIcon,
+  CheckCircle2Icon,
+  DatabaseZapIcon,
+  HeartIcon,
+  Loader2Icon,
+  MessageCircleIcon,
+  PauseCircleIcon,
+  PlayCircleIcon,
+  RefreshCcwIcon,
+  SparklesIcon,
+  TrendingUpIcon,
 } from "lucide-react";
+import { toast } from "sonner";
+
+import { AppSidebar } from "@/components/app-sidebar";
+import { ChartAreaInteractive } from "@/components/chart-area-interactive";
+import { DataTable } from "@/components/data-table";
+import { SectionCards } from "@/components/section-cards";
+import { SiteHeader } from "@/components/site-header";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  SidebarInset,
+  SidebarProvider,
+} from "@/components/ui/sidebar";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Toaster } from "@/components/ui/sonner";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import "./styles.css";
-
-const views = [
-  { id: "discovered", label: "발굴됨" },
-  { id: "scheduled", label: "게시예정" },
-  { id: "posted", label: "게시됨" },
-];
-
-function cx(...parts) {
-  return parts.filter(Boolean).join(" ");
-}
 
 async function api(path, options = {}) {
   const res = await fetch(path, {
@@ -35,10 +56,6 @@ async function api(path, options = {}) {
   const data = await res.json();
   if (!res.ok || data.ok === false) throw new Error(data.error || "요청 실패");
   return data;
-}
-
-function isVideo(url = "") {
-  return /\.mp4|\/o1\/v\/t16\//i.test(url);
 }
 
 function formatDate(value) {
@@ -60,6 +77,23 @@ function compact(value) {
   return Number(value || 0).toLocaleString("ko-KR");
 }
 
+function totalActivity(day) {
+  return Number(day?.posted || 0) + Number(day?.comments || 0) + Number(day?.hearts || 0);
+}
+
+function growthSummary(flowDays = []) {
+  const recent = flowDays.slice(-7).reduce((total, day) => total + totalActivity(day), 0);
+  const previous = flowDays.slice(-14, -7).reduce((total, day) => total + totalActivity(day), 0);
+  const rate = previous ? ((recent - previous) / previous) * 100 : recent ? 100 : 0;
+  const rounded = Math.abs(rate) >= 10 ? Math.round(rate) : Math.round(rate * 10) / 10;
+  return {
+    recent,
+    previous,
+    value: `${rounded > 0 ? "+" : ""}${rounded}%`,
+    trend: rounded >= 0 ? "상승" : "하락",
+  };
+}
+
 function Dashboard() {
   const [view, setView] = useState(new URLSearchParams(location.search).get("view") || "discovered");
   const [data, setData] = useState(null);
@@ -71,6 +105,7 @@ function Dashboard() {
   const [terafabxResult, setTerafabxResult] = useState(null);
   const [autoRefresh, setAutoRefresh] = useState(localStorage.getItem("threadDashboard.autoRefreshEnabled") !== "false");
   const [error, setError] = useState("");
+  const [automationDate, setAutomationDate] = useState("all");
 
   async function load(nextView = view) {
     setError("");
@@ -99,31 +134,73 @@ function Dashboard() {
     return () => clearInterval(timer);
   }, [autoRefresh, view]);
 
-  const metrics = useMemo(() => {
-    const summary = data?.summary || {};
-    return [
-      { label: "발굴 대기", value: summary.discoveredCount ?? 0, note: "수동 검토 대상", icon: Sparkles },
-      { label: "게시 예정", value: summary.scheduledCount ?? 0, note: `다음 ${formatDate(summary.nextScheduledAt)}`, icon: CalendarClock },
-      { label: "게시됨", value: summary.postedCount ?? 0, note: `최근 ${formatDate(summary.latestPostedAt)}`, icon: CheckCircle2 },
-      { label: "자동 발굴", value: summary.autoDiscoveryEnabled ? "ON" : "OFF", note: summary.failedCount ? `재시도 ${summary.failedCount}개` : "오류 없음", icon: summary.autoDiscoveryEnabled ? PlayCircle : PauseCircle },
-    ];
-  }, [data]);
+  const summary = data?.summary || {};
+  const rows = data?.rows || [];
+  const automation = data?.automation || {};
+  const flowDays = automation.flowDays || [];
+  const commentTimeline = automation.commentTimeline || [];
+  const availableDates = automation.availableDates || [];
+  const growth = useMemo(() => growthSummary(flowDays), [flowDays]);
+  const selectedComments = useMemo(() => (
+    automationDate === "all"
+      ? commentTimeline
+      : commentTimeline.filter((item) => item.date === automationDate)
+  ), [automationDate, commentTimeline]);
 
-  async function runAction(label, fn) {
+  useEffect(() => {
+    if (automationDate !== "all" && availableDates.length && !availableDates.includes(automationDate)) {
+      setAutomationDate("all");
+    }
+  }, [automationDate, availableDates]);
+
+  const metrics = useMemo(() => [
+    {
+      label: "게시됨",
+      value: compact(summary.postedCount),
+      note: `최근 ${formatDate(summary.latestPostedAt)}`,
+      trend: "완료",
+      icon: CheckCircle2Icon,
+    },
+    {
+      label: "자동댓글",
+      value: compact(summary.commentCount),
+      note: `최근 ${formatDate(summary.lastCommentAt)}`,
+      trend: data?.terafabx?.comment?.enabled ? "ON" : "OFF",
+      icon: MessageCircleIcon,
+    },
+    {
+      label: "하트수",
+      value: compact(summary.heartCount),
+      note: `최근 ${formatDate(summary.lastHeartAt)}`,
+      trend: data?.terafabx?.heart?.enabled ? "ON" : "OFF",
+      icon: HeartIcon,
+    },
+    {
+      label: "성장률",
+      value: growth.value,
+      note: `최근 7일 ${compact(growth.recent)}건 · 이전 7일 ${compact(growth.previous)}건`,
+      trend: growth.trend,
+      icon: TrendingUpIcon,
+    },
+  ], [data?.terafabx, growth, summary]);
+
+  async function runAction(label, fn, success = "완료됨") {
     setBusy(label);
     setError("");
     try {
       await fn();
       await load(view);
+      toast.success(success);
     } catch (err) {
       setError(err.message);
+      toast.error(err.message);
     } finally {
       setBusy("");
     }
   }
 
-  function rowText(url) {
-    return (titleEdits[url] || "").trim();
+  function rowText(row) {
+    return (titleEdits[row.canonicalUrl] || row.textPreview || "").trim();
   }
 
   async function runTerafabx(job, action) {
@@ -133,174 +210,323 @@ function Dashboard() {
         body: JSON.stringify({ job, action }),
       });
       setTerafabxResult(result);
-    });
+    }, "자동화 상태 변경됨");
   }
 
+  const controlsBusy = Boolean(busy);
+
   return (
-    <div className="app-shell">
-      <header className="topbar">
-        <div>
-          <h1>Threads 발굴 대시보드</h1>
-          <p>좋아요 1000+ · 미디어 포함 · X 수동 검토/예약 워크플로우</p>
-        </div>
-        <div className="topbar-actions">
-          <button
-            className={cx("btn", data?.summary?.autoDiscoveryEnabled ? "btn-outline" : "btn-primary")}
-            disabled={Boolean(busy)}
-            onClick={() => runAction("auto-scan", () => api("/api/discovery/auto-scan", {
-              method: "POST",
-              body: JSON.stringify({ enabled: !data?.summary?.autoDiscoveryEnabled }),
-            }))}
-          >
-            {data?.summary?.autoDiscoveryEnabled ? <PauseCircle /> : <PlayCircle />}
-            {data?.summary?.autoDiscoveryEnabled ? "자동 발굴 중지" : "자동 발굴 재개"}
-          </button>
-          <button className="btn btn-outline" onClick={() => { const next = !autoRefresh; setAutoRefresh(next); localStorage.setItem("threadDashboard.autoRefreshEnabled", String(next)); }}>
-            <RefreshCcw />
-            {autoRefresh ? "자동새로고침 끄기" : "자동새로고침 켜기"}
-          </button>
-          <button className="btn btn-outline" disabled={Boolean(busy)} onClick={() => runAction("refresh", () => api("/api/discovery/refresh-previews", { method: "POST", body: JSON.stringify({ limit: 5 }) }))}>
-            {busy === "refresh" ? <Loader2 className="spin" /> : <RefreshCcw />}
-            미리보기 보강
-          </button>
-          <button className="btn btn-primary" disabled={Boolean(busy)} onClick={() => runAction("scan", () => api("/api/discovery/run", { method: "POST", body: JSON.stringify({ minLikes: 1000, maxScrolls: 20 }) }))}>
-            {busy === "scan" ? <Loader2 className="spin" /> : <Sparkles />}
-            지금 스캔
-          </button>
-        </div>
-      </header>
+    <TooltipProvider>
+      <SidebarProvider
+        style={{
+          "--sidebar-width": "calc(var(--spacing) * 72)",
+          "--header-height": "calc(var(--spacing) * 12)",
+        }}
+      >
+        <AppSidebar
+          variant="inset"
+          view={view}
+          onViewChange={setView}
+          summary={summary}
+          terafabx={data?.terafabx}
+          automation={automation}
+          automationDate={automationDate}
+          onAutomationDateChange={setAutomationDate}
+        />
+        <SidebarInset>
+          <SiteHeader
+            title="Threads 발굴 대시보드"
+            subtitle="좋아요 1000+ · 미디어 포함 · X 수동 검토/예약 워크플로우"
+            autoRefresh={autoRefresh}
+            busy={controlsBusy}
+            onRefresh={() => runAction("refresh-data", () => load(view), "새로고침 완료")}
+            onToggleAutoRefresh={() => {
+              const next = !autoRefresh;
+              setAutoRefresh(next);
+              localStorage.setItem("threadDashboard.autoRefreshEnabled", String(next));
+            }}
+          />
+          <div className="flex flex-1 flex-col">
+            <div className="@container/main flex flex-1 flex-col gap-4 py-4 md:gap-6 md:py-6">
+              <SectionCards metrics={metrics} />
 
-      <section className="url-card">
-        <input value={urlInput} onChange={(event) => setUrlInput(event.target.value)} placeholder="Threads URL 추가" />
-        <button className="btn btn-primary" disabled={!urlInput.trim() || Boolean(busy)} onClick={() => runAction("add", async () => {
-          await api("/api/discovery/add-url", { method: "POST", body: JSON.stringify({ url: urlInput.trim() }) });
-          setUrlInput("");
-        })}>추가</button>
-      </section>
+              <div className="grid gap-4 px-4 lg:grid-cols-[minmax(0,1fr)_minmax(320px,420px)] lg:px-6" id="controls">
+                <Card id="add-url">
+                  <CardHeader>
+                    <CardTitle>수동 추가</CardTitle>
+                    <CardDescription>
+                      Android 공유 없이 Threads URL을 대시보드에 바로 넣습니다.
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto]">
+                    <Input
+                      value={urlInput}
+                      onChange={(event) => setUrlInput(event.target.value)}
+                      placeholder="https://www.threads.com/@..."
+                    />
+                    <Button
+                      disabled={!urlInput.trim() || controlsBusy}
+                      onClick={() =>
+                        runAction("add", async () => {
+                          await api("/api/discovery/add-url-async", {
+                            method: "POST",
+                            body: JSON.stringify({ url: urlInput.trim(), origin: "dashboard" }),
+                          });
+                          setUrlInput("");
+                        }, "대시보드에 추가됨")
+                      }
+                    >
+                      <SparklesIcon data-icon="inline-start" />
+                      추가
+                    </Button>
+                  </CardContent>
+                </Card>
 
-      <section className="metrics-grid">
-        {metrics.map((metric) => {
-          const Icon = metric.icon;
-          return (
-            <article className="metric-card" key={metric.label}>
-              <div className="metric-head">
-                <span>{metric.label}</span>
-                <Icon />
+                <Card>
+                  <CardHeader>
+                    <CardTitle>스캔/보강</CardTitle>
+                    <CardDescription>
+                      발굴 스캔과 미리보기 보강 작업을 수동 실행합니다.
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className="grid grid-cols-2 gap-2">
+                    <Button
+                      variant={summary.autoDiscoveryEnabled ? "outline" : "default"}
+                      disabled={controlsBusy}
+                      onClick={() =>
+                        runAction("auto-scan", () => api("/api/discovery/auto-scan", {
+                          method: "POST",
+                          body: JSON.stringify({ enabled: !summary.autoDiscoveryEnabled }),
+                        }), "자동 발굴 설정 변경됨")
+                      }
+                    >
+                      {summary.autoDiscoveryEnabled ? <PauseCircleIcon data-icon="inline-start" /> : <PlayCircleIcon data-icon="inline-start" />}
+                      {summary.autoDiscoveryEnabled ? "중지" : "재개"}
+                    </Button>
+                    <Button
+                      variant="outline"
+                      disabled={controlsBusy}
+                      onClick={() =>
+                        runAction("refresh-previews", () => api("/api/discovery/refresh-previews", {
+                          method: "POST",
+                          body: JSON.stringify({ limit: 5 }),
+                        }), "미리보기 보강 완료")
+                      }
+                    >
+                      <RefreshCcwIcon data-icon="inline-start" />
+                      보강
+                    </Button>
+                    <Button
+                      className="col-span-2"
+                      disabled={controlsBusy}
+                      onClick={() =>
+                        runAction("scan", () => api("/api/discovery/run", {
+                          method: "POST",
+                          body: JSON.stringify({ minLikes: 1000, maxScrolls: 20 }),
+                        }), "스캔 완료")
+                      }
+                    >
+                      {busy === "scan" ? <Loader2Icon data-icon="inline-start" className="animate-spin" /> : <DatabaseZapIcon data-icon="inline-start" />}
+                      지금 스캔
+                    </Button>
+                  </CardContent>
+                </Card>
               </div>
-              <strong>{typeof metric.value === "number" ? compact(metric.value) : metric.value}</strong>
-              <p>{metric.note}</p>
-            </article>
-          );
-        })}
-      </section>
 
-      <section className="terafabx-panel">
-        <div className="terafabx-head">
-          <div>
-            <h2>과즙루피 자동화</h2>
-            <p>Hermes CLI 미사용 · 댓글 생성 Grok CLI · 댓글/하트 실행 mirror_server.js CDP 코드 · Chrome {data?.terafabx?.chromePort || 9224}</p>
-          </div>
-          <button className="btn btn-outline" disabled={Boolean(busy)} onClick={() => runAction("terafabx-refresh", async () => setTerafabxResult(await api("/api/terafabx/automation")))}>
-            {busy === "terafabx-refresh" ? <Loader2 className="spin" /> : <RefreshCcw />}
-            상태 새로고침
-          </button>
-        </div>
-        <div className="terafabx-grid">
-          <article className="terafabx-card">
-            <div className="terafabx-title"><strong><MessageCircle /> 자동댓글</strong><span>{data?.terafabx?.comment?.enabled ? "ON" : "OFF"}</span></div>
-            <p>엔진: Grok CLI · 상태: {data?.terafabx?.comment?.lastStatus || "대기"}</p>
-            <p>최근 실행: {formatDate(data?.terafabx?.comment?.lastRunAt)} · 다음 자동: {formatDate(data?.terafabx?.comment?.nextRunAt)}</p>
-            <p className="terafabx-last">최근 댓글: {data?.terafabx?.comment?.lastComment || "-"}</p>
-            {data?.terafabx?.comment?.lastReplyUrl ? <a className="btn btn-outline full" href={data.terafabx.comment.lastReplyUrl} target="_blank" rel="noreferrer"><ExternalLink /> 최근 답글 열기</a> : null}
-            {data?.terafabx?.comment?.lastError ? <p className="terafabx-error">오류: {data.terafabx.comment.lastError}</p> : null}
-            <div className="terafabx-actions">
-              <button className="btn btn-primary" disabled={Boolean(busy)} onClick={() => runTerafabx("comment", "run")}>{busy === "terafabx-comment-run" ? <Loader2 className="spin" /> : <MessageCircle />} 지금 댓글 1회</button>
-              <button className="btn btn-outline" disabled={Boolean(busy)} onClick={() => runTerafabx("comment", "enable")}>ON</button>
-              <button className="btn btn-outline" disabled={Boolean(busy)} onClick={() => runTerafabx("comment", "disable")}>OFF</button>
-            </div>
-          </article>
-          <article className="terafabx-card">
-            <div className="terafabx-title"><strong><Heart /> 하트</strong><span>{data?.terafabx?.heart?.enabled ? "ON" : "OFF"}</span></div>
-            <p>엔진: 로컬 CDP 스크립트 · 상태: {data?.terafabx?.heart?.lastStatus || "대기"}</p>
-            <p>최근 실행: {formatDate(data?.terafabx?.heart?.lastRunAt)} · 최근 {compact(data?.terafabx?.heart?.lastCount || 0)}개 · 다음 자동: {formatDate(data?.terafabx?.heart?.nextRunAt)}</p>
-            <p className="terafabx-last">대상: X 홈/For You/Following 공개 타임라인</p>
-            {data?.terafabx?.heart?.lastError ? <p className="terafabx-error">오류: {data.terafabx.heart.lastError}</p> : null}
-            <div className="terafabx-actions">
-              <button className="btn btn-primary" disabled={Boolean(busy)} onClick={() => runTerafabx("heart", "run")}>{busy === "terafabx-heart-run" ? <Loader2 className="spin" /> : <Heart />} 지금 하트 1회</button>
-              <button className="btn btn-outline" disabled={Boolean(busy)} onClick={() => runTerafabx("heart", "enable")}>ON</button>
-              <button className="btn btn-outline" disabled={Boolean(busy)} onClick={() => runTerafabx("heart", "disable")}>OFF</button>
-            </div>
-          </article>
-        </div>
-        <pre className="terafabx-result">{terafabxResult ? JSON.stringify(terafabxResult, null, 2) : `락: ${data?.terafabx?.lock?.busy ? `사용 중 ${data.terafabx.lock.action || ""}` : "대기"}`}</pre>
-      </section>
+              {error ? (
+                <div className="px-4 lg:px-6">
+                  <Alert variant="destructive">
+                    <AlertTitle>작업 실패</AlertTitle>
+                    <AlertDescription>{error}</AlertDescription>
+                  </Alert>
+                </div>
+              ) : null}
 
-      <nav className="tabs">
-        {views.map((item) => (
-          <button key={item.id} className={cx("tab", view === item.id && "active")} onClick={() => setView(item.id)}>
-            {item.label}
-            <span>{compact(data?.summary?.[`${item.id}Count`] || 0)}</span>
-          </button>
-        ))}
-      </nav>
+              <div className="grid gap-4 px-4 lg:grid-cols-[minmax(0,1fr)_minmax(320px,420px)] lg:px-6">
+                {loading ? (
+                  <Skeleton className="h-[350px] rounded-lg" />
+                ) : (
+                  <ChartAreaInteractive flowDays={flowDays} />
+                )}
 
-      {error ? <div className="error">{error}</div> : null}
+                <Card id="terafabx">
+                  <CardHeader>
+                    <CardTitle>과즙루피 자동화</CardTitle>
+                    <CardDescription>
+                      Grok CLI 댓글 · Chrome {data?.terafabx?.chromePort || 9224} · 락 {data?.terafabx?.lock?.busy ? "사용 중" : "대기"}
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className="grid gap-4">
+                    <div className="grid grid-cols-3 gap-2">
+                      <div className="rounded-lg border p-3">
+                        <div className="text-xs text-muted-foreground">게시됨</div>
+                        <div className="text-xl font-semibold tabular-nums">{compact(summary.postedCount)}</div>
+                      </div>
+                      <div className="rounded-lg border p-3">
+                        <div className="text-xs text-muted-foreground">자동댓글</div>
+                        <div className="text-xl font-semibold tabular-nums">{compact(summary.commentCount)}</div>
+                      </div>
+                      <div className="rounded-lg border p-3">
+                        <div className="text-xs text-muted-foreground">하트수</div>
+                        <div className="text-xl font-semibold tabular-nums">{compact(summary.heartCount)}</div>
+                      </div>
+                    </div>
+                    <div className="grid gap-3 rounded-lg border p-3">
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2 font-medium">
+                            <MessageCircleIcon className="size-4" />
+                            자동댓글 {data?.terafabx?.comment?.enabled ? "ON" : "OFF"}
+                          </div>
+                          <p className="truncate text-sm text-muted-foreground">
+                            최근 {data?.terafabx?.comment?.lastComment || "-"}
+                          </p>
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-3 gap-2">
+                        <Button size="sm" disabled={controlsBusy} onClick={() => runTerafabx("comment", "run")}>1회</Button>
+                        <Button size="sm" variant="outline" disabled={controlsBusy} onClick={() => runTerafabx("comment", "enable")}>ON</Button>
+                        <Button size="sm" variant="outline" disabled={controlsBusy} onClick={() => runTerafabx("comment", "disable")}>OFF</Button>
+                      </div>
+                    </div>
+                    <div className="grid gap-3 rounded-lg border p-3">
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2 font-medium">
+                            <HeartIcon className="size-4" />
+                            하트 {data?.terafabx?.heart?.enabled ? "ON" : "OFF"}
+                          </div>
+                          <p className="truncate text-sm text-muted-foreground">
+                            최근 {compact(data?.terafabx?.heart?.lastCount)}개 · 다음 {formatDate(data?.terafabx?.heart?.nextRunAt)}
+                          </p>
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-3 gap-2">
+                        <Button size="sm" disabled={controlsBusy} onClick={() => runTerafabx("heart", "run")}>1회</Button>
+                        <Button size="sm" variant="outline" disabled={controlsBusy} onClick={() => runTerafabx("heart", "enable")}>ON</Button>
+                        <Button size="sm" variant="outline" disabled={controlsBusy} onClick={() => runTerafabx("heart", "disable")}>OFF</Button>
+                      </div>
+                    </div>
+                    <div className="grid gap-3 rounded-lg border p-3">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="font-medium">댓글 타임라인</div>
+                          <p className="text-sm text-muted-foreground">
+                            {automationDate === "all" ? "전체 날짜" : automationDate} · {compact(selectedComments.length)}개
+                          </p>
+                        </div>
+                        <Select value={automationDate} onValueChange={setAutomationDate}>
+                          <SelectTrigger className="w-[132px]" size="sm" aria-label="댓글 날짜 선택">
+                            <SelectValue placeholder="날짜" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectGroup>
+                              <SelectItem value="all">전체</SelectItem>
+                              {availableDates.map((date) => (
+                                <SelectItem key={date} value={date}>{date}</SelectItem>
+                              ))}
+                            </SelectGroup>
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      <div className="max-h-[360px] overflow-auto rounded-lg border bg-muted/20">
+                        {selectedComments.length ? (
+                          selectedComments.slice(0, 30).map((item) => (
+                            <div key={`${item.at}-${item.targetUrl || item.replyUrl}`} className="grid gap-1 border-b p-3 last:border-b-0">
+                              <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+                                <span>{formatDate(item.at)}</span>
+                                <Badge variant={item.manual ? "outline" : "secondary"}>{item.manual ? "수동" : "자동"}</Badge>
+                              </div>
+                              <p className="line-clamp-2 text-sm font-medium">{item.comment || "댓글 내용 없음"}</p>
+                              {item.targetText ? (
+                                <p className="line-clamp-1 text-xs text-muted-foreground">{item.targetText}</p>
+                              ) : null}
+                              {item.replyUrl || item.targetUrl ? (
+                                <a
+                                  className="inline-flex w-fit items-center gap-1 text-xs font-medium text-primary hover:underline"
+                                  href={item.replyUrl || item.targetUrl}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                >
+                                  X에서 보기
+                                  <ExternalLinkIcon className="size-3" />
+                                </a>
+                              ) : null}
+                            </div>
+                          ))
+                        ) : (
+                          <div className="p-4 text-sm text-muted-foreground">
+                            선택한 날짜의 댓글 기록이 없습니다.
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                    <pre className="max-h-40 overflow-auto rounded-lg bg-muted p-3 text-xs">
+                      {terafabxResult ? JSON.stringify(terafabxResult, null, 2) : "대기"}
+                    </pre>
+                  </CardContent>
+                </Card>
+              </div>
 
-      <main className="content-grid">
-        {loading ? <div className="empty-state">불러오는 중...</div> : null}
-        {!loading && !data?.rows?.length ? <div className="empty-state">{views.find((item) => item.id === view)?.label} 항목이 없습니다.</div> : null}
-        {data?.rows?.map((row) => (
-          <article className="post-card" key={row.canonicalUrl}>
-            <div className="media-frame">
-              {row.mediaPreviewUrl ? (
-                isVideo(row.mediaPreviewUrl)
-                  ? <video src={row.mediaPreviewUrl} muted playsInline controls loop preload="metadata" />
-                  : <img src={row.mediaPreviewUrl} alt="" loading="lazy" referrerPolicy="no-referrer" />
+              {loading ? (
+                <div className="px-4 lg:px-6">
+                  <Skeleton className="h-[520px] rounded-lg" />
+                </div>
               ) : (
-                <a href={row.canonicalUrl} target="_blank" rel="noreferrer">미리보기 보강 필요</a>
+                <DataTable
+                  rows={rows}
+                  view={view}
+                  counts={summary}
+                  titleEdits={titleEdits}
+                  scheduleEdits={scheduleEdits}
+                  busy={busy}
+                  onViewChange={setView}
+                  onTitleChange={setTitleEdits}
+                  onScheduleChange={setScheduleEdits}
+                  onSaveTitle={(row) =>
+                    runAction(`save-${row.canonicalUrl}`, () => api("/api/discovery/title", {
+                      method: "POST",
+                      body: JSON.stringify({ url: row.canonicalUrl, text: rowText(row) }),
+                    }), "제목 저장됨")
+                  }
+                  onPost={(row) =>
+                    runAction(`post-${row.canonicalUrl}`, () => api("/api/discovery/post", {
+                      method: "POST",
+                      body: JSON.stringify({ url: row.canonicalUrl, text: rowText(row) }),
+                    }), "X에 게시됨")
+                  }
+                  onDraft={(row) =>
+                    runAction(`draft-${row.canonicalUrl}`, () => api("/api/discovery/draft", {
+                      method: "POST",
+                      body: JSON.stringify({ url: row.canonicalUrl, text: rowText(row) }),
+                    }), "X 초안 저장됨")
+                  }
+                  onSchedule={(row) =>
+                    runAction(`schedule-${row.canonicalUrl}`, () => api("/api/discovery/schedule", {
+                      method: "POST",
+                      body: JSON.stringify({
+                        url: row.canonicalUrl,
+                        text: rowText(row),
+                        scheduledAt: scheduleEdits[row.canonicalUrl],
+                      }),
+                    }), "X 예약됨")
+                  }
+                  onAutoSchedule={(row) =>
+                    runAction(`auto-${row.canonicalUrl}`, () => api("/api/discovery/auto-schedule", {
+                      method: "POST",
+                      body: JSON.stringify({ url: row.canonicalUrl, text: rowText(row) }),
+                    }), "자동 예약됨")
+                  }
+                  formatDate={formatDate}
+                  compact={compact}
+                />
               )}
             </div>
-
-            <div className="badge-row">
-              <span>좋아요 {compact(row.likeCount)}</span>
-              <span>미디어 {compact(row.mediaCount)}</span>
-              <span>점수 {compact(row.viralScore)}</span>
-              <span>{row.status}</span>
-            </div>
-
-            {row.scheduledPostAt ? <div className="time-box"><span>게시 예정 시간</span><strong>{formatDate(row.scheduledPostAt)}</strong></div> : null}
-            {row.postedAt && !row.scheduledPostAt ? <div className="time-box muted"><span>게시된 시간</span><strong>{formatDate(row.postedAt)}</strong></div> : null}
-
-            <div className="author">@{row.author || "unknown"}</div>
-            <p className="preview">{row.textPreview || "(본문 없음)"}</p>
-
-            <label className="editor">
-              <span>게시글</span>
-              <textarea value={titleEdits[row.canonicalUrl] ?? row.textPreview ?? ""} maxLength={280} rows={3} onChange={(event) => setTitleEdits((prev) => ({ ...prev, [row.canonicalUrl]: event.target.value }))} />
-            </label>
-            <button className="btn btn-outline full" disabled={Boolean(busy)} onClick={() => runAction(`save-${row.canonicalUrl}`, () => api("/api/discovery/title", { method: "POST", body: JSON.stringify({ url: row.canonicalUrl, text: rowText(row.canonicalUrl) }) }))}>
-              <FilePenLine />
-              제목 저장
-            </button>
-
-            <div className="criteria">
-              <span>짧은 훅 {row.criteria?.shortHook ? "Y" : "N"}</span>
-              <span>강한 미디어 {row.criteria?.strongMedia ? "Y" : "N"}</span>
-              <span>논쟁성 {row.criteria?.controversy ? "Y" : "N"}</span>
-            </div>
-
-            <div className="card-actions">
-              <a className="btn btn-outline full" href={row.canonicalUrl} target="_blank" rel="noreferrer"><ExternalLink /> 원문 열기</a>
-              <button className="btn btn-primary" disabled={!row.canPost || Boolean(busy)} onClick={() => runAction(`post-${row.canonicalUrl}`, () => api("/api/discovery/post", { method: "POST", body: JSON.stringify({ url: row.canonicalUrl, text: rowText(row.canonicalUrl) }) }))}><Send /> 게시</button>
-              <button className="btn btn-outline" disabled={!row.canPost || Boolean(busy)} onClick={() => runAction(`draft-${row.canonicalUrl}`, () => api("/api/discovery/draft", { method: "POST", body: JSON.stringify({ url: row.canonicalUrl, text: rowText(row.canonicalUrl) }) }))}>초안 저장</button>
-              <input className="schedule-input" type="datetime-local" value={scheduleEdits[row.canonicalUrl] || ""} onChange={(event) => setScheduleEdits((prev) => ({ ...prev, [row.canonicalUrl]: event.target.value }))} />
-              <button className="btn btn-outline" disabled={!row.canPost || Boolean(busy)} onClick={() => runAction(`schedule-${row.canonicalUrl}`, () => api("/api/discovery/schedule", { method: "POST", body: JSON.stringify({ url: row.canonicalUrl, text: rowText(row.canonicalUrl), scheduledAt: scheduleEdits[row.canonicalUrl] }) }))}><Clock3 /> 예약 게시</button>
-              <button className="btn btn-primary full" disabled={!row.canPost || Boolean(busy)} onClick={() => runAction(`auto-${row.canonicalUrl}`, () => api("/api/discovery/auto-schedule", { method: "POST", body: JSON.stringify({ url: row.canonicalUrl, text: rowText(row.canonicalUrl) }) }))}><CalendarClock /> 자동 예약</button>
-            </div>
-          </article>
-        ))}
-      </main>
-    </div>
+          </div>
+        </SidebarInset>
+      </SidebarProvider>
+      <Toaster richColors closeButton />
+    </TooltipProvider>
   );
 }
 
