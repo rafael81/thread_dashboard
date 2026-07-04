@@ -12,6 +12,7 @@ import {
   RefreshCcwIcon,
   SparklesIcon,
   TrendingUpIcon,
+  FileTextIcon
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -77,6 +78,146 @@ function compact(value) {
   return Number(value || 0).toLocaleString("ko-KR");
 }
 
+
+function NaverBlogOps({ data, loading, busy, error, onRunAction, onReload }) {
+  const state = data?.state || {};
+  const browser = data?.browser || {};
+  const scheduler = data?.scheduler || {};
+  const events = data?.events || [];
+  const [scheduleText, setScheduleText] = useState((state.schedule || ["08:00", "15:00", "21:00"]).join(", "));
+
+  useEffect(() => {
+    setScheduleText((state.schedule || ["08:00", "15:00", "21:00"]).join(", "));
+  }, [state.schedule]);
+
+  const schedule = scheduleText.split(",").map((item) => item.trim()).filter(Boolean);
+  const disabled = Boolean(busy || loading || scheduler.busy);
+
+  return (
+    <div className="grid gap-4 px-4 lg:px-6">
+      <div className="grid gap-4 lg:grid-cols-4">
+        <Card>
+          <CardHeader className="pb-2">
+            <CardDescription>자체 스케줄러</CardDescription>
+            <CardTitle>{state.enabled ? "ON" : "OFF"}</CardTitle>
+          </CardHeader>
+          <CardContent className="text-sm text-muted-foreground">
+            Hermes cron 미사용 · 다음 {formatDate(state.nextRunAt)}
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader className="pb-2">
+            <CardDescription>작성자</CardDescription>
+            <CardTitle>Gemini Web Only</CardTitle>
+          </CardHeader>
+          <CardContent className="text-sm text-muted-foreground">
+            다른 LLM 본문 작성 차단
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader className="pb-2">
+            <CardDescription>브라우저 프로필</CardDescription>
+            <CardTitle>{browser.running ? "실행 중" : "대기"}</CardTitle>
+          </CardHeader>
+          <CardContent className="text-sm text-muted-foreground">
+            Chrome {browser.port || 9233} · 블로그 {browser.blogTabs || 0} · Gemini {browser.geminiTabs || 0}
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader className="pb-2">
+            <CardDescription>마지막 작업</CardDescription>
+            <CardTitle>{state.lastRun?.status || "-"}</CardTitle>
+          </CardHeader>
+          <CardContent className="truncate text-sm text-muted-foreground">
+            {state.lastRun?.title || state.lastRun?.error || "아직 실행 없음"}
+          </CardContent>
+        </Card>
+      </div>
+
+      {error ? (
+        <Alert variant="destructive">
+          <AlertTitle>네이버 블로그 작업 실패</AlertTitle>
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      ) : null}
+
+      <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_420px]">
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2"><FileTextIcon className="size-5" /> 네이버 블로그 작성 운영</CardTitle>
+            <CardDescription>
+              검색수요 후보 → Gemini Web 초안 → SmartEditor 임시저장 흐름을 이 서버 자체 스케줄러로 운영합니다.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="grid gap-4">
+            <div className="grid gap-2">
+              <label className="text-sm font-medium" htmlFor="naver-schedule">실행 시간(KST, 쉼표 구분)</label>
+              <Input id="naver-schedule" value={scheduleText} onChange={(event) => setScheduleText(event.target.value)} placeholder="08:00, 15:00, 21:00" />
+            </div>
+            <div className="grid gap-2 rounded-lg border p-3 text-sm text-muted-foreground">
+              <div>블로그 ID: <span className="font-medium text-foreground">{state.blogId || "cury8282"}</span></div>
+              <div>모드: <span className="font-medium text-foreground">임시저장 전용 / 발행 금지</span></div>
+              <div>프로필: <span className="font-mono text-xs">{browser.profileDir || state.chrome?.profileDir}</span></div>
+              <div>규칙: 제목 바로 아래 대표 이미지 · 엔터/방송/근황은 실제 이미지 우선 · 완료 후 탭 정리</div>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <Button disabled={disabled} onClick={() => onRunAction("naver-settings-enable", () => api("/api/naver-blog/settings", { method: "POST", body: JSON.stringify({ enabled: true, schedule }) }), "네이버 블로그 스케줄러 ON")}>ON</Button>
+              <Button variant="outline" disabled={disabled} onClick={() => onRunAction("naver-settings-disable", () => api("/api/naver-blog/settings", { method: "POST", body: JSON.stringify({ enabled: false, schedule }) }), "네이버 블로그 스케줄러 OFF")}>OFF</Button>
+              <Button variant="outline" disabled={disabled} onClick={() => onRunAction("naver-settings-save", () => api("/api/naver-blog/settings", { method: "POST", body: JSON.stringify({ schedule, enabled: state.enabled === true }) }), "스케줄 저장됨")}>스케줄 저장</Button>
+              <Button disabled={disabled} onClick={() => onRunAction("naver-run", () => api("/api/naver-blog/run", { method: "POST", body: JSON.stringify({}) }), "네이버 임시저장 완료")}>{busy === "naver-run" ? <Loader2Icon data-icon="inline-start" className="animate-spin" /> : <FileTextIcon data-icon="inline-start" />} 지금 1회 작성</Button>
+              <Button variant="outline" disabled={disabled} onClick={() => onRunAction("naver-browser", () => api("/api/naver-blog/browser", { method: "POST", body: JSON.stringify({}) }), "전용 브라우저 실행됨")}><ExternalLinkIcon data-icon="inline-start" /> 전용 브라우저</Button>
+              <Button variant="outline" disabled={disabled} onClick={() => onRunAction("naver-cleanup", () => api("/api/naver-blog/cleanup-tabs", { method: "POST", body: JSON.stringify({}) }), "작업 탭 정리됨")}>탭 정리</Button>
+              <Button variant="ghost" disabled={disabled} onClick={onReload}>새로고침</Button>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>최근 실행</CardTitle>
+            <CardDescription>자체 스케줄러/수동 실행 결과</CardDescription>
+          </CardHeader>
+          <CardContent className="grid gap-3">
+            {(state.recentRuns || []).length ? (state.recentRuns || []).slice(0, 8).map((run) => (
+              <div key={run.id} className="grid gap-1 rounded-lg border p-3 text-sm">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-medium">{run.status}</span>
+                  <Badge variant={run.status === "ok" ? "secondary" : "destructive"}>{run.source}</Badge>
+                </div>
+                <div className="text-muted-foreground">{formatDate(run.finishedAt || run.startedAt)}</div>
+                <div className="line-clamp-2">{run.title || run.error || "제목 없음"}</div>
+                {run.logNo ? <div className="font-mono text-xs text-muted-foreground">logNo {run.logNo}</div> : null}
+              </div>
+            )) : (
+              <div className="rounded-lg border p-4 text-sm text-muted-foreground">아직 실행 기록이 없습니다.</div>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>이벤트 로그</CardTitle>
+          <CardDescription>브라우저 실행, 탭 정리, 스케줄러 tick 로그</CardDescription>
+        </CardHeader>
+        <CardContent className="max-h-[360px] overflow-auto rounded-lg border bg-muted/20 p-0">
+          {events.length ? events.slice().reverse().map((event, index) => (
+            <div key={`${event.ts}-${index}`} className="grid gap-1 border-b p-3 text-sm last:border-b-0">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-medium">{event.type}</span>
+                <span className="text-xs text-muted-foreground">{formatDate(event.ts)}</span>
+              </div>
+              <pre className="overflow-auto whitespace-pre-wrap text-xs text-muted-foreground">{JSON.stringify(event, null, 2)}</pre>
+            </div>
+          )) : (
+            <div className="p-4 text-sm text-muted-foreground">로그 없음</div>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
 function totalActivity(day) {
   return Number(day?.posted || 0) + Number(day?.comments || 0) + Number(day?.hearts || 0);
 }
@@ -95,7 +236,10 @@ function growthSummary(flowDays = []) {
 }
 
 function Dashboard() {
-  const [view, setView] = useState(new URLSearchParams(location.search).get("view") || "discovered");
+  const initialView = location.pathname.startsWith("/naver-blog")
+    ? "naver-blog"
+    : new URLSearchParams(location.search).get("view") || "discovered";
+  const [view, setView] = useState(initialView);
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState("");
@@ -109,15 +253,23 @@ function Dashboard() {
 
   async function load(nextView = view) {
     setError("");
-    const result = await api(`/api/discovery/dashboard?view=${encodeURIComponent(nextView)}`);
+    const result = nextView === "naver-blog"
+      ? await api("/api/naver-blog/ops")
+      : await api(`/api/discovery/dashboard?view=${encodeURIComponent(nextView)}`);
     setData(result);
-    setTitleEdits(Object.fromEntries(result.rows.map((row) => [row.canonicalUrl, row.textPreview || ""])));
+    setTitleEdits(Object.fromEntries((result.rows || []).map((row) => [row.canonicalUrl, row.textPreview || ""])));
     setLoading(false);
   }
 
   useEffect(() => {
     const url = new URL(location.href);
-    url.searchParams.set("view", view);
+    if (view === "naver-blog") {
+      url.pathname = "/naver-blog";
+      url.searchParams.delete("view");
+    } else {
+      url.pathname = "/discovery";
+      url.searchParams.set("view", view);
+    }
     history.replaceState(null, "", url);
     setLoading(true);
     load(view).catch((err) => {
@@ -235,8 +387,8 @@ function Dashboard() {
         />
         <SidebarInset>
           <SiteHeader
-            title="Threads 발굴 대시보드"
-            subtitle="좋아요 1000+ · 미디어 포함 · X 수동 검토/예약 워크플로우"
+            title={view === "naver-blog" ? "네이버 블로그 운영" : "Threads 발굴 대시보드"}
+            subtitle={view === "naver-blog" ? "Gemini Web 전용 작성 · 자체 스케줄러 · 전용 Chrome 프로필" : "좋아요 1000+ · 미디어 포함 · X 수동 검토/예약 워크플로우"}
             autoRefresh={autoRefresh}
             busy={controlsBusy}
             onRefresh={() => runAction("refresh-data", () => load(view), "새로고침 완료")}
@@ -248,6 +400,17 @@ function Dashboard() {
           />
           <div className="flex flex-1 flex-col">
             <div className="@container/main flex flex-1 flex-col gap-4 py-4 md:gap-6 md:py-6">
+              {view === "naver-blog" ? (
+                <NaverBlogOps
+                  data={data}
+                  loading={loading}
+                  busy={busy}
+                  error={error}
+                  onRunAction={runAction}
+                  onReload={() => runAction("naver-refresh", () => load("naver-blog"), "새로고침 완료")}
+                />
+              ) : (
+                <>
               <SectionCards metrics={metrics} />
 
               <div className="grid gap-4 px-4 lg:grid-cols-[minmax(0,1fr)_minmax(320px,420px)] lg:px-6" id="controls">
@@ -520,6 +683,8 @@ function Dashboard() {
                   formatDate={formatDate}
                   compact={compact}
                 />
+              )}
+                </>
               )}
             </div>
           </div>

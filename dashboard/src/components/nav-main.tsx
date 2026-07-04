@@ -62,7 +62,11 @@ export function NavMain({
                 <span>{item.title}</span>
                 {item.badge !== undefined ? (
                   <Badge variant="secondary" className="ml-auto">
-                    {Number(item.badge || 0).toLocaleString("ko-KR")}
+                    {typeof item.badge === "number"
+                      ? item.badge.toLocaleString("ko-KR")
+                      : typeof item.badge === "string"
+                        ? item.badge
+                        : Number(item.badge || 0).toLocaleString("ko-KR")}
                   </Badge>
                 ) : null}
               </SidebarMenuButton>
