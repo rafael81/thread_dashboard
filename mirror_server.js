@@ -3,7 +3,7 @@ const http = require("http");
 const os = require("os");
 const path = require("path");
 const { URL } = require("url");
-const { execFile } = require("child_process");
+const { execFile, spawn } = require("child_process");
 const WebSocket = require("ws");
 
 const PORT = Number(process.env.PORT || 3131);
@@ -32,6 +32,17 @@ const TERAFABX_HEART_INTERVAL_MS = Number(process.env.TERAFABX_HEART_INTERVAL_MS
 const TERAFABX_HEART_LIMIT = Number(process.env.TERAFABX_HEART_LIMIT || 5);
 const DISCOVERY_EXCLUDED_KEYWORDS = ["배재고", "배제고", "이재명"];
 const TERAFABX_JOB_GAP_MS = Number(process.env.TERAFABX_JOB_GAP_MS || 90 * 1000);
+const NAVER_BLOG_STATE_PATH = process.env.NAVER_BLOG_STATE_PATH || path.join(__dirname, ".data", "naver-blog-ops-state.json");
+const NAVER_BLOG_EVENTS_PATH = process.env.NAVER_BLOG_EVENTS_PATH || path.join(__dirname, ".data", "naver-blog-ops-events.jsonl");
+const NAVER_BLOG_LOCK_PATH = process.env.NAVER_BLOG_LOCK_PATH || path.join(os.tmpdir(), "naver-blog-ops.lock");
+const NAVER_BLOG_CHROME_PORT = Number(process.env.NAVER_BLOG_CHROME_PORT || 9233);
+const NAVER_BLOG_PROFILE_DIR = process.env.NAVER_BLOG_PROFILE_DIR || path.join(__dirname, ".data", "chrome-profiles", "naver-blog-writer");
+const NAVER_BLOG_ADPOST_ROOT = process.env.NAVER_BLOG_ADPOST_ROOT || "/Users/user/Documents/adpost";
+const NAVER_BLOG_INTERVAL_MS = Number(process.env.NAVER_BLOG_INTERVAL_MS || 60 * 1000);
+const NAVER_BLOG_DEFAULT_SCHEDULE = ["08:00", "15:00", "21:00"];
+
+let naverBlogSchedulerBusy = false;
+let naverBlogManualBusy = false;
 
 let busy = false;
 let discoveryScanBusy = false;
@@ -3390,12 +3401,366 @@ function parseRequestedScheduleTime(value) {
   return date;
 }
 
+
+function ensureParentDir(filePath) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+}
+
+function appendNaverBlogEvent(type, data = {}) {
+  const entry = { ts: new Date().toISOString(), type, ...data };
+  try {
+    ensureParentDir(NAVER_BLOG_EVENTS_PATH);
+    fs.appendFileSync(NAVER_BLOG_EVENTS_PATH, `${JSON.stringify(entry)}\n`);
+  } catch (error) {
+    console.error("failed to write naver blog event log", error.message);
+  }
+  logEvent(`naver_blog_${type}`, data);
+}
+
+function defaultNaverBlogState() {
+  return {
+    enabled: true,
+    schedule: NAVER_BLOG_DEFAULT_SCHEDULE,
+    timezone: "Asia/Seoul",
+    blogId: "cury8282",
+    mode: "draft-save-only",
+    writer: "gemini-web-only",
+    chrome: {
+      port: NAVER_BLOG_CHROME_PORT,
+      profileDir: NAVER_BLOG_PROFILE_DIR,
+      status: "unknown",
+    },
+    lastRun: null,
+    nextRunAt: null,
+    recentRuns: [],
+    rules: {
+      noHermesCron: true,
+      geminiOnly: true,
+      publish: false,
+      newBrowserProfile: true,
+      closeTabsAfterDraft: true,
+      representativeImageBelowTitle: true,
+      realImagesForEntertainment: true,
+    },
+  };
+}
+
+function loadNaverBlogState() {
+  try {
+    const state = JSON.parse(fs.readFileSync(NAVER_BLOG_STATE_PATH, "utf8"));
+    return { ...defaultNaverBlogState(), ...state, chrome: { ...defaultNaverBlogState().chrome, ...(state.chrome || {}) }, rules: { ...defaultNaverBlogState().rules, ...(state.rules || {}) } };
+  } catch {
+    return defaultNaverBlogState();
+  }
+}
+
+function saveNaverBlogState(patch = {}) {
+  const current = loadNaverBlogState();
+  const next = {
+    ...current,
+    ...patch,
+    chrome: { ...(current.chrome || {}), ...(patch.chrome || {}) },
+    rules: { ...(current.rules || {}), ...(patch.rules || {}) },
+    updatedAt: new Date().toISOString(),
+  };
+  next.nextRunAt = next.enabled ? computeNextNaverBlogRun(next.schedule).toISOString() : null;
+  ensureParentDir(NAVER_BLOG_STATE_PATH);
+  fs.writeFileSync(NAVER_BLOG_STATE_PATH, JSON.stringify(next, null, 2));
+  return next;
+}
+
+function parseKstScheduleMinute(value) {
+  const match = String(value || "").trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) throw new Error(`스케줄은 HH:mm 형식이어야 합니다: ${value}`);
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) throw new Error(`잘못된 스케줄 시간: ${value}`);
+  return hour * 60 + minute;
+}
+
+function nowKstParts(date = new Date()) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Seoul",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).formatToParts(date).reduce((acc, item) => {
+    if (item.type !== "literal") acc[item.type] = Number(item.value);
+    return acc;
+  }, {});
+}
+
+function kstDateToUtc(year, month, day, hour, minute, second = 0) {
+  return new Date(Date.UTC(year, month - 1, day, hour - 9, minute, second));
+}
+
+function computeNextNaverBlogRun(schedule = NAVER_BLOG_DEFAULT_SCHEDULE, from = new Date()) {
+  const normalized = [...new Set((schedule || []).map(String).filter(Boolean))]
+    .map((value) => {
+      const total = parseKstScheduleMinute(value);
+      return { value, hour: Math.floor(total / 60), minute: total % 60, total };
+    })
+    .sort((a, b) => a.total - b.total);
+  if (!normalized.length) throw new Error("최소 1개 이상의 스케줄이 필요합니다.");
+  const p = nowKstParts(from);
+  const today = normalized
+    .map((slot) => kstDateToUtc(p.year, p.month, p.day, slot.hour, slot.minute, 0))
+    .find((candidate) => candidate.getTime() > from.getTime() + 30 * 1000);
+  if (today) return today;
+  const first = normalized[0];
+  const tomorrowUtcNoon = kstDateToUtc(p.year, p.month, p.day + 1, 12, 0, 0);
+  const t = nowKstParts(tomorrowUtcNoon);
+  return kstDateToUtc(t.year, t.month, t.day, first.hour, first.minute, 0);
+}
+
+function validateGeminiOnlyWorkflowConfig(config = {}) {
+  const writer = String(config.writer || "gemini-web-only").toLowerCase();
+  if (writer !== "gemini-web-only" && writer !== "gemini") {
+    throw new Error("네이버 블로그 작성 워크플로우는 Gemini Web만 허용됩니다.");
+  }
+  return true;
+}
+
+function recentNaverBlogEvents(limit = 20) {
+  try {
+    return fs.readFileSync(NAVER_BLOG_EVENTS_PATH, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .slice(-limit)
+      .map((line) => JSON.parse(line));
+  } catch {
+    return [];
+  }
+}
+
+function requestJsonForPort(port, method, pathname) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: "127.0.0.1", port, method, path: pathname }, (res) => {
+      let data = "";
+      res.on("data", (chunk) => (data += chunk));
+      res.on("end", () => {
+        try { resolve(JSON.parse(data)); }
+        catch { reject(new Error(data || `Chrome ${port} returned HTTP ${res.statusCode}`)); }
+      });
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+async function getNaverBlogChromeTabs() {
+  try {
+    return await requestJsonForPort(NAVER_BLOG_CHROME_PORT, "GET", "/json/list");
+  } catch {
+    return [];
+  }
+}
+
+async function naverBlogBrowserStatus() {
+  const tabs = await getNaverBlogChromeTabs();
+  return {
+    running: tabs.length > 0,
+    port: NAVER_BLOG_CHROME_PORT,
+    profileDir: NAVER_BLOG_PROFILE_DIR,
+    tabCount: tabs.length,
+    blogTabs: tabs.filter((tab) => /blog\.naver\.com|PostWriteForm|Redirect=Write|TempPostList/.test(tab.url || "")).length,
+    geminiTabs: tabs.filter((tab) => /gemini\.google\.com/.test(tab.url || "")).length,
+  };
+}
+
+function chromeExecutablePath() {
+  const candidates = [
+    process.env.NAVER_BLOG_CHROME_BIN,
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+  ].filter(Boolean);
+  const found = candidates.find((candidate) => fs.existsSync(candidate));
+  if (!found) throw new Error("Chrome/Brave 실행 파일을 찾지 못했습니다. NAVER_BLOG_CHROME_BIN을 지정하세요.");
+  return found;
+}
+
+async function ensureNaverBlogBrowser() {
+  const before = await naverBlogBrowserStatus();
+  if (before.running) return { ...before, launched: false };
+  fs.mkdirSync(NAVER_BLOG_PROFILE_DIR, { recursive: true });
+  const args = [
+    `--remote-debugging-port=${NAVER_BLOG_CHROME_PORT}`,
+    `--user-data-dir=${NAVER_BLOG_PROFILE_DIR}`,
+    "--no-first-run",
+    "--no-default-browser-check",
+    "https://blog.naver.com/cury8282?Redirect=Write&",
+  ];
+  const child = spawn(chromeExecutablePath(), args, { detached: true, stdio: "ignore" });
+  child.unref();
+  await sleep(3500);
+  const after = await naverBlogBrowserStatus();
+  appendNaverBlogEvent("browser_launch", { port: NAVER_BLOG_CHROME_PORT, profileDir: NAVER_BLOG_PROFILE_DIR, running: after.running });
+  return { ...after, launched: true };
+}
+
+async function closeNaverBlogWorkTabs() {
+  const tabs = await getNaverBlogChromeTabs();
+  const close = tabs.filter((tab) => /blog\.naver\.com|PostWriteForm|Redirect=Write|TempPostList|gemini\.google\.com/.test(tab.url || ""));
+  const results = [];
+  for (const tab of close) {
+    try {
+      await requestJsonForPort(NAVER_BLOG_CHROME_PORT, "PUT", `/json/close/${tab.id}`);
+      results.push({ id: tab.id, title: tab.title, url: tab.url, ok: true });
+    } catch (error) {
+      results.push({ id: tab.id, title: tab.title, url: tab.url, ok: false, error: error.message });
+    }
+  }
+  const after = await naverBlogBrowserStatus();
+  appendNaverBlogEvent("tabs_cleanup", { closed: results.length, remainingBlogTabs: after.blogTabs, remainingGeminiTabs: after.geminiTabs });
+  return { closed: results.length, results, remainingBlogTabs: after.blogTabs, remainingGeminiTabs: after.geminiTabs };
+}
+
+function runNodeScript(scriptPath, args = [], options = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [scriptPath, ...args], {
+      cwd: options.cwd || __dirname,
+      env: { ...process.env, ...(options.env || {}) },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    child.on("close", (code) => resolve({ code, stdout: stdout.slice(-12000), stderr: stderr.slice(-12000) }));
+  });
+}
+
+async function runNaverBlogDraftWorkflow(options = {}) {
+  validateGeminiOnlyWorkflowConfig({ writer: "gemini-web-only" });
+  if (naverBlogManualBusy || naverBlogSchedulerBusy) {
+    throw new Error("네이버 블로그 작성 작업이 이미 진행 중입니다.");
+  }
+  const startedAt = new Date().toISOString();
+  const run = { id: `naver-blog-${startedAt.replace(/[:.]/g, "-")}`, startedAt, source: options.source || "manual", status: "running", title: null, logNo: null, steps: [] };
+  appendNaverBlogEvent("draft_run_start", run);
+  const browser = await ensureNaverBlogBrowser();
+  run.steps.push({ step: "browser", ok: browser.running, browser });
+  const workflowScript = path.join(__dirname, "scripts", "naver-blog-gemini-workflow.js");
+  if (!fs.existsSync(workflowScript)) throw new Error(`워크플로우 스크립트가 없습니다: ${workflowScript}`);
+  const scriptResult = await runNodeScript(workflowScript, ["--source", run.source], {
+    cwd: __dirname,
+    env: { NAVER_BLOG_CHROME_PORT: String(NAVER_BLOG_CHROME_PORT), NAVER_BLOG_PROFILE_DIR, NAVER_BLOG_ADPOST_ROOT, NAVER_BLOG_WRITER: "gemini-web-only" },
+  });
+  run.steps.push({ step: "workflow", ok: scriptResult.code === 0, code: scriptResult.code, stdout: scriptResult.stdout, stderr: scriptResult.stderr });
+  if (scriptResult.code !== 0) throw new Error(scriptResult.stderr || scriptResult.stdout || "네이버 블로그 워크플로우 실패");
+  let parsed = null;
+  try { parsed = JSON.parse(scriptResult.stdout.trim().split("\n").pop() || "{}"); } catch {}
+  const cleanup = await closeNaverBlogWorkTabs();
+  run.steps.push({ step: "cleanup", ok: cleanup.remainingBlogTabs === 0 && cleanup.remainingGeminiTabs === 0, cleanup });
+  run.status = "ok";
+  run.finishedAt = new Date().toISOString();
+  run.title = parsed?.title || null;
+  run.logNo = parsed?.logNo || null;
+  run.result = parsed;
+  const state = loadNaverBlogState();
+  const recentRuns = [run, ...(state.recentRuns || [])].slice(0, 20);
+  saveNaverBlogState({ lastRun: run, recentRuns });
+  appendNaverBlogEvent("draft_run_ok", { id: run.id, title: run.title, logNo: run.logNo });
+  return run;
+}
+
+async function maybeRunNaverBlogScheduler() {
+  const state = loadNaverBlogState();
+  if (!state.enabled) return { ok: true, skipped: true, reason: "disabled" };
+  const nextRunAt = state.nextRunAt || computeNextNaverBlogRun(state.schedule).toISOString();
+  if (new Date(nextRunAt).getTime() > Date.now()) return { ok: true, skipped: true, nextRunAt };
+  if (naverBlogSchedulerBusy) return { ok: true, skipped: true, reason: "busy" };
+  naverBlogSchedulerBusy = true;
+  try {
+    const result = await runNaverBlogDraftWorkflow({ source: "scheduler" });
+    saveNaverBlogState({ nextRunAt: computeNextNaverBlogRun(state.schedule).toISOString() });
+    return { ok: true, result };
+  } catch (error) {
+    const failed = { id: `naver-blog-error-${Date.now()}`, status: "error", source: "scheduler", error: error.message, finishedAt: new Date().toISOString() };
+    const latest = loadNaverBlogState();
+    saveNaverBlogState({ lastRun: failed, recentRuns: [failed, ...(latest.recentRuns || [])].slice(0, 20), nextRunAt: computeNextNaverBlogRun(latest.schedule).toISOString() });
+    appendNaverBlogEvent("draft_run_error", failed);
+    return { ok: false, error: error.message };
+  } finally {
+    naverBlogSchedulerBusy = false;
+  }
+}
+
+async function getNaverBlogOpsDashboard() {
+  const state = saveNaverBlogState({});
+  const browser = await naverBlogBrowserStatus();
+  return { ok: true, state, browser, events: recentNaverBlogEvents(30), scheduler: { busy: naverBlogSchedulerBusy || naverBlogManualBusy, intervalMs: NAVER_BLOG_INTERVAL_MS, noHermesCron: true, writer: "gemini-web-only" } };
+}
+
 const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && tryServeDashboardAsset(req, res)) {
     return;
   }
   if (req.method === "GET" && req.url === "/health") {
     json(res, 200, { ok: true, chromePort: CHROME_PORT, requiredXHandle: REQUIRED_X_HANDLE });
+    return;
+  }
+  if (req.method === "GET" && req.url === "/naver-blog") {
+    try {
+      if (fs.existsSync(DASHBOARD_INDEX_PATH)) serveFile(res, DASHBOARD_INDEX_PATH);
+      else html(res, 200, "<h1>Naver Blog Ops</h1><p>Run npm run build:dashboard first.</p>");
+    } catch (error) {
+      logEvent("naver_blog_dashboard_error", { error: error.message });
+      html(res, 500, `<pre>${escapeHtml(error.message)}</pre>`);
+    }
+    return;
+  }
+  if (req.method === "GET" && req.url === "/api/naver-blog/ops") {
+    try { json(res, 200, await getNaverBlogOpsDashboard()); }
+    catch (error) { appendNaverBlogEvent("status_error", { error: error.message }); json(res, 500, { ok: false, error: error.message }); }
+    return;
+  }
+  if (req.method === "POST" && req.url === "/api/naver-blog/settings") {
+    try {
+      const body = await readRequestBody(req);
+      const payload = JSON.parse(body || "{}");
+      const patch = {};
+      if (Object.prototype.hasOwnProperty.call(payload, "enabled")) patch.enabled = payload.enabled === true;
+      if (Array.isArray(payload.schedule)) patch.schedule = payload.schedule.map(String).filter(Boolean);
+      if (payload.blogId) patch.blogId = String(payload.blogId);
+      validateGeminiOnlyWorkflowConfig({ writer: "gemini-web-only" });
+      const state = saveNaverBlogState(patch);
+      appendNaverBlogEvent("settings_update", { enabled: state.enabled, schedule: state.schedule });
+      json(res, 200, { ok: true, state });
+    } catch (error) {
+      appendNaverBlogEvent("settings_error", { error: error.message });
+      json(res, 500, { ok: false, error: error.message });
+    }
+    return;
+  }
+  if (req.method === "POST" && req.url === "/api/naver-blog/browser") {
+    try { json(res, 200, { ok: true, browser: await ensureNaverBlogBrowser() }); }
+    catch (error) { appendNaverBlogEvent("browser_error", { error: error.message }); json(res, 500, { ok: false, error: error.message }); }
+    return;
+  }
+  if (req.method === "POST" && req.url === "/api/naver-blog/cleanup-tabs") {
+    try { json(res, 200, { ok: true, ...(await closeNaverBlogWorkTabs()) }); }
+    catch (error) { appendNaverBlogEvent("cleanup_error", { error: error.message }); json(res, 500, { ok: false, error: error.message }); }
+    return;
+  }
+  if (req.method === "POST" && req.url === "/api/naver-blog/run") {
+    if (naverBlogManualBusy || naverBlogSchedulerBusy) { json(res, 429, { ok: false, error: "네이버 블로그 작성 작업이 이미 진행 중입니다." }); return; }
+    naverBlogManualBusy = true;
+    try {
+      const result = await runNaverBlogDraftWorkflow({ source: "dashboard" });
+      json(res, 200, { ok: true, result, state: loadNaverBlogState() });
+    } catch (error) {
+      const failed = { id: `naver-blog-error-${Date.now()}`, status: "error", source: "dashboard", error: error.message, finishedAt: new Date().toISOString() };
+      const latest = loadNaverBlogState();
+      saveNaverBlogState({ lastRun: failed, recentRuns: [failed, ...(latest.recentRuns || [])].slice(0, 20) });
+      appendNaverBlogEvent("manual_run_error", failed);
+      json(res, 500, { ok: false, error: error.message, state: loadNaverBlogState() });
+    } finally { naverBlogManualBusy = false; }
     return;
   }
   if (req.method === "GET" && req.url === "/api/terafabx/automation") {
@@ -3912,6 +4277,12 @@ setInterval(() => {
     logEvent("discovery_auto_scan_error", { error: error.message });
   });
 }, DISCOVERY_SCAN_INTERVAL_MS);
+
+setInterval(() => {
+  maybeRunNaverBlogScheduler().catch((error) => {
+    appendNaverBlogEvent("scheduler_tick_error", { error: error.message });
+  });
+}, NAVER_BLOG_INTERVAL_MS);
 
 setInterval(() => {
   maybeRunTerafabxAutomation().catch((error) => {

@@ -8,6 +8,7 @@ import {
   MessageCircleIcon,
   SearchIcon,
   Settings2Icon,
+  FileTextIcon,
   SparklesIcon,
 } from "lucide-react"
 
@@ -40,6 +41,7 @@ const viewItems = [
   { id: "discovered", title: "발굴됨", icon: <SparklesIcon /> },
   { id: "scheduled", title: "게시예정", icon: <CalendarClockIcon /> },
   { id: "posted", title: "게시됨", icon: <CheckCircle2Icon /> },
+  { id: "naver-blog", title: "네이버 블로그", icon: <FileTextIcon /> },
 ]
 
 type CommentTimelineItem = {
@@ -180,7 +182,9 @@ export function AppSidebar({
         ? summary.discoveredCount
         : item.id === "scheduled"
           ? summary.scheduledCount
-          : summary.postedCount,
+          : item.id === "posted"
+            ? summary.postedCount
+            : "운영",
     onClick: () => onViewChange(item.id),
   }))
 
