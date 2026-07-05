@@ -13,11 +13,13 @@ const MAX_MEDIA = 4;
 const LOG_PATH = path.join(__dirname, "mirror-events.jsonl");
 const SCHEDULE_SLOTS_PATH = path.join(__dirname, "x-scheduled-slots.json");
 const MIRROR_HISTORY_PATH = path.join(__dirname, "mirror-history.json");
+const SCHEDULED_REPLY_STATE_PATH = path.join(__dirname, ".data", "scheduled-inssider-replies.json");
 const DISCOVERY_SETTINGS_PATH = path.join(__dirname, "discovery-settings.json");
 const SCHEDULE_SPACING_MS = 15 * 60 * 1000;
 const DISCOVERY_DB_PATH = process.env.DISCOVERY_DB_PATH || path.join(__dirname, ".data", "thread-discovery.db");
 const DASHBOARD_DIST_DIR = path.join(__dirname, "dashboard", "dist");
 const DASHBOARD_INDEX_PATH = path.join(DASHBOARD_DIST_DIR, "index.html");
+const GENERATED_MEDIA_DIR = path.join(__dirname, ".data", "generated-media");
 const DISCOVERY_MIN_LIKES = Number(process.env.DISCOVERY_MIN_LIKES || 1000);
 const DISCOVERY_POST_INTERVAL_MS = Number(process.env.DISCOVERY_POST_INTERVAL_MS || 10 * 60 * 1000);
 const DISCOVERY_WORKER_INTERVAL_MS = Number(process.env.DISCOVERY_WORKER_INTERVAL_MS || 60 * 1000);
@@ -40,6 +42,12 @@ const NAVER_BLOG_PROFILE_DIR = process.env.NAVER_BLOG_PROFILE_DIR || path.join(_
 const NAVER_BLOG_ADPOST_ROOT = process.env.NAVER_BLOG_ADPOST_ROOT || "/Users/user/Documents/adpost";
 const NAVER_BLOG_INTERVAL_MS = Number(process.env.NAVER_BLOG_INTERVAL_MS || 60 * 1000);
 const NAVER_BLOG_DEFAULT_SCHEDULE = ["08:00", "15:00", "21:00"];
+const INSSIDER_BASE_URL = "https://inssider.kr";
+const INSSIDER_PENDING_CATEGORIES = [
+  { code: "003011", name: "[연애·결혼] 누구잘못?" },
+  { code: "003001", name: "[직장·사회] 리얼사회생활" },
+];
+const INSSIDER_CATEGORY_CODES = new Set(INSSIDER_PENDING_CATEGORIES.map((category) => category.code));
 
 let naverBlogSchedulerBusy = false;
 let naverBlogManualBusy = false;
@@ -51,6 +59,7 @@ let terafabxBusy = false;
 let terafabxSchedulerBusy = false;
 let autoScheduleQueue = Promise.resolve();
 let autoScheduleQueueDepth = 0;
+let scheduledReplyBusy = false;
 
 function loadDiscoverySettings() {
   try {
@@ -123,6 +132,300 @@ function contentTypeFor(filePath) {
   return "application/octet-stream";
 }
 
+function parseKoreanDateTime(value) {
+  if (!value) return null;
+  const normalized = String(value).trim().replace(" ", "T");
+  const date = new Date(`${normalized}+09:00`);
+  return Number.isFinite(date.getTime()) ? date : null;
+}
+
+function xmlEscape(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function stripHtmlToText(htmlText) {
+  return String(htmlText || "")
+    .replace(/<img\b[^>]*>/gi, "\n")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&quot;/g, "\"")
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
+function firstImageFromHtml(htmlText) {
+  const match = String(htmlText || "").match(/<img\b[^>]*\bsrc=["']([^"']+)["']/i);
+  return match ? new URL(match[1], INSSIDER_BASE_URL).toString() : "";
+}
+
+function wrapKoreanText(text, maxChars) {
+  const words = String(text || "").split(/\s+/).filter(Boolean);
+  const lines = [];
+  let line = "";
+  for (const word of words) {
+    const next = line ? `${line} ${word}` : word;
+    if ([...next].length > maxChars && line) {
+      lines.push(line);
+      line = word;
+    } else {
+      line = next;
+    }
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
+function buildCuriosityExcerptParts(text) {
+  const lines = String(text || "")
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const selected = [];
+  let charCount = 0;
+  const stopPatterns = [
+    /문제는|그런데|하지만|근데|며칠 뒤|나중에|이후부터|반면|그러자/,
+    /말해주더군요|들었습니다|달라졌습니다|분위기/,
+    /["“].+["”]/,
+  ];
+  for (const line of lines) {
+    selected.push(line);
+    charCount += [...line].length;
+    if (selected.length >= 4 && stopPatterns.some((pattern) => pattern.test(line))) break;
+    if (selected.length >= 6 || charCount >= 230) break;
+  }
+  const rest = lines.slice(selected.length).join("\n");
+  const excerpt = selected.join("\n");
+  return {
+    excerpt: excerpt.endsWith("...") || excerpt.endsWith("…") ? excerpt : `${excerpt}\n\n...`,
+    continuation: rest,
+  };
+}
+
+function xWeightedLength(text) {
+  return [...String(text || "")].reduce((total, char) => total + (char.charCodeAt(0) > 0x2e80 ? 2 : 1), 0);
+}
+
+function splitInssiderReplyChunks(text, maxLength = 180) {
+  const cleaned = String(text || "").replace(/\n{3,}/g, "\n\n").trim();
+  if (!cleaned) return [];
+  const paragraphs = cleaned.split(/\n+/).map((line) => line.trim()).filter(Boolean);
+  const chunks = [];
+  let current = "";
+  const pushCurrent = () => {
+    const value = current.trim();
+    if (value) chunks.push(value);
+    current = "";
+  };
+  for (const paragraph of paragraphs) {
+    const next = current ? `${current}\n${paragraph}` : paragraph;
+    if (xWeightedLength(next) <= maxLength) {
+      current = next;
+      continue;
+    }
+    pushCurrent();
+    if (xWeightedLength(paragraph) <= maxLength) {
+      current = paragraph;
+      continue;
+    }
+    let line = "";
+    for (const word of paragraph.split(/\s+/).filter(Boolean)) {
+      const candidate = line ? `${line} ${word}` : word;
+      if (xWeightedLength(candidate) <= maxLength) {
+        line = candidate;
+        continue;
+      }
+      if (line) chunks.push(line);
+      if (xWeightedLength(word) <= maxLength) {
+        line = word;
+      } else {
+        const chars = [...word];
+        let slice = "";
+        for (const char of chars) {
+          const candidateSlice = `${slice}${char}`;
+          if (slice && xWeightedLength(candidateSlice) > maxLength) {
+            chunks.push(slice);
+            slice = char;
+          } else {
+            slice = candidateSlice;
+          }
+        }
+        if (slice) chunks.push(slice);
+        line = "";
+      }
+    }
+    if (line) chunks.push(line);
+  }
+  pushCurrent();
+  return chunks;
+}
+
+function buildInssiderPostText(post) {
+  return String(post.postTitle || "").trim().slice(0, 280);
+}
+
+async function fetchInssiderPostDetail(categoryCode, postSeq) {
+  if (!INSSIDER_CATEGORY_CODES.has(categoryCode)) throw new Error("허용되지 않은 인싸이더 카테고리입니다.");
+  const response = await fetch(`${INSSIDER_BASE_URL}/api/posts/detail`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "user-agent": "Mozilla/5.0",
+      referer: `${INSSIDER_BASE_URL}/posts/${categoryCode}/${postSeq}`,
+    },
+    body: JSON.stringify({ postSeq: String(postSeq) }),
+  });
+  const payload = await response.json();
+  if (!response.ok || payload.status !== "SUCCESS") {
+    throw new Error(payload.message || `인싸이더 상세 조회 실패: HTTP ${response.status}`);
+  }
+  const data = payload.data || {};
+  if (String(data.categoryCd || "") !== categoryCode) throw new Error("인싸이더 상세 카테고리가 요청과 다릅니다.");
+  return data;
+}
+
+async function imageUrlToDataUri(url) {
+  if (!url) return "";
+  try {
+    const response = await fetch(url, { headers: { "user-agent": "Mozilla/5.0" } });
+    if (!response.ok) return "";
+    const contentType = response.headers.get("content-type") || "image/png";
+    const buffer = Buffer.from(await response.arrayBuffer());
+    return `data:${contentType};base64,${buffer.toString("base64")}`;
+  } catch {
+    return "";
+  }
+}
+
+async function createInssiderCaptureImage(post) {
+  fs.mkdirSync(GENERATED_MEDIA_DIR, { recursive: true });
+  const sharp = (await import("sharp")).default;
+  const contentText = stripHtmlToText(post.content);
+  const excerptParts = buildCuriosityExcerptParts(contentText);
+  const excerpt = excerptParts.excerpt;
+  const imageUrl = firstImageFromHtml(post.content);
+  const imageDataUri = await imageUrlToDataUri(imageUrl);
+  const textLines = excerpt.split("\n").flatMap((line) => line ? wrapKoreanText(line, 21) : [""]);
+  const width = 1080;
+  const height = 1350;
+  const textStartY = imageDataUri ? 690 : 160;
+  const bodyFontSize = 41;
+  const bodyLineHeight = 64;
+  const maxTextLines = imageDataUri ? 8 : 15;
+  const textSvg = textLines.slice(0, maxTextLines).map((line, index) => {
+    const y = textStartY + index * bodyLineHeight;
+    if (!line) return "";
+    const fill = line === "..." ? "#8a8a8a" : "#1f1f1f";
+    return `<text x="92" y="${y}" font-size="${bodyFontSize}" font-weight="600" fill="${fill}">${xmlEscape(line)}</text>`;
+  }).join("");
+  const category = String(post.categoryName || "").replace(/^\[|\].*$/g, "").trim();
+  const svg = `
+<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+  <rect width="1080" height="1350" fill="#f7f3ec"/>
+  <rect x="54" y="54" width="972" height="1242" rx="34" fill="#fffdf8"/>
+  ${imageDataUri ? `<image href="${imageDataUri}" x="92" y="92" width="896" height="520" preserveAspectRatio="xMidYMid slice"/>` : ""}
+  <text x="92" y="${imageDataUri ? 650 : 118}" font-size="28" font-weight="700" fill="#d84a1b">${xmlEscape(category || "INSSIDER")}</text>
+  ${textSvg}
+  <text x="92" y="1248" font-size="30" font-weight="700" fill="#d84a1b">댓글에서 이어보기</text>
+</svg>`;
+  const filename = `inssider-${post.categoryCd}-${post.postSeq}-${Date.now()}.png`;
+  const outputPath = path.join(GENERATED_MEDIA_DIR, filename);
+  await sharp(Buffer.from(svg)).png().toFile(outputPath);
+  return {
+    filePath: outputPath,
+    url: `http://127.0.0.1:${PORT}/generated-media/${filename}`,
+    excerpt,
+    continuation: excerptParts.continuation,
+    sourceImageUrl: imageUrl,
+  };
+}
+
+async function fetchInssiderCategoryPendingPosts(category) {
+  const response = await fetch(`${INSSIDER_BASE_URL}/api/posts/list`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "user-agent": "Mozilla/5.0",
+      referer: `${INSSIDER_BASE_URL}/posts/${category.code}`,
+    },
+    body: JSON.stringify({
+      categoryCd: category.code,
+      currPage: 1,
+      pageSize: 500,
+      sort: "R",
+      postKind: "D",
+      includeTopPosts: true,
+    }),
+  });
+  const raw = await response.text();
+  if (!response.ok) throw new Error(`Inssider ${category.code} HTTP ${response.status}: ${raw.slice(0, 160)}`);
+  let payload;
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    throw new Error(`Inssider ${category.code} returned non-JSON response`);
+  }
+  if (payload.status !== "SUCCESS") {
+    throw new Error(payload.message || `Inssider ${category.code} request failed`);
+  }
+  const posts = Array.isArray(payload.data?.posts) ? payload.data.posts : [];
+  const now = Date.now();
+  return posts
+    .filter((post) => post?.postKind === "D")
+    .filter((post) => {
+      const endAt = parseKoreanDateTime(post.debateEndAt);
+      return endAt && endAt.getTime() > now;
+    })
+    .map((post) => ({
+      id: String(post.postSeq || ""),
+      title: String(post.postTitle || "").trim(),
+      preview: String(post.previewContent || "").trim(),
+      url: `${INSSIDER_BASE_URL}/posts/${category.code}/${post.postSeq}`,
+      categoryCode: category.code,
+      categoryName: post.categoryName || category.name,
+      debateEndAt: post.debateEndAt || "",
+      prosText: post.prosText || "",
+      consText: post.consText || "",
+      prosCnt: Number(post.prosCnt || 0),
+      consCnt: Number(post.consCnt || 0),
+      viewCntDisplay: post.viewCntDisplay || String(post.viewCnt || 0),
+      commentCntDisplay: post.commentCntDisplay || String(post.commentCnt || 0),
+      likeCntDisplay: post.likeCntDisplay || String(post.likeCnt || 0),
+      thumbnailUrl: post.thumbnailPath ? new URL(post.thumbnailPath, INSSIDER_BASE_URL).toString() : "",
+      regDate: post.regDate || "",
+      regTime: post.regTime || "",
+      nickname: post.nickname || "",
+    }));
+}
+
+async function getInssiderPendingDashboardData() {
+  const groups = await Promise.all(INSSIDER_PENDING_CATEGORIES.map(async (category) => ({
+    ...category,
+    rows: await fetchInssiderCategoryPendingPosts(category),
+  })));
+  const rows = groups.flatMap((group) => group.rows)
+    .sort((a, b) => (parseKoreanDateTime(a.debateEndAt)?.getTime() || 0) - (parseKoreanDateTime(b.debateEndAt)?.getTime() || 0));
+  return {
+    ok: true,
+    fetchedAt: new Date().toISOString(),
+    summary: {
+      totalCount: rows.length,
+      categoryCounts: Object.fromEntries(groups.map((group) => [group.code, group.rows.length])),
+    },
+    categories: groups.map(({ rows, ...category }) => ({ ...category, count: rows.length })),
+    rows,
+  };
+}
+
 function serveFile(res, filePath) {
   const body = fs.readFileSync(filePath);
   res.writeHead(200, { "content-type": contentTypeFor(filePath) });
@@ -134,6 +437,18 @@ function tryServeDashboardAsset(req, res) {
   const requested = decodeURIComponent(new URL(req.url, "http://localhost").pathname.slice(1));
   const fullPath = path.resolve(DASHBOARD_DIST_DIR, requested);
   const rootPath = path.resolve(DASHBOARD_DIST_DIR);
+  if (!fullPath.startsWith(rootPath + path.sep) || !fs.existsSync(fullPath) || !fs.statSync(fullPath).isFile()) {
+    return false;
+  }
+  serveFile(res, fullPath);
+  return true;
+}
+
+function tryServeGeneratedMedia(req, res) {
+  if (!req.url.startsWith("/generated-media/")) return false;
+  const requested = decodeURIComponent(new URL(req.url, "http://localhost").pathname.replace(/^\/generated-media\//, ""));
+  const fullPath = path.resolve(GENERATED_MEDIA_DIR, requested);
+  const rootPath = path.resolve(GENERATED_MEDIA_DIR);
   if (!fullPath.startsWith(rootPath + path.sep) || !fs.existsSync(fullPath) || !fs.statSync(fullPath).isFile()) {
     return false;
   }
@@ -303,6 +618,38 @@ function readJsonFile(file, fallback = {}) {
 function writeJsonFile(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(value, null, 2));
+}
+
+function loadScheduledReplyState() {
+  return readJsonFile(SCHEDULED_REPLY_STATE_PATH, { items: [] });
+}
+
+function saveScheduledReplyState(state) {
+  writeJsonFile(SCHEDULED_REPLY_STATE_PATH, { items: state.items || [] });
+}
+
+function upsertScheduledReplyItem(item) {
+  const state = loadScheduledReplyState();
+  const items = (state.items || []).filter((entry) => entry.canonicalUrl !== item.canonicalUrl);
+  items.push({
+    status: "pending",
+    attempts: 0,
+    createdAt: new Date().toISOString(),
+    ...item,
+    updatedAt: new Date().toISOString(),
+  });
+  saveScheduledReplyState({ items });
+  logEvent("inssider_scheduled_reply_queued", item);
+}
+
+function patchScheduledReplyItem(canonicalUrl, patch) {
+  const state = loadScheduledReplyState();
+  const items = (state.items || []).map((entry) => (
+    entry.canonicalUrl === canonicalUrl
+      ? { ...entry, ...patch, updatedAt: new Date().toISOString() }
+      : entry
+  ));
+  saveScheduledReplyState({ items });
 }
 
 function loadTerafabxState() {
@@ -617,7 +964,7 @@ async function generateTerafabxReplyWithGrok(target) {
   return validateTerafabxReply(fallback);
 }
 
-async function postTerafabxReply(targetUrl, comment) {
+async function postTerafabxReply(targetUrl, comment, options = {}) {
   logEvent("terafabx_reply_post_start", { targetUrl, comment });
   const page = await getExistingXPage(targetUrl);
   try {
@@ -631,7 +978,13 @@ async function postTerafabxReply(targetUrl, comment) {
       function clean(s) { return (s || "").replace(/\\s+/g, " ").trim(); }
       return { ok: Boolean(article && Array.from(article.querySelectorAll('a[href*="/status/"]')).some((a) => a.href.includes('/status/' + id))), text: article ? clean(article.innerText).slice(0, 900) : "", url: location.href };
     })()`);
-    if (!pre.ok) throw new Error(`target root 검증 실패: ${JSON.stringify(pre)}`);
+    if (!pre.ok) {
+      if (options.validate === false && pre.text) {
+        logEvent("terafabx_reply_target_verify_relaxed", { targetUrl, url: pre.url, textPreview: pre.text.slice(0, 180) });
+      } else {
+        throw new Error(`target root 검증 실패: ${JSON.stringify(pre)}`);
+      }
+    }
     logEvent("terafabx_reply_target_verified", { targetUrl, url: pre.url, textPreview: pre.text.slice(0, 180) });
     const clickedReply = await page.eval(`(() => {
       const article = document.querySelector("article");
@@ -651,6 +1004,12 @@ async function postTerafabxReply(targetUrl, comment) {
       editor.scrollIntoView({ block: "center" });
       editor.click();
       editor.focus();
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(editor);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      document.execCommand("delete");
       return true;
     })()`);
     if (!focused) throw new Error("답글 입력창을 찾지 못했습니다.");
@@ -670,54 +1029,116 @@ async function postTerafabxReply(targetUrl, comment) {
         const selection = window.getSelection();
         const range = document.createRange();
         range.selectNodeContents(editor);
-        range.collapse(false);
         selection.removeAllRanges();
         selection.addRange(range);
+        document.execCommand("delete");
         document.execCommand("insertText", false, comment);
         editor.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: comment }));
         return editor.innerText || editor.textContent || "";
       })(${JSON.stringify(comment)})`);
       await sleep(700);
     }
-    if (cleanSocialText(typed) !== cleanSocialText(comment)) throw new Error(`입력 텍스트 불일치: ${typed}`);
-    logEvent("terafabx_reply_text_typed", { targetUrl, comment });
-    validateTerafabxReply(typed);
-    const clickedPost = await page.eval(`(() => {
-      const buttons = Array.from(document.querySelectorAll('[data-testid="tweetButton"], [data-testid="tweetButtonInline"]'))
-        .filter((el) => el.offsetWidth && el.offsetHeight && !(el.disabled || el.getAttribute("aria-disabled") === "true"));
-      const button = buttons.pop();
-      if (!button) {
-        return {
-          clicked: false,
-          candidates: Array.from(document.querySelectorAll('button, [role="button"]')).map((el) => ({
-            text: el.innerText || "",
-            label: el.getAttribute("aria-label") || "",
-            testid: el.getAttribute("data-testid") || "",
-            disabled: Boolean(el.disabled || el.getAttribute("aria-disabled") === "true"),
-          })).slice(-12),
-        };
+    if (cleanSocialText(typed) !== cleanSocialText(comment)) {
+      if (options.validate === false) {
+        logEvent("terafabx_reply_text_mismatch_ignored", { targetUrl, expected: comment, typed });
+      } else {
+        throw new Error(`입력 텍스트 불일치: ${typed}`);
       }
-      button.click();
-      return { clicked: true, text: button.innerText || button.getAttribute("aria-label") || "" };
+    }
+    await page.eval(`(() => {
+      const editors = Array.from(document.querySelectorAll('[data-testid="tweetTextarea_0"], [role="textbox"][contenteditable="true"], [contenteditable="true"]')).filter((el) => el.offsetWidth && el.offsetHeight);
+      const editor = editors.pop();
+      if (!editor) return false;
+      editor.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: editor.innerText || editor.textContent || "" }));
+      editor.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    })()`).catch(() => false);
+    logEvent("terafabx_reply_text_typed", { targetUrl, comment });
+    if (options.validate !== false) validateTerafabxReply(typed);
+    let clickedPost = await page.eval(`(async () => {
+      async function wait(ms) { await new Promise((resolve) => setTimeout(resolve, ms)); }
+      for (let attempt = 0; attempt < 12; attempt += 1) {
+        const buttons = Array.from(document.querySelectorAll('[data-testid="tweetButton"], [data-testid="tweetButtonInline"]'))
+          .filter((el) => el.offsetWidth && el.offsetHeight && !(el.disabled || el.getAttribute("aria-disabled") === "true"));
+        const button = buttons.pop();
+        if (button) {
+          button.click();
+          return { clicked: true, text: button.innerText || button.getAttribute("aria-label") || "", attempt };
+        }
+        await wait(500);
+      }
+      return {
+        clicked: false,
+        candidates: Array.from(document.querySelectorAll('button, [role="button"]')).map((el) => ({
+          text: el.innerText || "",
+          label: el.getAttribute("aria-label") || "",
+          testid: el.getAttribute("data-testid") || "",
+          disabled: Boolean(el.disabled || el.getAttribute("aria-disabled") === "true"),
+        })).slice(-12),
+      };
     })()`);
-    if (!clickedPost.clicked) throw new Error("활성화된 답글 게시 버튼을 찾지 못했습니다.");
+    if (!clickedPost.clicked) {
+      logEvent("terafabx_reply_submit_not_found", {
+        targetUrl,
+        weightedLength: xWeightedLength(comment),
+        length: [...String(comment || "")].length,
+        candidates: clickedPost.candidates,
+      });
+      if (options.validate === false && id) {
+        const intentUrl = `https://x.com/intent/tweet?in_reply_to=${encodeURIComponent(id)}&text=${encodeURIComponent(comment)}`;
+        await page.navigate(intentUrl, 8000);
+        await sleep(1800);
+        clickedPost = await page.eval(`(async () => {
+          async function wait(ms) { await new Promise((resolve) => setTimeout(resolve, ms)); }
+          for (let attempt = 0; attempt < 12; attempt += 1) {
+            const buttons = Array.from(document.querySelectorAll('[data-testid="tweetButton"], [data-testid="tweetButtonInline"]'))
+              .filter((el) => el.offsetWidth && el.offsetHeight && !(el.disabled || el.getAttribute("aria-disabled") === "true"));
+            const button = buttons.pop();
+            if (button) {
+              button.click();
+              return { clicked: true, text: button.innerText || button.getAttribute("aria-label") || "", attempt, fallback: "intent" };
+            }
+            await wait(500);
+          }
+          return { clicked: false, fallback: "intent" };
+        })()`);
+      }
+      if (!clickedPost.clicked) throw new Error("활성화된 답글 게시 버튼을 찾지 못했습니다.");
+    }
     logEvent("terafabx_reply_submit_clicked", { targetUrl, button: clickedPost.text });
     await sleep(5000);
     logEvent("terafabx_reply_verify_start", { targetUrl });
     await page.navigate("https://x.com/terafabXai/with_replies", 7000);
+    const verifyNeedle = options.validate === false
+      ? String(comment).split(/\n+/).map((line) => line.trim()).filter(Boolean).join(" ").slice(0, 48)
+      : comment;
     const verify = await page.eval(`(() => {
       const want = ${JSON.stringify(comment)};
+      const needle = ${JSON.stringify(verifyNeedle)};
       function clean(s) { return (s || "").replace(/\\s+/g, " ").trim(); }
       for (const article of Array.from(document.querySelectorAll("article"))) {
         const text = clean(article.innerText || "");
-        if (text.includes(want)) {
+        if (text.includes(want) || (needle && text.includes(needle))) {
           const href = Array.from(article.querySelectorAll('a[href*="/status/"]')).map((a) => a.href).find((href) => href.includes('/terafabXai/status/'));
           return { found: true, href: href ? href.split("?")[0] : null, text: text.slice(0, 800), url: location.href };
         }
       }
       return { found: false, url: location.href };
     })()`);
-    if (!verify.found || !verify.href) throw new Error(`답글 게시 검증 실패: ${JSON.stringify(verify)}`);
+    if (!verify.found || !verify.href) {
+      if (options.validate === false) {
+        const fallbackHref = await page.eval(`(() => {
+          const href = Array.from(document.querySelectorAll('article a[href*="/status/"]'))
+            .map((a) => a.href)
+            .find((href) => href.includes('/terafabXai/status/') && !href.includes('/analytics'));
+          return href ? href.split("?")[0] : null;
+        })()`).catch(() => null);
+        const replyUrl = fallbackHref || targetUrl;
+        logEvent("terafabx_reply_verify_relaxed", { targetUrl, replyUrl, verify });
+        return { ok: true, replyUrl, verify: { ...verify, relaxed: true } };
+      }
+      throw new Error(`답글 게시 검증 실패: ${JSON.stringify(verify)}`);
+    }
     logEvent("terafabx_reply_verified", { targetUrl, replyUrl: verify.href });
     return { ok: true, replyUrl: verify.href, verify };
   } finally {
@@ -900,6 +1321,32 @@ function validateThreadsUrl(value) {
   const match = parsed.pathname.match(/^\/@([^/]+)\/post\/([^/]+)/);
   if (!match) throw new Error("Threads 원글 URL 형식이 아닙니다.");
   return `https://www.threads.com/@${match[1]}/post/${match[2]}`;
+}
+
+function isInssiderPostUrl(value) {
+  try {
+    const parsed = new URL(value);
+    return parsed.hostname === "inssider.kr" && /^\/posts\/\d+\/\d+/.test(parsed.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function validateInssiderUrl(value) {
+  const parsed = new URL(value);
+  if (parsed.hostname !== "inssider.kr") throw new Error("inssider.kr URL만 허용됩니다.");
+  const match = parsed.pathname.match(/^\/posts\/(\d+)\/(\d+)/);
+  if (!match) throw new Error("인싸이더 글 URL 형식이 아닙니다.");
+  if (!INSSIDER_CATEGORY_CODES.has(match[1])) throw new Error("허용되지 않은 인싸이더 카테고리입니다.");
+  return {
+    canonicalUrl: `${INSSIDER_BASE_URL}/posts/${match[1]}/${match[2]}`,
+    categoryCode: match[1],
+    postSeq: match[2],
+  };
+}
+
+function normalizeDiscoveryUrl(value) {
+  return isInssiderPostUrl(value) ? validateInssiderUrl(value).canonicalUrl : validateThreadsUrl(value);
 }
 
 function parseCompactCount(value) {
@@ -1519,7 +1966,29 @@ async function postToX(threadPost, mediaFiles, options = {}) {
       if (!clicked) throw new Error("X 게시 버튼을 클릭하지 못했습니다.");
       await sleep(5000);
       if (scheduledAt) recordScheduleSlot(scheduledAt);
-      return { scheduledAt };
+      let postUrl = null;
+      if (!scheduledAt) {
+        const verifyText = String(threadPost.text || "").slice(0, 80);
+        try {
+          await page.navigate(`https://x.com/${REQUIRED_X_HANDLE}/with_replies`, 7000);
+          const found = await page.eval(`((verifyText) => {
+            function clean(s) { return (s || "").replace(/\\s+/g, " ").trim(); }
+            for (const article of Array.from(document.querySelectorAll("article")).slice(0, 8)) {
+              const text = clean(article.innerText || "");
+              if (!text.includes(verifyText)) continue;
+              const href = Array.from(article.querySelectorAll('a[href*="/status/"]'))
+                .map((a) => a.href)
+                .find((href) => /x\\.com\\/[^/]+\\/status\\/\\d+/.test(href) && !href.includes("/analytics"));
+              if (href) return href.split("?")[0];
+            }
+            return null;
+          })(${JSON.stringify(verifyText)})`);
+          postUrl = found || null;
+        } catch (error) {
+          logEvent("x_post_url_lookup_error", { error: error.message, textPreview: verifyText });
+        }
+      }
+      return { scheduledAt, postUrl };
     } finally {
       await page.close();
       logEvent("x_tab_closed", {});
@@ -2039,6 +2508,223 @@ async function addThreadToDiscoveryReview(url, options = {}) {
   };
 }
 
+async function addInssiderToDiscoveryReview(url) {
+  const { canonicalUrl, categoryCode, postSeq } = validateInssiderUrl(url);
+  const post = await fetchInssiderPostDetail(categoryCode, postSeq);
+  const debateEndAt = parseKoreanDateTime(post.debateInfo?.debateEndAt);
+  if (post.postKind !== "D" || !debateEndAt || debateEndAt.getTime() <= Date.now()) {
+    throw new Error("판결중인 인싸이더 글만 대시보드에 저장할 수 있습니다.");
+  }
+  const capture = await createInssiderCaptureImage(post);
+  const textPreview = buildInssiderPostText(post);
+  const saved = await saveDiscoveryCandidates([{
+    canonicalUrl,
+    author: "inssider",
+    textPreview,
+    mediaPreviewUrl: capture.url,
+    likeCount: Number(post.likeCnt || 0),
+    mediaCount: 1,
+    viralScore: 3,
+    criteria: JSON.stringify({
+      source: "inssider",
+      categoryCode,
+      postSeq,
+      pendingDebate: true,
+      captureExcerpt: capture.excerpt,
+      inssiderReplyChunks: splitInssiderReplyChunks(capture.continuation),
+      sourceImageUrl: capture.sourceImageUrl,
+      debateEndAt: post.debateInfo?.debateEndAt || null,
+    }),
+  }]);
+  logEvent("inssider_saved_to_discovery", { canonicalUrl, categoryCode, postSeq, capture: path.basename(capture.filePath), ...saved });
+  return {
+    canonicalUrl,
+    saved,
+    mediaPreviewUrl: capture.url,
+    textPreview,
+    message: "인싸이더 글이 대시보드에 저장됨",
+  };
+}
+
+async function postInssiderContinuationReplies(targetUrl, sourceUrl, options = {}) {
+  const { categoryCode, postSeq, canonicalUrl } = validateInssiderUrl(sourceUrl);
+  const post = await fetchInssiderPostDetail(categoryCode, postSeq);
+  const contentText = stripHtmlToText(post.content);
+  const parts = buildCuriosityExcerptParts(contentText);
+  const chunks = splitInssiderReplyChunks(parts.continuation);
+  const skipChunks = Math.max(0, Number(options.skipChunks || 0));
+  const pendingChunks = chunks.slice(skipChunks);
+  if (!pendingChunks.length) {
+    return { canonicalUrl, targetUrl, replyCount: 0, skipped: skipChunks, message: "추가로 달 답글이 없습니다." };
+  }
+  let replyTargetUrl = String(targetUrl || "").split("?")[0];
+  const replies = [];
+  for (let index = 0; index < pendingChunks.length; index += 1) {
+    const chunk = pendingChunks[index];
+    const result = await postTerafabxReply(replyTargetUrl, chunk, { validate: false });
+    replies.push({ index: skipChunks + index, replyUrl: result.replyUrl, length: chunk.length });
+    replyTargetUrl = result.replyUrl || replyTargetUrl;
+    logEvent("inssider_continuation_reply_posted", {
+      canonicalUrl,
+      targetUrl,
+      replyUrl: result.replyUrl,
+      index: skipChunks + index,
+      total: chunks.length,
+      length: chunk.length,
+    });
+    if (index < pendingChunks.length - 1) await sleep(1200);
+  }
+  return { canonicalUrl, targetUrl, skipped: skipChunks, replyCount: replies.length, replies };
+}
+
+async function postReplyTextChain(targetUrl, texts) {
+  const chunks = (Array.isArray(texts) ? texts : [])
+    .map((text) => String(text || "").trim())
+    .filter(Boolean);
+  if (!chunks.length) throw new Error("답글 텍스트가 비어 있습니다.");
+  let replyTargetUrl = String(targetUrl || "").split("?")[0];
+  const replies = [];
+  for (let index = 0; index < chunks.length; index += 1) {
+    const result = await postTerafabxReply(replyTargetUrl, chunks[index], { validate: false });
+    replies.push({ index, replyUrl: result.replyUrl, length: chunks[index].length });
+    replyTargetUrl = result.replyUrl || replyTargetUrl;
+    logEvent("reply_text_chain_posted", { targetUrl, replyUrl: result.replyUrl, index, total: chunks.length, length: chunks[index].length });
+    if (index < chunks.length - 1) await sleep(1200);
+  }
+  return { targetUrl, replyCount: replies.length, replies };
+}
+
+async function findOwnXPostByText(text, options = {}) {
+  const needle = String(text || "").replace(/\s+/g, " ").trim().slice(0, 80);
+  if (!needle) return null;
+  const page = await newPage(`https://x.com/${REQUIRED_X_HANDLE}/with_replies`);
+  try {
+    await verifyXAccount(page);
+    await page.navigate(`https://x.com/${REQUIRED_X_HANDLE}/with_replies`, 8000);
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const found = await page.eval(`(() => {
+        const needle = ${JSON.stringify(needle)};
+        function clean(s) { return (s || "").replace(/\\s+/g, " ").trim(); }
+        for (const article of Array.from(document.querySelectorAll("article")).slice(0, 20)) {
+          const text = clean(article.innerText || "");
+          if (!text.includes(needle)) continue;
+          const href = Array.from(article.querySelectorAll('a[href*="/status/"]'))
+            .map((a) => a.href)
+            .find((href) => href.toLowerCase().includes('/${REQUIRED_X_HANDLE}/status/') && !href.includes('/analytics'));
+          if (href) return href.split("?")[0];
+        }
+        return null;
+      })()`);
+      if (found) return found;
+      await page.send("Runtime.evaluate", {
+        expression: "window.scrollBy(0, 900)",
+        returnByValue: true,
+      }).catch(() => {});
+      await sleep(1500);
+    }
+    return null;
+  } finally {
+    await page.close();
+  }
+}
+
+async function maybeRunScheduledInssiderReplies() {
+  if (scheduledReplyBusy) return { ok: true, skipped: true, reason: "busy" };
+  scheduledReplyBusy = true;
+  try {
+    await enqueueMissingScheduledInssiderReplyItems();
+    const state = loadScheduledReplyState();
+    const now = Date.now();
+    const pending = (state.items || [])
+      .filter((item) => item.status === "pending")
+      .filter((item) => new Date(item.scheduledAt || 0).getTime() + 30 * 1000 <= now)
+      .sort((a, b) => new Date(a.scheduledAt || 0).getTime() - new Date(b.scheduledAt || 0).getTime());
+    for (const item of pending) {
+      const attempts = Number(item.attempts || 0) + 1;
+      patchScheduledReplyItem(item.canonicalUrl, { attempts, lastAttemptAt: new Date().toISOString(), lastError: null });
+      try {
+        const row = await getDiscoveryRow(item.canonicalUrl);
+        let criteria = {};
+        try { criteria = JSON.parse(row?.criteria || "{}"); } catch {}
+        const storedReplyChunks = Array.isArray(item.replyChunks) && item.replyChunks.length
+          ? item.replyChunks
+          : Array.isArray(criteria.inssiderReplyChunks)
+            ? criteria.inssiderReplyChunks
+            : [];
+        const replyChunks = splitInssiderReplyChunks(storedReplyChunks.join("\n"), 180);
+        if (!row || !replyChunks.length) throw new Error("예약 댓글에 필요한 대시보드 행 또는 replyChunks가 없습니다.");
+        const postUrl = item.postUrl || await findOwnXPostByText(item.text || row.textPreview || "");
+        if (!postUrl) {
+          if (attempts >= 20) patchScheduledReplyItem(item.canonicalUrl, { status: "failed", lastError: "예약 게시글 URL을 찾지 못했습니다." });
+          else patchScheduledReplyItem(item.canonicalUrl, { lastError: "예약 게시글 URL을 아직 찾지 못했습니다." });
+          logEvent("inssider_scheduled_reply_post_not_found", { canonicalUrl: item.canonicalUrl, attempts });
+          continue;
+        }
+        const replies = Array.isArray(item.replies) ? item.replies.filter((reply) => reply && reply.replyUrl) : [];
+        let replyTargetUrl = replies.length ? replies[replies.length - 1].replyUrl : postUrl;
+        for (let index = replies.length; index < replyChunks.length; index += 1) {
+          const replyText = String(replyChunks[index] || "").trim();
+          if (!replyText) continue;
+          const replyResult = await postTerafabxReply(replyTargetUrl, replyText, { validate: false });
+          replies.push({ index, replyUrl: replyResult.replyUrl, length: replyText.length });
+          replyTargetUrl = replyResult.replyUrl || replyTargetUrl;
+          patchScheduledReplyItem(item.canonicalUrl, {
+            postUrl,
+            replies,
+            lastReplyAt: new Date().toISOString(),
+            lastError: null,
+          });
+          if (index < replyChunks.length - 1) await sleep(1200);
+        }
+        patchScheduledReplyItem(item.canonicalUrl, {
+          status: "done",
+          postUrl,
+          replies,
+          completedAt: new Date().toISOString(),
+          lastError: null,
+        });
+        logEvent("inssider_scheduled_replies_done", { canonicalUrl: item.canonicalUrl, postUrl, replyCount: replies.length });
+      } catch (error) {
+        patchScheduledReplyItem(item.canonicalUrl, {
+          status: attempts >= 20 ? "failed" : "pending",
+          attempts,
+          lastError: error.message,
+        });
+        logEvent("inssider_scheduled_replies_error", { canonicalUrl: item.canonicalUrl, attempts, error: error.message });
+      }
+    }
+    return { ok: true, processed: pending.length };
+  } finally {
+    scheduledReplyBusy = false;
+  }
+}
+
+async function enqueueMissingScheduledInssiderReplyItems() {
+  const state = loadScheduledReplyState();
+  const existing = new Set((state.items || []).map((item) => item.canonicalUrl));
+  const scheduledHistory = loadMirrorHistory().filter((entry) => entry.status === "scheduled" && isInssiderPostUrl(entry.canonicalUrl));
+  if (!scheduledHistory.length) return;
+  const rows = await listDiscoveryRows(500);
+  for (const history of scheduledHistory) {
+    if (existing.has(history.canonicalUrl)) continue;
+    const row = rows.find((item) => item.canonicalUrl === history.canonicalUrl);
+    if (!row) continue;
+    let criteria = {};
+    try { criteria = JSON.parse(row.criteria || "{}"); } catch {}
+    const replyChunks = Array.isArray(criteria.inssiderReplyChunks)
+      ? criteria.inssiderReplyChunks.map((chunk) => String(chunk || "").trim()).filter(Boolean)
+      : [];
+    if (!replyChunks.length) continue;
+    upsertScheduledReplyItem({
+      canonicalUrl: history.canonicalUrl,
+      scheduledAt: history.scheduledAt,
+      text: row.textPreview,
+      replyChunks,
+      source: "backfill",
+    });
+  }
+}
+
 async function listDiscoveryRows(limit = 20) {
   const db = await getDiscoveryDb();
   return db.prepare(`
@@ -2052,6 +2738,19 @@ async function listDiscoveryRows(limit = 20) {
     ORDER BY discovered_at DESC
     LIMIT ?
   `).all(limit);
+}
+
+async function getDiscoveryRow(canonicalUrl) {
+  const db = await getDiscoveryDb();
+  return db.prepare(`
+    SELECT canonical_url AS canonicalUrl, author, text_preview AS textPreview,
+      media_preview_url AS mediaPreviewUrl, like_count AS likeCount, media_count AS mediaCount, viral_score AS viralScore,
+      criteria, status,
+      scheduled_post_at AS scheduledPostAt, discovered_at AS discoveredAt,
+      posted_at AS postedAt, last_error AS lastError, attempts
+    FROM thread_discoveries
+    WHERE canonical_url = ? AND status != 'skipped'
+  `).get(canonicalUrl);
 }
 
 async function markDiscoveryPosted(canonicalUrl, mediaCount) {
@@ -3311,6 +4010,125 @@ async function createXDraftFromThread(url, options = {}) {
   }
 }
 
+async function postDiscoveryRowToX(canonicalUrl, options = {}) {
+  if (!isInssiderPostUrl(canonicalUrl)) {
+    return mirrorThread(canonicalUrl, options);
+  }
+  const completed = findCompletedMirror(canonicalUrl);
+  if (completed) {
+    throw new DuplicateMirrorError("이미 X에 게시 또는 예약된 인싸이더 URL입니다.", {
+      canonicalUrl,
+      previousStatus: completed.status,
+      previousScheduledAt: completed.scheduledAt,
+      previousCompletedAt: completed.completedAt,
+    });
+  }
+  const row = await getDiscoveryRow(canonicalUrl);
+  if (!row) throw new Error("저장된 인싸이더 대시보드 항목을 찾지 못했습니다.");
+  let criteria = {};
+  try { criteria = JSON.parse(row.criteria || "{}"); } catch {}
+  if (criteria.source !== "inssider") throw new Error("인싸이더 저장 항목 정보가 올바르지 않습니다.");
+  if (!row.mediaPreviewUrl) throw new Error("인싸이더 캡처 이미지가 없습니다.");
+  const requestedScheduledAt = parseRequestedScheduleTime(options.scheduledAt);
+  const post = {
+    url: canonicalUrl,
+    text: String(options.textOverride || row.textPreview || "").trim().slice(0, 280),
+    mediaUrls: [row.mediaPreviewUrl],
+    imageMediaUrls: [row.mediaPreviewUrl],
+    videoMediaUrls: [],
+    diagnostics: { source: "inssider_saved_capture" },
+  };
+  const media = await downloadMedia(post.mediaUrls);
+  try {
+    const postResult = await postToX(post, media.files, {
+      schedule: Boolean(options.schedule),
+      scheduledAt: requestedScheduledAt,
+    });
+    const replyResults = [];
+    const replyChunks = Array.isArray(criteria.inssiderReplyChunks)
+      ? criteria.inssiderReplyChunks.map((chunk) => String(chunk || "").trim()).filter(Boolean)
+      : String(criteria.inssiderReplyText || "").trim()
+        ? [String(criteria.inssiderReplyText || "").trim()]
+        : [];
+    if (!postResult.scheduledAt && replyChunks.length) {
+      if (!postResult.postUrl) throw new Error("인싸이더 이어보기 답글을 달 새 X 게시글 URL을 찾지 못했습니다.");
+      let replyTargetUrl = postResult.postUrl;
+      for (let index = 0; index < replyChunks.length; index += 1) {
+        const replyText = replyChunks[index];
+        const replyResult = await postTerafabxReply(replyTargetUrl, replyText, { validate: false });
+        replyResults.push({ index, replyUrl: replyResult.replyUrl, length: replyText.length });
+        replyTargetUrl = replyResult.replyUrl || replyTargetUrl;
+        logEvent("inssider_x_reply_success", {
+          canonicalUrl,
+          postUrl: postResult.postUrl,
+          replyUrl: replyResult.replyUrl,
+          index,
+          total: replyChunks.length,
+          length: replyText.length,
+        });
+        if (index < replyChunks.length - 1) await sleep(1200);
+      }
+    }
+    recordCompletedMirror({
+      canonicalUrl,
+      status: postResult.scheduledAt ? "scheduled" : "posted",
+      scheduledAt: postResult.scheduledAt?.toISOString(),
+      mediaCount: media.files.length,
+    });
+    if (postResult.scheduledAt && replyChunks.length) {
+      upsertScheduledReplyItem({
+        canonicalUrl,
+        scheduledAt: postResult.scheduledAt.toISOString(),
+        text: post.text,
+        replyChunks,
+      });
+    }
+    logEvent("inssider_x_post_success", { canonicalUrl, mediaCount: media.files.length, scheduledAt: postResult.scheduledAt?.toISOString() });
+    return {
+      canonicalUrl,
+      mediaCount: media.files.length,
+      scheduledAt: postResult.scheduledAt?.toISOString(),
+      postUrl: postResult.postUrl || null,
+      replyUrl: replyResults.at(-1)?.replyUrl || null,
+      replyCount: replyResults.length,
+      message: postResult.scheduledAt ? `X 예약됨 · ${postResult.scheduledAt.toLocaleString("ko-KR")}` : "X 게시됨",
+    };
+  } finally {
+    fs.rmSync(media.dir, { recursive: true, force: true });
+    logEvent("cleanup_done", { canonicalUrl, dir: media.dir, source: "inssider" });
+  }
+}
+
+async function createXDraftFromDiscoveryRow(canonicalUrl, options = {}) {
+  if (!isInssiderPostUrl(canonicalUrl)) {
+    return createXDraftFromThread(canonicalUrl, options);
+  }
+  const row = await getDiscoveryRow(canonicalUrl);
+  if (!row) throw new Error("저장된 인싸이더 대시보드 항목을 찾지 못했습니다.");
+  if (!row.mediaPreviewUrl) throw new Error("인싸이더 캡처 이미지가 없습니다.");
+  const post = {
+    url: canonicalUrl,
+    text: String(options.textOverride || row.textPreview || "").trim().slice(0, 280),
+    mediaUrls: [row.mediaPreviewUrl],
+    imageMediaUrls: [row.mediaPreviewUrl],
+    videoMediaUrls: [],
+    diagnostics: { source: "inssider_saved_capture" },
+  };
+  const media = await downloadMedia(post.mediaUrls);
+  try {
+    await createXDraft(post, media.files);
+    logEvent("inssider_x_draft_success", { canonicalUrl, mediaCount: media.files.length });
+    return {
+      canonicalUrl,
+      mediaCount: media.files.length,
+      message: "X 초안 저장됨",
+    };
+  } finally {
+    fs.rmSync(media.dir, { recursive: true, force: true });
+    logEvent("cleanup_done", { canonicalUrl, dir: media.dir, draft: true, source: "inssider" });
+  }
+}
+
 async function runDiscoveryAutoSchedule(canonicalUrl, options = {}) {
   await acquireMirrorBusy({
     wait: Boolean(options.waitForBusy),
@@ -3327,7 +4145,7 @@ async function runDiscoveryAutoSchedule(canonicalUrl, options = {}) {
       scheduledAt: scheduledAt.toISOString(),
       source: options.source || null,
     });
-    const result = await mirrorThread(canonicalUrl, {
+    const result = await postDiscoveryRowToX(canonicalUrl, {
       textOverride: options.text,
       schedule: true,
       scheduledAt,
@@ -3701,6 +4519,9 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && tryServeDashboardAsset(req, res)) {
     return;
   }
+  if (req.method === "GET" && tryServeGeneratedMedia(req, res)) {
+    return;
+  }
   if (req.method === "GET" && req.url === "/health") {
     json(res, 200, { ok: true, chromePort: CHROME_PORT, requiredXHandle: REQUIRED_X_HANDLE });
     return;
@@ -3715,9 +4536,62 @@ const server = http.createServer(async (req, res) => {
     }
     return;
   }
+  if (req.method === "GET" && req.url === "/inssider-pending") {
+    try {
+      if (fs.existsSync(DASHBOARD_INDEX_PATH)) serveFile(res, DASHBOARD_INDEX_PATH);
+      else html(res, 200, "<h1>Inssider Pending</h1><p>Run npm run build:dashboard first.</p>");
+    } catch (error) {
+      logEvent("inssider_pending_dashboard_error", { error: error.message });
+      html(res, 500, `<pre>${escapeHtml(error.message)}</pre>`);
+    }
+    return;
+  }
   if (req.method === "GET" && req.url === "/api/naver-blog/ops") {
     try { json(res, 200, await getNaverBlogOpsDashboard()); }
     catch (error) { appendNaverBlogEvent("status_error", { error: error.message }); json(res, 500, { ok: false, error: error.message }); }
+    return;
+  }
+  if (req.method === "GET" && req.url.startsWith("/api/inssider/pending")) {
+    try { json(res, 200, await getInssiderPendingDashboardData()); }
+    catch (error) { logEvent("inssider_pending_error", { error: error.message }); json(res, 500, { ok: false, error: error.message }); }
+    return;
+  }
+  if (req.method === "POST" && req.url === "/api/inssider/save-to-discovery") {
+    try {
+      const body = await readRequestBody(req);
+      const payload = JSON.parse(body || "{}");
+      json(res, 200, { ok: true, ...(await addInssiderToDiscoveryReview(payload.url)) });
+    } catch (error) {
+      logEvent("inssider_save_to_discovery_error", { error: error.message });
+      json(res, 500, { ok: false, error: error.message });
+    }
+    return;
+  }
+  if (req.method === "POST" && req.url === "/api/inssider/reply-continuation") {
+    try {
+      const body = await readRequestBody(req);
+      const payload = JSON.parse(body || "{}");
+      json(res, 200, {
+        ok: true,
+        ...(await postInssiderContinuationReplies(payload.targetUrl, payload.sourceUrl, {
+          skipChunks: payload.skipChunks,
+        })),
+      });
+    } catch (error) {
+      logEvent("inssider_reply_continuation_error", { error: error.message });
+      json(res, 500, { ok: false, error: error.message });
+    }
+    return;
+  }
+  if (req.method === "POST" && req.url === "/api/inssider/reply-text-chain") {
+    try {
+      const body = await readRequestBody(req);
+      const payload = JSON.parse(body || "{}");
+      json(res, 200, { ok: true, ...(await postReplyTextChain(payload.targetUrl, payload.texts)) });
+    } catch (error) {
+      logEvent("reply_text_chain_error", { error: error.message });
+      json(res, 500, { ok: false, error: error.message });
+    }
     return;
   }
   if (req.method === "POST" && req.url === "/api/naver-blog/settings") {
@@ -3814,7 +4688,7 @@ const server = http.createServer(async (req, res) => {
     try {
       const body = await readRequestBody(req);
       const payload = JSON.parse(body || "{}");
-      const canonicalUrl = validateThreadsUrl(payload.url);
+      const canonicalUrl = normalizeDiscoveryUrl(payload.url);
       const threadPost = await extractThreadPost(canonicalUrl);
       json(res, 200, {
         ok: true,
@@ -3940,7 +4814,7 @@ const server = http.createServer(async (req, res) => {
     try {
       const body = await readRequestBody(req);
       const payload = JSON.parse(body || "{}");
-      const canonicalUrl = validateThreadsUrl(payload.url);
+      const canonicalUrl = normalizeDiscoveryUrl(payload.url);
       const result = await updateDiscoveryTitle(canonicalUrl, payload.text);
       json(res, 200, { ok: true, ...result });
     } catch (error) {
@@ -3959,11 +4833,11 @@ const server = http.createServer(async (req, res) => {
     try {
       const body = await readRequestBody(req);
       const payload = JSON.parse(body || "{}");
-      canonicalUrl = validateThreadsUrl(payload.url);
+      canonicalUrl = normalizeDiscoveryUrl(payload.url);
       if (payload.text && String(payload.text).trim()) {
         await updateDiscoveryTitle(canonicalUrl, payload.text);
       }
-      const result = await mirrorThread(canonicalUrl, {
+      const result = await postDiscoveryRowToX(canonicalUrl, {
         textOverride: payload.text,
         schedule: false,
       });
@@ -3993,11 +4867,11 @@ const server = http.createServer(async (req, res) => {
     try {
       const body = await readRequestBody(req);
       const payload = JSON.parse(body || "{}");
-      canonicalUrl = validateThreadsUrl(payload.url);
+      canonicalUrl = normalizeDiscoveryUrl(payload.url);
       if (payload.text && String(payload.text).trim()) {
         await updateDiscoveryTitle(canonicalUrl, payload.text);
       }
-      const result = await createXDraftFromThread(canonicalUrl, {
+      const result = await createXDraftFromDiscoveryRow(canonicalUrl, {
         textOverride: payload.text,
       });
       await markDiscoveryDrafted(canonicalUrl, result.mediaCount);
@@ -4052,7 +4926,7 @@ const server = http.createServer(async (req, res) => {
     try {
       const body = await readRequestBody(req);
       const payload = JSON.parse(body || "{}");
-      canonicalUrl = validateThreadsUrl(payload.url);
+      canonicalUrl = normalizeDiscoveryUrl(payload.url);
       if (payload.text && String(payload.text).trim()) {
         await updateDiscoveryTitle(canonicalUrl, payload.text);
       }
@@ -4062,7 +4936,7 @@ const server = http.createServer(async (req, res) => {
         browserTimezone: payload.scheduledAtTimezone || null,
         browserOffsetMinutes: Number.isFinite(Number(payload.scheduledAtOffsetMinutes)) ? Number(payload.scheduledAtOffsetMinutes) : null,
       });
-      const result = await mirrorThread(canonicalUrl, {
+      const result = await postDiscoveryRowToX(canonicalUrl, {
         textOverride: payload.text,
         schedule: true,
         scheduledAt: payload.scheduledAt,
@@ -4092,7 +4966,7 @@ const server = http.createServer(async (req, res) => {
     try {
       const body = await readRequestBody(req);
       const payload = JSON.parse(body || "{}");
-      canonicalUrl = validateThreadsUrl(payload.url);
+      canonicalUrl = normalizeDiscoveryUrl(payload.url);
       const result = await runDiscoveryAutoSchedule(canonicalUrl, {
         text: payload.text,
         source: "dashboard",
@@ -4272,6 +5146,12 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`using Chrome remote debugging port ${CHROME_PORT}; required X account @${REQUIRED_X_HANDLE}`);
 });
 
+setTimeout(() => {
+  maybeRunScheduledInssiderReplies().catch((error) => {
+    logEvent("inssider_scheduled_reply_startup_error", { error: error.message });
+  });
+}, 5000);
+
 setInterval(() => {
   runDiscoveryScan().catch((error) => {
     logEvent("discovery_auto_scan_error", { error: error.message });
@@ -4287,5 +5167,11 @@ setInterval(() => {
 setInterval(() => {
   maybeRunTerafabxAutomation().catch((error) => {
     logEvent("terafabx_auto_tick_error", { error: error.message });
+  });
+}, 60 * 1000);
+
+setInterval(() => {
+  maybeRunScheduledInssiderReplies().catch((error) => {
+    logEvent("inssider_scheduled_reply_tick_error", { error: error.message });
   });
 }, 60 * 1000);

@@ -9,6 +9,7 @@ import {
   SearchIcon,
   Settings2Icon,
   FileTextIcon,
+  ScaleIcon,
   SparklesIcon,
 } from "lucide-react"
 
@@ -41,6 +42,7 @@ const viewItems = [
   { id: "discovered", title: "발굴됨", icon: <SparklesIcon /> },
   { id: "scheduled", title: "게시예정", icon: <CalendarClockIcon /> },
   { id: "posted", title: "게시됨", icon: <CheckCircle2Icon /> },
+  { id: "inssider-pending", title: "인싸이더 판결중", icon: <ScaleIcon /> },
   { id: "naver-blog", title: "네이버 블로그", icon: <FileTextIcon /> },
 ]
 
@@ -184,6 +186,8 @@ export function AppSidebar({
           ? summary.scheduledCount
           : item.id === "posted"
             ? summary.postedCount
+            : item.id === "inssider-pending"
+              ? summary.totalCount
             : "운영",
     onClick: () => onViewChange(item.id),
   }))
