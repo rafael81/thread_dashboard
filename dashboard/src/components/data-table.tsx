@@ -28,16 +28,6 @@ import {
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
-  Drawer,
-  DrawerClose,
-  DrawerContent,
-  DrawerDescription,
-  DrawerFooter,
-  DrawerHeader,
-  DrawerTitle,
-  DrawerTrigger,
-} from "@/components/ui/drawer"
-import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
   DropdownMenuContent,
@@ -56,6 +46,16 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import {
+  Sheet,
+  SheetClose,
+  SheetContent,
+  SheetDescription,
+  SheetFooter,
+  SheetHeader,
+  SheetTitle,
+  SheetTrigger,
+} from "@/components/ui/sheet"
 import {
   Table,
   TableBody,
@@ -102,11 +102,11 @@ type DataTableProps = {
   onViewChange: (view: string) => void
   onTitleChange: React.Dispatch<React.SetStateAction<Record<string, string>>>
   onScheduleChange: React.Dispatch<React.SetStateAction<Record<string, string>>>
-  onSaveTitle: (row: DashboardRow) => void
-  onPost: (row: DashboardRow) => void
-  onDraft: (row: DashboardRow) => void
-  onSchedule: (row: DashboardRow) => void
-  onAutoSchedule: (row: DashboardRow) => void
+  onSaveTitle: (row: DashboardRow, text?: string) => void
+  onPost: (row: DashboardRow, text?: string) => void
+  onDraft: (row: DashboardRow, text?: string) => void
+  onSchedule: (row: DashboardRow, text?: string, scheduledAt?: string) => void
+  onAutoSchedule: (row: DashboardRow, text?: string) => void
   formatDate: (value?: string | null) => string
   compact: (value: unknown) => string
 }
@@ -181,13 +181,11 @@ function MediaPreview({ row, large = false }: { row: DashboardRow; large?: boole
   )
 }
 
-function ThreadDrawer({
+function ThreadSheet({
   row,
   titleEdits,
   scheduleEdits,
   busy,
-  onTitleChange,
-  onScheduleChange,
   onSaveTitle,
   onPost,
   onDraft,
@@ -199,23 +197,35 @@ function ThreadDrawer({
   row: DashboardRow
 }) {
   const disabled = Boolean(busy) || !row.canPost
+  const [draftText, setDraftText] = React.useState(titleEdits[row.canonicalUrl] ?? row.textPreview ?? "")
+  const [draftSchedule, setDraftSchedule] = React.useState(scheduleEdits[row.canonicalUrl] || "")
+
+  React.useEffect(() => {
+    setDraftText(titleEdits[row.canonicalUrl] ?? row.textPreview ?? "")
+    setDraftSchedule(scheduleEdits[row.canonicalUrl] || "")
+  }, [row.canonicalUrl, row.textPreview, scheduleEdits, titleEdits])
 
   return (
-    <Drawer>
-      <DrawerTrigger asChild>
+    <Sheet>
+      <SheetTrigger asChild>
         <Button variant="link" className="h-auto min-w-0 px-0 text-left text-foreground">
           <span className="line-clamp-2 max-w-[34rem] whitespace-normal">
             {row.textPreview || "(본문 없음)"}
           </span>
         </Button>
-      </DrawerTrigger>
-      <DrawerContent>
-        <DrawerHeader className="gap-1">
-          <DrawerTitle>@{row.author || "unknown"}</DrawerTitle>
-          <DrawerDescription>
+      </SheetTrigger>
+      <SheetContent
+        side="bottom"
+        className="max-h-[88vh] rounded-t-xl"
+        onPointerDownOutside={(event) => event.preventDefault()}
+        onInteractOutside={(event) => event.preventDefault()}
+      >
+        <SheetHeader className="gap-1">
+          <SheetTitle>@{row.author || "unknown"}</SheetTitle>
+          <SheetDescription>
             좋아요 {compact(row.likeCount)} · 미디어 {compact(row.mediaCount)} · 점수 {compact(row.viralScore)}
-          </DrawerDescription>
-        </DrawerHeader>
+          </SheetDescription>
+        </SheetHeader>
         <div className="grid gap-4 overflow-y-auto px-4 pb-2 text-sm lg:grid-cols-[minmax(0,420px)_minmax(0,1fr)]">
           <div className="flex flex-col gap-3">
             <MediaPreview row={row} large />
@@ -235,20 +245,19 @@ function ThreadDrawer({
               </details>
             ) : null}
           </div>
-          <div className="flex min-w-0 flex-col gap-4">
+          <div
+            className="flex min-w-0 flex-col gap-4"
+            onClick={(event) => event.stopPropagation()}
+            onPointerDown={(event) => event.stopPropagation()}
+          >
             <div className="grid gap-2">
               <Label htmlFor={`${row.canonicalUrl}-text`}>게시글</Label>
               <Textarea
                 id={`${row.canonicalUrl}-text`}
-                value={titleEdits[row.canonicalUrl] ?? row.textPreview ?? ""}
+                value={draftText}
                 maxLength={280}
                 rows={5}
-                onChange={(event) =>
-                  onTitleChange((prev) => ({
-                    ...prev,
-                    [row.canonicalUrl]: event.target.value,
-                  }))
-                }
+                onChange={(event) => setDraftText(event.target.value)}
               />
             </div>
             <div className="grid gap-2">
@@ -256,17 +265,12 @@ function ThreadDrawer({
               <Input
                 id={`${row.canonicalUrl}-schedule`}
                 type="datetime-local"
-                value={scheduleEdits[row.canonicalUrl] || ""}
-                onChange={(event) =>
-                  onScheduleChange((prev) => ({
-                    ...prev,
-                    [row.canonicalUrl]: event.target.value,
-                  }))
-                }
+                value={draftSchedule}
+                onChange={(event) => setDraftSchedule(event.target.value)}
               />
             </div>
             <div className="grid grid-cols-2 gap-2">
-              <Button variant="outline" onClick={() => onSaveTitle(row)} disabled={Boolean(busy)}>
+              <Button variant="outline" onClick={() => onSaveTitle(row, draftText)} disabled={Boolean(busy)}>
                 <FilePenLineIcon data-icon="inline-start" />
                 제목 저장
               </Button>
@@ -276,31 +280,31 @@ function ThreadDrawer({
                   원문 열기
                 </a>
               </Button>
-              <Button onClick={() => onPost(row)} disabled={disabled}>
+              <Button onClick={() => onPost(row, draftText)} disabled={disabled}>
                 <SendIcon data-icon="inline-start" />
                 게시
               </Button>
-              <Button variant="outline" onClick={() => onDraft(row)} disabled={disabled}>
+              <Button variant="outline" onClick={() => onDraft(row, draftText)} disabled={disabled}>
                 초안 저장
               </Button>
-              <Button variant="outline" onClick={() => onSchedule(row)} disabled={disabled}>
+              <Button variant="outline" onClick={() => onSchedule(row, draftText, draftSchedule)} disabled={disabled}>
                 <Clock3Icon data-icon="inline-start" />
                 예약 게시
               </Button>
-              <Button onClick={() => onAutoSchedule(row)} disabled={disabled}>
+              <Button onClick={() => onAutoSchedule(row, draftText)} disabled={disabled}>
                 <CalendarClockIcon data-icon="inline-start" />
                 자동 예약
               </Button>
             </div>
           </div>
         </div>
-        <DrawerFooter>
-          <DrawerClose asChild>
+        <SheetFooter>
+          <SheetClose asChild>
             <Button variant="outline">닫기</Button>
-          </DrawerClose>
-        </DrawerFooter>
-      </DrawerContent>
-    </Drawer>
+          </SheetClose>
+        </SheetFooter>
+      </SheetContent>
+    </Sheet>
   )
 }
 
@@ -334,7 +338,7 @@ export function DataTable(props: DataTableProps) {
       {
         accessorKey: "textPreview",
         header: "Threads",
-        cell: ({ row }) => <ThreadDrawer row={row.original} {...props} />,
+        cell: ({ row }) => <ThreadSheet row={row.original} {...props} />,
         enableHiding: false,
       },
       {

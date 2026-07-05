@@ -10,6 +10,7 @@ import {
   PauseCircleIcon,
   PlayCircleIcon,
   RefreshCcwIcon,
+  ScaleIcon,
   SparklesIcon,
   TrendingUpIcon,
   FileTextIcon
@@ -76,6 +77,122 @@ function formatDate(value) {
 
 function compact(value) {
   return Number(value || 0).toLocaleString("ko-KR");
+}
+
+function InssiderPending({ data, loading, error, onReload, onSave, busy }) {
+  const rows = data?.rows || [];
+  const categories = data?.categories || [];
+  const categoryCounts = data?.summary?.categoryCounts || {};
+
+  return (
+    <div className="grid gap-4 px-4 lg:px-6">
+      <div className="grid gap-4 md:grid-cols-3">
+        <Card>
+          <CardHeader className="pb-2">
+            <CardDescription>판결중 글</CardDescription>
+            <CardTitle>{loading ? "-" : compact(data?.summary?.totalCount)}</CardTitle>
+          </CardHeader>
+          <CardContent className="text-sm text-muted-foreground">
+            연애·결혼, 직장·사회만 필터링
+          </CardContent>
+        </Card>
+        {categories.map((category) => (
+          <Card key={category.code}>
+            <CardHeader className="pb-2">
+              <CardDescription>{category.name}</CardDescription>
+              <CardTitle>{compact(categoryCounts[category.code])}</CardTitle>
+            </CardHeader>
+            <CardContent className="text-sm text-muted-foreground">
+              카테고리 코드 {category.code}
+            </CardContent>
+          </Card>
+        ))}
+      </div>
+
+      {error ? (
+        <Alert variant="destructive">
+          <AlertTitle>인싸이더 조회 실패</AlertTitle>
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      ) : null}
+
+      <Card>
+        <CardHeader className="gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <CardTitle className="flex items-center gap-2">
+              <ScaleIcon className="size-5" />
+              인싸이더 판결중
+            </CardTitle>
+            <CardDescription>
+              `postKind=D`이고 판결 종료 시간이 아직 지나지 않은 글만 표시합니다.
+            </CardDescription>
+          </div>
+          <Button variant="outline" disabled={busy || loading} onClick={onReload}>
+            {busy ? <Loader2Icon data-icon="inline-start" className="animate-spin" /> : <RefreshCcwIcon data-icon="inline-start" />}
+            새로고침
+          </Button>
+        </CardHeader>
+        <CardContent className="grid gap-3">
+          {loading ? (
+            <>
+              <Skeleton className="h-28 rounded-lg" />
+              <Skeleton className="h-28 rounded-lg" />
+              <Skeleton className="h-28 rounded-lg" />
+            </>
+          ) : rows.length ? rows.map((row) => (
+            <article key={`${row.categoryCode}-${row.id}`} className="grid gap-3 rounded-lg border p-4 sm:grid-cols-[96px_minmax(0,1fr)]">
+              <div className="aspect-square overflow-hidden rounded-md bg-muted">
+                {row.thumbnailUrl ? (
+                  <img className="h-full w-full object-cover" src={row.thumbnailUrl} alt="" loading="lazy" />
+                ) : (
+                  <div className="flex h-full items-center justify-center text-muted-foreground">
+                    <ScaleIcon className="size-6" />
+                  </div>
+                )}
+              </div>
+              <div className="min-w-0 space-y-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Badge variant="secondary">{row.categoryName}</Badge>
+                  <Badge variant="outline">판결중 · {formatDate(row.debateEndAt)}</Badge>
+                  <span className="text-xs text-muted-foreground">
+                    조회 {row.viewCntDisplay} · 댓글 {row.commentCntDisplay} · 추천 {row.likeCntDisplay}
+                  </span>
+                </div>
+                <h3 className="line-clamp-2 text-base font-semibold">{row.title || "제목 없음"}</h3>
+                <p className="line-clamp-2 text-sm text-muted-foreground">{row.preview || "미리보기 없음"}</p>
+                <div className="grid gap-2 text-sm sm:grid-cols-2">
+                  <div className="rounded-md border px-3 py-2">
+                    <div className="text-xs text-muted-foreground">찬성 {compact(row.prosCnt)}</div>
+                    <div className="line-clamp-1 font-medium">{row.prosText || "-"}</div>
+                  </div>
+                  <div className="rounded-md border px-3 py-2">
+                    <div className="text-xs text-muted-foreground">반대 {compact(row.consCnt)}</div>
+                    <div className="line-clamp-1 font-medium">{row.consText || "-"}</div>
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <Button size="sm" disabled={Boolean(busy)} onClick={() => onSave(row)}>
+                    {busy === `inssider-save-${row.id}` ? <Loader2Icon data-icon="inline-start" className="animate-spin" /> : <SparklesIcon data-icon="inline-start" />}
+                    대시보드 저장
+                  </Button>
+                  <Button size="sm" variant="outline" asChild>
+                    <a href={row.url} target="_blank" rel="noreferrer">
+                      <ExternalLinkIcon data-icon="inline-start" />
+                      원문 열기
+                    </a>
+                  </Button>
+                </div>
+              </div>
+            </article>
+          )) : (
+            <div className="rounded-lg border p-6 text-center text-sm text-muted-foreground">
+              현재 조건에 맞는 판결중 글이 없습니다.
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
 }
 
 
@@ -238,6 +355,8 @@ function growthSummary(flowDays = []) {
 function Dashboard() {
   const initialView = location.pathname.startsWith("/naver-blog")
     ? "naver-blog"
+    : location.pathname.startsWith("/inssider-pending")
+      ? "inssider-pending"
     : new URLSearchParams(location.search).get("view") || "discovered";
   const [view, setView] = useState(initialView);
   const [data, setData] = useState(null);
@@ -255,7 +374,9 @@ function Dashboard() {
     setError("");
     const result = nextView === "naver-blog"
       ? await api("/api/naver-blog/ops")
-      : await api(`/api/discovery/dashboard?view=${encodeURIComponent(nextView)}`);
+      : nextView === "inssider-pending"
+        ? await api("/api/inssider/pending")
+        : await api(`/api/discovery/dashboard?view=${encodeURIComponent(nextView)}`);
     setData(result);
     setTitleEdits(Object.fromEntries((result.rows || []).map((row) => [row.canonicalUrl, row.textPreview || ""])));
     setLoading(false);
@@ -265,6 +386,9 @@ function Dashboard() {
     const url = new URL(location.href);
     if (view === "naver-blog") {
       url.pathname = "/naver-blog";
+      url.searchParams.delete("view");
+    } else if (view === "inssider-pending") {
+      url.pathname = "/inssider-pending";
       url.searchParams.delete("view");
     } else {
       url.pathname = "/discovery";
@@ -387,8 +511,8 @@ function Dashboard() {
         />
         <SidebarInset>
           <SiteHeader
-            title={view === "naver-blog" ? "네이버 블로그 운영" : "Threads 발굴 대시보드"}
-            subtitle={view === "naver-blog" ? "Gemini Web 전용 작성 · 자체 스케줄러 · 전용 Chrome 프로필" : "좋아요 1000+ · 미디어 포함 · X 수동 검토/예약 워크플로우"}
+            title={view === "naver-blog" ? "네이버 블로그 운영" : view === "inssider-pending" ? "인싸이더 판결중" : "Threads 발굴 대시보드"}
+            subtitle={view === "naver-blog" ? "Gemini Web 전용 작성 · 자체 스케줄러 · 전용 Chrome 프로필" : view === "inssider-pending" ? "연애·결혼 / 직장·사회 카테고리의 진행 중인 판결글" : "좋아요 1000+ · 미디어 포함 · X 수동 검토/예약 워크플로우"}
             autoRefresh={autoRefresh}
             busy={controlsBusy}
             onRefresh={() => runAction("refresh-data", () => load(view), "새로고침 완료")}
@@ -408,6 +532,18 @@ function Dashboard() {
                   error={error}
                   onRunAction={runAction}
                   onReload={() => runAction("naver-refresh", () => load("naver-blog"), "새로고침 완료")}
+                />
+              ) : view === "inssider-pending" ? (
+                <InssiderPending
+                  data={data}
+                  loading={loading}
+                  error={error}
+                  busy={busy}
+                  onReload={() => runAction("inssider-refresh", () => load("inssider-pending"), "새로고침 완료")}
+                  onSave={(row) => runAction(`inssider-save-${row.id}`, () => api("/api/inssider/save-to-discovery", {
+                    method: "POST",
+                    body: JSON.stringify({ url: row.url }),
+                  }), "발굴 대시보드에 저장됨")}
                 />
               ) : (
                 <>
@@ -646,38 +782,38 @@ function Dashboard() {
                   onViewChange={setView}
                   onTitleChange={setTitleEdits}
                   onScheduleChange={setScheduleEdits}
-                  onSaveTitle={(row) =>
+                  onSaveTitle={(row, text) =>
                     runAction(`save-${row.canonicalUrl}`, () => api("/api/discovery/title", {
                       method: "POST",
-                      body: JSON.stringify({ url: row.canonicalUrl, text: rowText(row) }),
+                      body: JSON.stringify({ url: row.canonicalUrl, text: (text ?? rowText(row)).trim() }),
                     }), "제목 저장됨")
                   }
-                  onPost={(row) =>
+                  onPost={(row, text) =>
                     runAction(`post-${row.canonicalUrl}`, () => api("/api/discovery/post", {
                       method: "POST",
-                      body: JSON.stringify({ url: row.canonicalUrl, text: rowText(row) }),
+                      body: JSON.stringify({ url: row.canonicalUrl, text: (text ?? rowText(row)).trim() }),
                     }), "X에 게시됨")
                   }
-                  onDraft={(row) =>
+                  onDraft={(row, text) =>
                     runAction(`draft-${row.canonicalUrl}`, () => api("/api/discovery/draft", {
                       method: "POST",
-                      body: JSON.stringify({ url: row.canonicalUrl, text: rowText(row) }),
+                      body: JSON.stringify({ url: row.canonicalUrl, text: (text ?? rowText(row)).trim() }),
                     }), "X 초안 저장됨")
                   }
-                  onSchedule={(row) =>
+                  onSchedule={(row, text, scheduledAt) =>
                     runAction(`schedule-${row.canonicalUrl}`, () => api("/api/discovery/schedule", {
                       method: "POST",
                       body: JSON.stringify({
                         url: row.canonicalUrl,
-                        text: rowText(row),
-                        scheduledAt: scheduleEdits[row.canonicalUrl],
+                        text: (text ?? rowText(row)).trim(),
+                        scheduledAt: scheduledAt || scheduleEdits[row.canonicalUrl],
                       }),
                     }), "X 예약됨")
                   }
-                  onAutoSchedule={(row) =>
+                  onAutoSchedule={(row, text) =>
                     runAction(`auto-${row.canonicalUrl}`, () => api("/api/discovery/auto-schedule", {
                       method: "POST",
-                      body: JSON.stringify({ url: row.canonicalUrl, text: rowText(row) }),
+                      body: JSON.stringify({ url: row.canonicalUrl, text: (text ?? rowText(row)).trim() }),
                     }), "자동 예약됨")
                   }
                   formatDate={formatDate}
