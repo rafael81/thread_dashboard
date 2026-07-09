@@ -19,10 +19,13 @@ import {
   ChevronsLeftIcon,
   ChevronsRightIcon,
   Clock3Icon,
+  DownloadIcon,
   ExternalLinkIcon,
   FilePenLineIcon,
   MoreVerticalIcon,
+  RefreshCcwIcon,
   SendIcon,
+  Trash2Icon,
 } from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
@@ -48,13 +51,11 @@ import {
 } from "@/components/ui/select"
 import {
   Sheet,
-  SheetClose,
   SheetContent,
   SheetDescription,
   SheetFooter,
   SheetHeader,
   SheetTitle,
-  SheetTrigger,
 } from "@/components/ui/sheet"
 import {
   Table,
@@ -107,6 +108,8 @@ type DataTableProps = {
   onDraft: (row: DashboardRow, text?: string) => void
   onSchedule: (row: DashboardRow, text?: string, scheduledAt?: string) => void
   onAutoSchedule: (row: DashboardRow, text?: string) => void
+  onRefetch: (row: DashboardRow) => void
+  onDiscard: (row: DashboardRow) => void
   formatDate: (value?: string | null) => string
   compact: (value: unknown) => string
 }
@@ -119,6 +122,10 @@ const views = [
 
 function isVideo(url = "") {
   return /\.mp4|\/o1\/v\/t16\//i.test(url)
+}
+
+function mediaDownloadUrl(url = "") {
+  return `/api/discovery/media-download?url=${encodeURIComponent(url)}`
 }
 
 function statusLabel(status: string) {
@@ -154,7 +161,7 @@ function MediaPreview({ row, large = false }: { row: DashboardRow; large?: boole
 
   if (isVideo(row.mediaPreviewUrl)) {
     return (
-      <div className={className}>
+      <div className={`${className} relative`}>
         <video
           className="size-full object-contain"
           src={row.mediaPreviewUrl}
@@ -164,12 +171,23 @@ function MediaPreview({ row, large = false }: { row: DashboardRow; large?: boole
           loop
           preload="metadata"
         />
+        <Button
+          variant="secondary"
+          size={large ? "sm" : "icon-sm"}
+          className="absolute bottom-2 right-2 shadow-md"
+          asChild
+        >
+          <a href={mediaDownloadUrl(row.mediaPreviewUrl)} aria-label="영상 다운로드">
+            <DownloadIcon data-icon={large ? "inline-start" : undefined} />
+            {large ? "영상 다운로드" : null}
+          </a>
+        </Button>
       </div>
     )
   }
 
   return (
-    <div className={className}>
+    <div className={`${className} relative`}>
       <img
         className="size-full object-contain"
         src={row.mediaPreviewUrl}
@@ -177,6 +195,17 @@ function MediaPreview({ row, large = false }: { row: DashboardRow; large?: boole
         loading="lazy"
         referrerPolicy="no-referrer"
       />
+      <Button
+        variant="secondary"
+        size={large ? "sm" : "icon-sm"}
+        className="absolute bottom-2 right-2 shadow-md"
+        asChild
+      >
+        <a href={mediaDownloadUrl(row.mediaPreviewUrl)} aria-label="미디어 다운로드">
+          <DownloadIcon data-icon={large ? "inline-start" : undefined} />
+          {large ? "미디어 다운로드" : null}
+        </a>
+      </Button>
     </div>
   )
 }
@@ -186,15 +215,21 @@ function ThreadSheet({
   titleEdits,
   scheduleEdits,
   busy,
+  onTitleChange,
+  onScheduleChange,
   onSaveTitle,
   onPost,
   onDraft,
   onSchedule,
   onAutoSchedule,
+  onRefetch,
+  onDiscard,
   formatDate,
   compact,
+  onOpenRowChange,
 }: Omit<DataTableProps, "rows" | "view" | "counts" | "onViewChange"> & {
   row: DashboardRow
+  onOpenRowChange: (url: string | null) => void
 }) {
   const disabled = Boolean(busy) || !row.canPost
   const [draftText, setDraftText] = React.useState(titleEdits[row.canonicalUrl] ?? row.textPreview ?? "")
@@ -203,20 +238,17 @@ function ThreadSheet({
   React.useEffect(() => {
     setDraftText(titleEdits[row.canonicalUrl] ?? row.textPreview ?? "")
     setDraftSchedule(scheduleEdits[row.canonicalUrl] || "")
-  }, [row.canonicalUrl, row.textPreview, scheduleEdits, titleEdits])
+  }, [row.canonicalUrl, row.textPreview])
 
   return (
-    <Sheet>
-      <SheetTrigger asChild>
-        <Button variant="link" className="h-auto min-w-0 px-0 text-left text-foreground">
-          <span className="line-clamp-2 max-w-[34rem] whitespace-normal">
-            {row.textPreview || "(본문 없음)"}
-          </span>
-        </Button>
-      </SheetTrigger>
+    <Sheet open onOpenChange={(nextOpen) => {
+      if (!nextOpen) onOpenRowChange(null)
+    }}>
       <SheetContent
         side="bottom"
         className="max-h-[88vh] rounded-t-xl"
+        showCloseButton={false}
+        onEscapeKeyDown={(event) => event.preventDefault()}
         onPointerDownOutside={(event) => event.preventDefault()}
         onInteractOutside={(event) => event.preventDefault()}
       >
@@ -257,7 +289,11 @@ function ThreadSheet({
                 value={draftText}
                 maxLength={280}
                 rows={5}
-                onChange={(event) => setDraftText(event.target.value)}
+                onChange={(event) => {
+                  const nextText = event.target.value
+                  setDraftText(nextText)
+                  onTitleChange((current) => ({ ...current, [row.canonicalUrl]: nextText }))
+                }}
               />
             </div>
             <div className="grid gap-2">
@@ -266,7 +302,11 @@ function ThreadSheet({
                 id={`${row.canonicalUrl}-schedule`}
                 type="datetime-local"
                 value={draftSchedule}
-                onChange={(event) => setDraftSchedule(event.target.value)}
+                onChange={(event) => {
+                  const nextSchedule = event.target.value
+                  setDraftSchedule(nextSchedule)
+                  onScheduleChange((current) => ({ ...current, [row.canonicalUrl]: nextSchedule }))
+                }}
               />
             </div>
             <div className="grid grid-cols-2 gap-2">
@@ -280,6 +320,22 @@ function ThreadSheet({
                   원문 열기
                 </a>
               </Button>
+              <Button variant="outline" onClick={() => onRefetch(row)} disabled={Boolean(busy)}>
+                <RefreshCcwIcon data-icon="inline-start" />
+                재수집
+              </Button>
+              <Button variant="outline" onClick={() => onDiscard(row)} disabled={Boolean(busy)}>
+                <Trash2Icon data-icon="inline-start" />
+                삭제
+              </Button>
+              {row.mediaPreviewUrl ? (
+                <Button variant="outline" asChild>
+                  <a href={mediaDownloadUrl(row.mediaPreviewUrl)}>
+                    <DownloadIcon data-icon="inline-start" />
+                    미디어 다운로드
+                  </a>
+                </Button>
+              ) : null}
               <Button onClick={() => onPost(row, draftText)} disabled={disabled}>
                 <SendIcon data-icon="inline-start" />
                 게시
@@ -299,9 +355,7 @@ function ThreadSheet({
           </div>
         </div>
         <SheetFooter>
-          <SheetClose asChild>
-            <Button variant="outline">닫기</Button>
-          </SheetClose>
+          <Button variant="outline" onClick={() => onOpenRowChange(null)}>닫기</Button>
         </SheetFooter>
       </SheetContent>
     </Sheet>
@@ -325,6 +379,11 @@ export function DataTable(props: DataTableProps) {
     pageIndex: 0,
     pageSize: 12,
   })
+  const [openRowUrl, setOpenRowUrl] = React.useState<string | null>(null)
+  const openRow = React.useMemo(
+    () => rows.find((row) => row.canonicalUrl === openRowUrl) || null,
+    [openRowUrl, rows]
+  )
 
   const columns = React.useMemo<ColumnDef<DashboardRow>[]>(
     () => [
@@ -338,7 +397,17 @@ export function DataTable(props: DataTableProps) {
       {
         accessorKey: "textPreview",
         header: "Threads",
-        cell: ({ row }) => <ThreadSheet row={row.original} {...props} />,
+        cell: ({ row }) => (
+          <Button
+            variant="link"
+            className="h-auto min-w-0 px-0 text-left text-foreground"
+            onClick={() => setOpenRowUrl(row.original.canonicalUrl)}
+          >
+            <span className="line-clamp-2 max-w-[34rem] whitespace-normal">
+              {props.titleEdits[row.original.canonicalUrl] || row.original.textPreview || "(본문 없음)"}
+            </span>
+          </Button>
+        ),
         enableHiding: false,
       },
       {
@@ -395,44 +464,64 @@ export function DataTable(props: DataTableProps) {
       },
       {
         id: "actions",
-        cell: ({ row }) => (
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button
-                variant="ghost"
-                className="flex size-8 text-muted-foreground data-[state=open]:bg-muted"
-                size="icon"
-              >
-                <MoreVerticalIcon />
-                <span className="sr-only">작업 메뉴</span>
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="w-40">
-              <DropdownMenuGroup>
-                <DropdownMenuItem onClick={() => props.onSaveTitle(row.original)} disabled={Boolean(busy)}>
-                  제목 저장
-                </DropdownMenuItem>
-                <DropdownMenuItem asChild>
+        cell: ({ row }) => {
+          const isPosted = row.original.status === "posted"
+
+          return (
+            <div className="flex items-center justify-end gap-2">
+              {isPosted ? (
+                <Button variant="outline" size="sm" asChild>
                   <a href={row.original.canonicalUrl} target="_blank" rel="noreferrer">
+                    <ExternalLinkIcon data-icon="inline-start" />
                     원문 열기
                   </a>
-                </DropdownMenuItem>
-              </DropdownMenuGroup>
-              <DropdownMenuSeparator />
-              <DropdownMenuGroup>
-                <DropdownMenuItem onClick={() => props.onPost(row.original)} disabled={!row.original.canPost || Boolean(busy)}>
-                  게시
-                </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => props.onDraft(row.original)} disabled={!row.original.canPost || Boolean(busy)}>
-                  초안 저장
-                </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => props.onAutoSchedule(row.original)} disabled={!row.original.canPost || Boolean(busy)}>
-                  자동 예약
-                </DropdownMenuItem>
-              </DropdownMenuGroup>
-            </DropdownMenuContent>
-          </DropdownMenu>
-        ),
+                </Button>
+              ) : null}
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    className="flex size-8 text-muted-foreground data-[state=open]:bg-muted"
+                    size="icon"
+                  >
+                    <MoreVerticalIcon />
+                    <span className="sr-only">작업 메뉴</span>
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-40">
+                  <DropdownMenuGroup>
+                    <DropdownMenuItem onClick={() => props.onSaveTitle(row.original)} disabled={Boolean(busy)}>
+                      제목 저장
+                    </DropdownMenuItem>
+                    <DropdownMenuItem asChild>
+                      <a href={row.original.canonicalUrl} target="_blank" rel="noreferrer">
+                        원문 열기
+                      </a>
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => props.onRefetch(row.original)} disabled={Boolean(busy)}>
+                      재수집
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => props.onDiscard(row.original)} disabled={Boolean(busy)}>
+                      삭제
+                    </DropdownMenuItem>
+                  </DropdownMenuGroup>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuGroup>
+                    <DropdownMenuItem onClick={() => props.onPost(row.original)} disabled={!row.original.canPost || Boolean(busy)}>
+                      게시
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => props.onDraft(row.original)} disabled={!row.original.canPost || Boolean(busy)}>
+                      초안 저장
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => props.onAutoSchedule(row.original)} disabled={!row.original.canPost || Boolean(busy)}>
+                      자동 예약
+                    </DropdownMenuItem>
+                  </DropdownMenuGroup>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
+          )
+        },
         enableSorting: false,
         enableHiding: false,
       },
@@ -459,6 +548,7 @@ export function DataTable(props: DataTableProps) {
   })
 
   return (
+    <>
     <Tabs value={view} onValueChange={onViewChange} className="w-full flex-col justify-start gap-6" id="queue">
       <div className="flex items-center justify-between px-4 lg:px-6">
         <Label htmlFor="view-selector" className="sr-only">
@@ -631,5 +721,13 @@ export function DataTable(props: DataTableProps) {
         </div>
       </TabsContent>
     </Tabs>
+    {openRow ? (
+      <ThreadSheet
+        row={openRow}
+        {...props}
+        onOpenRowChange={setOpenRowUrl}
+      />
+    ) : null}
+    </>
   )
 }

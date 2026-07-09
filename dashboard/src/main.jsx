@@ -13,6 +13,7 @@ import {
   ScaleIcon,
   SparklesIcon,
   TrendingUpIcon,
+  UserPlusIcon,
   FileTextIcon
 } from "lucide-react";
 import { toast } from "sonner";
@@ -47,6 +48,10 @@ import {
 } from "@/components/ui/sidebar";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Toaster } from "@/components/ui/sonner";
+import {
+  ToggleGroup,
+  ToggleGroupItem,
+} from "@/components/ui/toggle-group";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import "./styles.css";
 
@@ -191,6 +196,69 @@ function InssiderPending({ data, loading, error, onReload, onSave, busy }) {
           )}
         </CardContent>
       </Card>
+    </div>
+  );
+}
+
+
+function profileInitial(handle) {
+  return String(handle || "?").replace(/^@/, "").slice(0, 1).toUpperCase() || "?";
+}
+
+function profileAvatarUrl(profile, targetUrl) {
+  const saved = String(profile?.avatarUrl || "").trim();
+  if (saved) return saved;
+  return targetUrl ? `/api/terafabx/avatar?url=${encodeURIComponent(targetUrl)}` : "";
+}
+
+function ProfileAvatar({ profile, targetUrl }) {
+  const src = profileAvatarUrl(profile, targetUrl);
+  const href = profile?.profileUrl || targetUrl || "#";
+  const hasHref = Boolean(profile?.profileUrl || targetUrl);
+  return (
+    <a
+      href={href}
+      target={hasHref ? "_blank" : undefined}
+      rel={hasHref ? "noreferrer" : undefined}
+      className="relative mt-1 flex size-11 shrink-0 items-center justify-center overflow-hidden rounded-full border bg-muted text-sm font-semibold text-muted-foreground"
+      aria-label={profile?.handle ? `@${profile.handle} 프로필` : "프로필"}
+    >
+      <span className="absolute inset-0 grid place-items-center">{profileInitial(profile?.handle)}</span>
+      {src ? (
+        <img
+          src={src}
+          alt=""
+          className="relative size-full object-cover"
+          loading="lazy"
+          referrerPolicy="no-referrer"
+          onError={(event) => {
+            event.currentTarget.style.display = "none";
+          }}
+        />
+      ) : null}
+    </a>
+  );
+}
+
+function GrokContextBlock({ context }) {
+  const summary = String(context?.summary || context?.contextSummary || "").trim();
+  const keyPoints = Array.isArray(context?.keyPoints)
+    ? context.keyPoints.map((item) => String(item || "").trim()).filter(Boolean)
+    : [];
+  if (!summary && !keyPoints.length) return null;
+  return (
+    <div className="grid gap-1">
+      <div className="text-xs font-medium text-muted-foreground">Grok 문맥 분석</div>
+      {summary ? <p className="text-muted-foreground">{summary}</p> : null}
+      {keyPoints.length ? (
+        <div className="flex flex-wrap gap-1">
+          {keyPoints.map((point, index) => (
+            <Badge key={`${point}-${index}`} variant="outline" className="max-w-full whitespace-normal text-left font-normal">
+              {point}
+            </Badge>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -352,12 +420,267 @@ function growthSummary(flowDays = []) {
   };
 }
 
+function AutomationTimelineView({
+  comments,
+  reviewComments,
+  availableDates,
+  automationDate,
+  onAutomationDateChange,
+  automationSort,
+  onAutomationSortChange,
+  summary,
+  onReviewAction,
+  actionBusy,
+  actionBusyKey,
+}) {
+  return (
+    <div className="grid gap-4 px-4 lg:px-6">
+      <Card>
+        <CardHeader className="gap-3">
+          <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+            <div className="grid gap-1">
+              <CardTitle>자동화 타임라인</CardTitle>
+              <CardDescription>
+                자동댓글 기록을 날짜별로 필터링하고 작성 시간순으로 확인합니다.
+              </CardDescription>
+            </div>
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+              <Select value={automationDate} onValueChange={onAutomationDateChange}>
+                <SelectTrigger className="w-full sm:w-[160px]" size="sm" aria-label="댓글 날짜 선택">
+                  <SelectValue placeholder="날짜" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    <SelectItem value="all">전체 날짜</SelectItem>
+                    {availableDates.map((date) => (
+                      <SelectItem key={date} value={date}>{date}</SelectItem>
+                    ))}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+              <ToggleGroup
+                type="single"
+                value={automationSort}
+                onValueChange={(value) => value && onAutomationSortChange(value)}
+                variant="outline"
+                size="sm"
+                aria-label="댓글 시간 정렬"
+              >
+                <ToggleGroupItem value="desc">최신순</ToggleGroupItem>
+                <ToggleGroupItem value="asc">오래된순</ToggleGroupItem>
+              </ToggleGroup>
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent className="grid gap-4">
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+            <div className="rounded-lg border p-3">
+              <div className="text-sm text-muted-foreground">자동댓글</div>
+              <div className="text-2xl font-semibold tabular-nums">{compact(summary.commentCount)}</div>
+            </div>
+            <div className="rounded-lg border p-3">
+              <div className="text-sm text-muted-foreground">작성된 댓글</div>
+              <div className="text-2xl font-semibold tabular-nums">{compact(summary.commentReviewCount)}</div>
+              <div className="text-xs text-muted-foreground">
+                검수대기 {compact(summary.pendingCommentReviewCount)} / 목표 288
+              </div>
+            </div>
+            <div className="rounded-lg border p-3">
+              <div className="text-sm text-muted-foreground">Gemini 점수</div>
+              <div className="text-2xl font-semibold tabular-nums">{compact(summary.commentQualityScore)}점</div>
+            </div>
+            <div className="rounded-lg border p-3">
+              <div className="text-sm text-muted-foreground">하트수</div>
+              <div className="text-2xl font-semibold tabular-nums">{compact(summary.heartCount)}</div>
+            </div>
+            <div className="rounded-lg border p-3">
+              <div className="text-sm text-muted-foreground">선택된 댓글</div>
+              <div className="text-2xl font-semibold tabular-nums">{compact(comments.length + reviewComments.length)}</div>
+            </div>
+          </div>
+
+          <div className="rounded-lg border">
+            <div className="flex flex-col gap-2 border-b p-4 sm:flex-row sm:items-center sm:justify-between">
+              <div className="grid gap-1">
+                <div className="font-medium">작성된 댓글 검수 큐</div>
+                <div className="text-sm text-muted-foreground">
+                  인증 팔로워 최신글 기준 · 5분마다 최대 5개 · 동시 5개 · {automationDate === "all" ? "전체 날짜" : automationDate} · 검수대기 {compact(reviewComments.length)}개
+                </div>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Badge variant="secondary">목표 288개</Badge>
+                <Badge variant="outline">게시 전용 큐</Badge>
+                <Badge variant="outline">Gemini 검수</Badge>
+              </div>
+            </div>
+            {reviewComments.length ? (
+              <div className="max-h-[620px] divide-y overflow-auto">
+                {reviewComments.map((item) => {
+                  const itemKey = item.id || item.targetUrl || item.targetId || "";
+                  const posting = actionBusyKey === `terafabx-review-post-${itemKey}`;
+                  const completing = actionBusyKey === `terafabx-review-complete-${itemKey}`;
+                  const deleting = actionBusyKey === `terafabx-review-delete-${itemKey}`;
+                  return (
+                  <article key={item.id || `${item.at}-${item.targetUrl}`} className="grid grid-cols-[44px_minmax(0,1fr)] gap-3 p-4">
+                    <ProfileAvatar profile={item.follower} targetUrl={item.targetUrl} />
+                    <div className="grid min-w-0 gap-3">
+                      <div className="flex flex-col gap-2 xl:flex-row xl:items-start xl:justify-between">
+                        <div className="flex min-w-0 flex-wrap items-center gap-2">
+                          <Badge variant={item.posted ? "secondary" : "outline"}>{item.posted ? "게시됨" : "검수대기"}</Badge>
+                          <Badge variant="outline">점수 {compact(item.geminiReview?.score)}점</Badge>
+                          {item.geminiReview?.decision ? <Badge variant="outline">{item.geminiReview.decision}</Badge> : null}
+                          <span className="text-sm font-medium tabular-nums">{formatDate(item.at)}</span>
+                          {item.follower?.handle ? (
+                            <span className="text-sm text-muted-foreground">@{item.follower.handle}</span>
+                          ) : null}
+                        </div>
+                        <div className="flex flex-wrap gap-2">
+                          <Button
+                            variant="default"
+                            size="sm"
+                            disabled={actionBusy}
+                            onClick={() => onReviewAction?.(item, "post")}
+                          >
+                            {posting ? "헤드리스 게시 중" : "게시"}
+                          </Button>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={actionBusy}
+                            onClick={() => onReviewAction?.(item, "complete")}
+                          >
+                            {completing ? "완료 처리 중" : "완료"}
+                          </Button>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={actionBusy}
+                            onClick={() => onReviewAction?.(item, "delete")}
+                          >
+                            {deleting ? "삭제 중" : "삭제"}
+                          </Button>
+                          {item.follower?.profileUrl ? (
+                            <Button variant="ghost" size="sm" asChild>
+                              <a href={item.follower.profileUrl} target="_blank" rel="noreferrer">
+                                프로필
+                                <ExternalLinkIcon data-icon="inline-end" />
+                              </a>
+                            </Button>
+                          ) : null}
+                          {item.targetUrl ? (
+                            <Button variant="ghost" size="sm" asChild>
+                              <a href={item.targetUrl} target="_blank" rel="noreferrer">
+                                원문
+                                <ExternalLinkIcon data-icon="inline-end" />
+                              </a>
+                            </Button>
+                          ) : null}
+                        </div>
+                      </div>
+                      <p className="text-base font-medium leading-relaxed">{item.comment || "댓글 내용 없음"}</p>
+                      {(item.targetText || item.grokContext || item.grokComment) ? (
+                        <div className="grid gap-2 rounded-md border bg-muted/20 p-3 text-sm">
+                          {item.targetText ? (
+                            <div className="grid gap-1">
+                              <div className="text-xs font-medium text-muted-foreground">X 추출 문맥</div>
+                              <p className="line-clamp-3 text-muted-foreground">{item.targetText}</p>
+                            </div>
+                          ) : null}
+                          <GrokContextBlock context={item.grokContext} />
+                          {item.grokComment ? (
+                            <div className="grid gap-1">
+                              <div className="text-xs font-medium text-muted-foreground">Grok 후보</div>
+                              <p className="text-muted-foreground">{item.grokComment}</p>
+                            </div>
+                          ) : null}
+                        </div>
+                      ) : null}
+                      {item.geminiReview?.reason ? (
+                        <p className="text-xs text-muted-foreground">검수 사유: {item.geminiReview.reason}</p>
+                      ) : null}
+                    </div>
+                  </article>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="p-6 text-sm text-muted-foreground">
+                선택한 날짜의 작성된 댓글이 없습니다.
+              </div>
+            )}
+          </div>
+
+          <div className="rounded-lg border">
+            <div className="border-b p-4">
+              <div className="font-medium">게시 완료 댓글 타임라인</div>
+              <div className="text-sm text-muted-foreground">
+                실제 X에 작성된 자동댓글 · {automationDate === "all" ? "전체 날짜" : automationDate} · {compact(comments.length)}개
+              </div>
+            </div>
+            {comments.length ? (
+              <div className="divide-y">
+                {comments.map((item) => (
+                  <article key={`${item.at}-${item.targetUrl || item.replyUrl}`} className="grid grid-cols-[44px_minmax(0,1fr)] gap-3 p-4">
+                    <ProfileAvatar profile={item.follower} targetUrl={item.targetUrl} />
+                    <div className="grid min-w-0 gap-2">
+                      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <Badge variant={item.manual ? "outline" : "secondary"}>{item.manual ? "수동" : "자동"}</Badge>
+                          <Badge variant="outline">{item.qualitySource === "local" ? "로컬" : "Gemini"} {compact(item.qualityScore)}점</Badge>
+                          <span className="text-sm font-medium tabular-nums">{formatDate(item.at)}</span>
+                          {item.follower?.handle ? (
+                            <span className="text-sm text-muted-foreground">@{item.follower.handle}</span>
+                          ) : null}
+                        </div>
+                        {item.replyUrl || item.targetUrl ? (
+                          <Button variant="ghost" size="sm" asChild>
+                            <a href={item.replyUrl || item.targetUrl} target="_blank" rel="noreferrer">
+                              X에서 보기
+                              <ExternalLinkIcon data-icon="inline-end" />
+                            </a>
+                          </Button>
+                        ) : null}
+                      </div>
+                      <p className="text-base font-medium leading-relaxed">{item.comment || "댓글 내용 없음"}</p>
+                      {(item.targetText || item.grokContext || item.grokComment) ? (
+                        <div className="grid gap-2 rounded-md border bg-muted/20 p-3 text-sm">
+                          {item.targetText ? (
+                            <div className="grid gap-1">
+                              <div className="text-xs font-medium text-muted-foreground">X 추출 문맥</div>
+                              <p className="line-clamp-2 text-muted-foreground">{item.targetText}</p>
+                            </div>
+                          ) : null}
+                          <GrokContextBlock context={item.grokContext} />
+                          {item.grokComment ? (
+                            <div className="grid gap-1">
+                              <div className="text-xs font-medium text-muted-foreground">Grok 후보</div>
+                              <p className="text-muted-foreground">{item.grokComment}</p>
+                            </div>
+                          ) : null}
+                        </div>
+                      ) : null}
+                    </div>
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <div className="p-6 text-sm text-muted-foreground">
+                선택한 날짜의 댓글 기록이 없습니다.
+              </div>
+            )}
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
 function Dashboard() {
   const initialView = location.pathname.startsWith("/naver-blog")
     ? "naver-blog"
     : location.pathname.startsWith("/inssider-pending")
       ? "inssider-pending"
-    : new URLSearchParams(location.search).get("view") || "discovered";
+      : new URLSearchParams(location.search).get("view") || "discovered";
   const [view, setView] = useState(initialView);
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -369,6 +692,7 @@ function Dashboard() {
   const [autoRefresh, setAutoRefresh] = useState(localStorage.getItem("threadDashboard.autoRefreshEnabled") !== "false");
   const [error, setError] = useState("");
   const [automationDate, setAutomationDate] = useState("all");
+  const [automationSort, setAutomationSort] = useState("desc");
 
   async function load(nextView = view) {
     setError("");
@@ -378,7 +702,12 @@ function Dashboard() {
         ? await api("/api/inssider/pending")
         : await api(`/api/discovery/dashboard?view=${encodeURIComponent(nextView)}`);
     setData(result);
-    setTitleEdits(Object.fromEntries((result.rows || []).map((row) => [row.canonicalUrl, row.textPreview || ""])));
+    setTitleEdits((current) => Object.fromEntries((result.rows || []).map((row) => [
+      row.canonicalUrl,
+      Object.prototype.hasOwnProperty.call(current, row.canonicalUrl)
+        ? current[row.canonicalUrl]
+        : row.textPreview || "",
+    ])));
     setLoading(false);
   }
 
@@ -413,8 +742,10 @@ function Dashboard() {
   const summary = data?.summary || {};
   const rows = data?.rows || [];
   const automation = data?.automation || {};
+  const automationSummary = { ...summary, ...(automation.summary || {}) };
   const flowDays = automation.flowDays || [];
   const commentTimeline = automation.commentTimeline || [];
+  const commentReviewQueue = automation.commentReviewQueue || [];
   const availableDates = automation.availableDates || [];
   const growth = useMemo(() => growthSummary(flowDays), [flowDays]);
   const selectedComments = useMemo(() => (
@@ -422,6 +753,25 @@ function Dashboard() {
       ? commentTimeline
       : commentTimeline.filter((item) => item.date === automationDate)
   ), [automationDate, commentTimeline]);
+  const selectedReviewComments = useMemo(() => (
+    automationDate === "all"
+      ? commentReviewQueue
+      : commentReviewQueue.filter((item) => item.date === automationDate)
+  ), [automationDate, commentReviewQueue]);
+  const sortedComments = useMemo(() => (
+    [...selectedComments].sort((a, b) => {
+      const left = new Date(a.at || 0).getTime();
+      const right = new Date(b.at || 0).getTime();
+      return automationSort === "asc" ? left - right : right - left;
+    })
+  ), [automationSort, selectedComments]);
+  const sortedReviewComments = useMemo(() => (
+    [...selectedReviewComments].sort((a, b) => {
+      const left = new Date(a.at || 0).getTime();
+      const right = new Date(b.at || 0).getTime();
+      return automationSort === "asc" ? left - right : right - left;
+    })
+  ), [automationSort, selectedReviewComments]);
 
   useEffect(() => {
     if (automationDate !== "all" && availableDates.length && !availableDates.includes(automationDate)) {
@@ -440,8 +790,8 @@ function Dashboard() {
     {
       label: "자동댓글",
       value: compact(summary.commentCount),
-      note: `최근 ${formatDate(summary.lastCommentAt)}`,
-      trend: data?.terafabx?.comment?.enabled ? "ON" : "OFF",
+      note: `Gemini ${compact(summary.commentQualityScore)}점 · 최근 ${formatDate(summary.lastCommentAt)}`,
+      trend: summary.commentQualityGrade || (data?.terafabx?.comment?.enabled ? "ON" : "OFF"),
       icon: MessageCircleIcon,
     },
     {
@@ -450,6 +800,13 @@ function Dashboard() {
       note: `최근 ${formatDate(summary.lastHeartAt)}`,
       trend: data?.terafabx?.heart?.enabled ? "ON" : "OFF",
       icon: HeartIcon,
+    },
+    {
+      label: "팔로우",
+      value: compact(data?.terafabx?.follow?.lastCount || 0),
+      note: `최근 ${formatDate(data?.terafabx?.follow?.lastRunAt)}`,
+      trend: data?.terafabx?.follow?.enabled ? "ON" : "OFF",
+      icon: UserPlusIcon,
     },
     {
       label: "성장률",
@@ -475,8 +832,38 @@ function Dashboard() {
     }
   }
 
-  function rowText(row) {
-    return (titleEdits[row.canonicalUrl] || row.textPreview || "").trim();
+  function rowText(row, textOverride) {
+    return (textOverride ?? titleEdits[row.canonicalUrl] ?? row.textPreview ?? "").trim();
+  }
+
+  async function saveDiscoveryTitle(row, textOverride) {
+    const savedText = rowText(row, textOverride);
+    setBusy(`save-${row.canonicalUrl}`);
+    setError("");
+    try {
+      await api("/api/discovery/title", {
+        method: "POST",
+        body: JSON.stringify({ url: row.canonicalUrl, text: savedText }),
+      });
+      setTitleEdits((current) => ({ ...current, [row.canonicalUrl]: savedText }));
+      setData((current) => {
+        if (!current?.rows) return current;
+        return {
+          ...current,
+          rows: current.rows.map((item) => (
+            item.canonicalUrl === row.canonicalUrl
+              ? { ...item, textPreview: savedText, lastError: null }
+              : item
+          )),
+        };
+      });
+      toast.success("제목 저장됨");
+    } catch (err) {
+      setError(err.message);
+      toast.error(err.message);
+    } finally {
+      setBusy("");
+    }
   }
 
   async function runTerafabx(job, action) {
@@ -487,6 +874,22 @@ function Dashboard() {
       });
       setTerafabxResult(result);
     }, "자동화 상태 변경됨");
+  }
+
+  async function runTerafabxReviewAction(item, action) {
+    const labels = { post: "게시", complete: "완료 처리", delete: "삭제" };
+    await runAction(`terafabx-review-${action}-${item.id || item.targetUrl}`, async () => {
+      const result = await api("/api/terafabx/comment-review-action", {
+        method: "POST",
+        body: JSON.stringify({
+          action,
+          id: item.id,
+          targetUrl: item.targetUrl,
+          targetId: item.targetId,
+        }),
+      });
+      setTerafabxResult(result);
+    }, `검수대기 ${labels[action] || "처리"} 완료`);
   }
 
   const controlsBusy = Boolean(busy);
@@ -506,13 +909,11 @@ function Dashboard() {
           summary={summary}
           terafabx={data?.terafabx}
           automation={automation}
-          automationDate={automationDate}
-          onAutomationDateChange={setAutomationDate}
         />
         <SidebarInset>
           <SiteHeader
-            title={view === "naver-blog" ? "네이버 블로그 운영" : view === "inssider-pending" ? "인싸이더 판결중" : "Threads 발굴 대시보드"}
-            subtitle={view === "naver-blog" ? "Gemini Web 전용 작성 · 자체 스케줄러 · 전용 Chrome 프로필" : view === "inssider-pending" ? "연애·결혼 / 직장·사회 카테고리의 진행 중인 판결글" : "좋아요 1000+ · 미디어 포함 · X 수동 검토/예약 워크플로우"}
+            title={view === "naver-blog" ? "네이버 블로그 운영" : view === "inssider-pending" ? "인싸이더 판결중" : view === "automation" ? "자동화 타임라인" : "Threads 발굴 대시보드"}
+            subtitle={view === "naver-blog" ? "Gemini Web 전용 작성 · 자체 스케줄러 · 전용 Chrome 프로필" : view === "inssider-pending" ? "연애·결혼 / 직장·사회 카테고리의 진행 중인 판결글" : view === "automation" ? "자동댓글 기록 · 날짜별 필터 · 작성 시간 정렬" : "좋아요 1000+ · 미디어 포함 · X 수동 검토/예약 워크플로우"}
             autoRefresh={autoRefresh}
             busy={controlsBusy}
             onRefresh={() => runAction("refresh-data", () => load(view), "새로고침 완료")}
@@ -549,6 +950,31 @@ function Dashboard() {
                 <>
               <SectionCards metrics={metrics} />
 
+              {error ? (
+                <div className="px-4 lg:px-6">
+                  <Alert variant="destructive">
+                    <AlertTitle>작업 실패</AlertTitle>
+                    <AlertDescription>{error}</AlertDescription>
+                  </Alert>
+                </div>
+              ) : null}
+
+              {view === "automation" ? (
+                <AutomationTimelineView
+                  comments={sortedComments}
+                  reviewComments={sortedReviewComments}
+                  availableDates={availableDates}
+                  automationDate={automationDate}
+                  onAutomationDateChange={setAutomationDate}
+                  automationSort={automationSort}
+                  onAutomationSortChange={setAutomationSort}
+                  summary={automationSummary}
+                  onReviewAction={runTerafabxReviewAction}
+                  actionBusy={controlsBusy}
+                  actionBusyKey={busy}
+                />
+              ) : (
+                <>
               <div className="grid gap-4 px-4 lg:grid-cols-[minmax(0,1fr)_minmax(320px,420px)] lg:px-6" id="controls">
                 <Card id="add-url">
                   <CardHeader>
@@ -632,15 +1058,6 @@ function Dashboard() {
                 </Card>
               </div>
 
-              {error ? (
-                <div className="px-4 lg:px-6">
-                  <Alert variant="destructive">
-                    <AlertTitle>작업 실패</AlertTitle>
-                    <AlertDescription>{error}</AlertDescription>
-                  </Alert>
-                </div>
-              ) : null}
-
               <div className="grid gap-4 px-4 lg:grid-cols-[minmax(0,1fr)_minmax(320px,420px)] lg:px-6">
                 {loading ? (
                   <Skeleton className="h-[350px] rounded-lg" />
@@ -652,7 +1069,7 @@ function Dashboard() {
                   <CardHeader>
                     <CardTitle>과즙루피 자동화</CardTitle>
                     <CardDescription>
-                      Grok CLI 댓글 · Chrome {data?.terafabx?.chromePort || 9224} · 락 {data?.terafabx?.lock?.busy ? "사용 중" : "대기"}
+                      Grok + Gemini Web Headless · X Chrome {data?.terafabx?.chromePort || 9224} · Gemini {data?.terafabx?.geminiReview?.chromePort || 9234} · 락 {data?.terafabx?.lock?.busy ? "사용 중" : "대기"}
                     </CardDescription>
                   </CardHeader>
                   <CardContent className="grid gap-4">
@@ -664,10 +1081,36 @@ function Dashboard() {
                       <div className="rounded-lg border p-3">
                         <div className="text-xs text-muted-foreground">자동댓글</div>
                         <div className="text-xl font-semibold tabular-nums">{compact(summary.commentCount)}</div>
+                        <div className="text-xs text-muted-foreground">Gemini {compact(summary.commentQualityScore)}점</div>
                       </div>
                       <div className="rounded-lg border p-3">
                         <div className="text-xs text-muted-foreground">하트수</div>
                         <div className="text-xl font-semibold tabular-nums">{compact(summary.heartCount)}</div>
+                      </div>
+                    </div>
+                    <div className="grid gap-3 rounded-lg border p-3">
+                      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-2 font-medium">
+                            <SparklesIcon className="size-4" />
+                            검수큐 병렬 작성
+                            <Badge variant={Number(data?.terafabx?.verifiedReview?.pendingToTarget || 0) === 0 ? "secondary" : "outline"}>
+                              {Number(data?.terafabx?.verifiedReview?.pendingToTarget || 0) === 0 ? "완료" : `남은 ${compact(data?.terafabx?.verifiedReview?.pendingToTarget)}`}
+                            </Badge>
+                            <Badge variant="outline">동시 {compact(data?.terafabx?.verifiedReview?.lastConcurrency || data?.terafabx?.verifiedReview?.batchSize || 5)}개</Badge>
+                          </div>
+                          <p className="text-sm text-muted-foreground">
+                            검수대기 {compact(summary.pendingCommentReviewCount)} / {compact(data?.terafabx?.verifiedReview?.targetCount || 288)} · 최근 배치 {compact(data?.terafabx?.verifiedReview?.lastAdded)}개 · 다음 {formatDate(data?.terafabx?.verifiedReview?.nextRunAt)}
+                          </p>
+                        </div>
+                        <Badge variant={data?.terafabx?.verifiedReview?.enabled ? "secondary" : "outline"}>
+                          {data?.terafabx?.verifiedReview?.enabled ? "ON" : "OFF"}
+                        </Badge>
+                      </div>
+                      <div className="grid grid-cols-3 gap-2">
+                        <Button size="sm" disabled={controlsBusy} onClick={() => runTerafabx("verified-review", "run")}>5개 작성</Button>
+                        <Button size="sm" variant="outline" disabled={controlsBusy} onClick={() => runTerafabx("verified-review", "enable")}>ON</Button>
+                        <Button size="sm" variant="outline" disabled={controlsBusy} onClick={() => runTerafabx("verified-review", "disable")}>OFF</Button>
                       </div>
                     </div>
                     <div className="grid gap-3 rounded-lg border p-3">
@@ -707,6 +1150,24 @@ function Dashboard() {
                       </div>
                     </div>
                     <div className="grid gap-3 rounded-lg border p-3">
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2 font-medium">
+                            <UserPlusIcon className="size-4" />
+                            팔로우 {data?.terafabx?.follow?.enabled ? "ON" : "OFF"}
+                          </div>
+                          <p className="truncate text-sm text-muted-foreground">
+                            최근 {compact(data?.terafabx?.follow?.lastCount || 0)}명 · 다음 {formatDate(data?.terafabx?.follow?.nextRunAt)}
+                          </p>
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-3 gap-2">
+                        <Button size="sm" disabled={controlsBusy} onClick={() => runTerafabx("follow", "run")}>1회</Button>
+                        <Button size="sm" variant="outline" disabled={controlsBusy} onClick={() => runTerafabx("follow", "enable")}>ON</Button>
+                        <Button size="sm" variant="outline" disabled={controlsBusy} onClick={() => runTerafabx("follow", "disable")}>OFF</Button>
+                      </div>
+                    </div>
+                    <div className="grid gap-3 rounded-lg border p-3">
                       <div className="flex items-start justify-between gap-3">
                         <div className="min-w-0">
                           <div className="font-medium">댓글 타임라인</div>
@@ -730,11 +1191,14 @@ function Dashboard() {
                       </div>
                       <div className="max-h-[360px] overflow-auto rounded-lg border bg-muted/20">
                         {selectedComments.length ? (
-                          selectedComments.slice(0, 30).map((item) => (
+                          sortedComments.slice(0, 30).map((item) => (
                             <div key={`${item.at}-${item.targetUrl || item.replyUrl}`} className="grid gap-1 border-b p-3 last:border-b-0">
                               <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
                                 <span>{formatDate(item.at)}</span>
-                                <Badge variant={item.manual ? "outline" : "secondary"}>{item.manual ? "수동" : "자동"}</Badge>
+                                <div className="flex items-center gap-1">
+                                  <Badge variant="outline">{item.qualitySource === "local" ? "로컬" : "Gemini"} {compact(item.qualityScore)}점</Badge>
+                                  <Badge variant={item.manual ? "outline" : "secondary"}>{item.manual ? "수동" : "자동"}</Badge>
+                                </div>
                               </div>
                               <p className="line-clamp-2 text-sm font-medium">{item.comment || "댓글 내용 없음"}</p>
                               {item.targetText ? (
@@ -782,22 +1246,17 @@ function Dashboard() {
                   onViewChange={setView}
                   onTitleChange={setTitleEdits}
                   onScheduleChange={setScheduleEdits}
-                  onSaveTitle={(row, text) =>
-                    runAction(`save-${row.canonicalUrl}`, () => api("/api/discovery/title", {
-                      method: "POST",
-                      body: JSON.stringify({ url: row.canonicalUrl, text: (text ?? rowText(row)).trim() }),
-                    }), "제목 저장됨")
-                  }
+                  onSaveTitle={saveDiscoveryTitle}
                   onPost={(row, text) =>
                     runAction(`post-${row.canonicalUrl}`, () => api("/api/discovery/post", {
                       method: "POST",
-                      body: JSON.stringify({ url: row.canonicalUrl, text: (text ?? rowText(row)).trim() }),
+                      body: JSON.stringify({ url: row.canonicalUrl, text: rowText(row, text) }),
                     }), "X에 게시됨")
                   }
                   onDraft={(row, text) =>
                     runAction(`draft-${row.canonicalUrl}`, () => api("/api/discovery/draft", {
                       method: "POST",
-                      body: JSON.stringify({ url: row.canonicalUrl, text: (text ?? rowText(row)).trim() }),
+                      body: JSON.stringify({ url: row.canonicalUrl, text: rowText(row, text) }),
                     }), "X 초안 저장됨")
                   }
                   onSchedule={(row, text, scheduledAt) =>
@@ -805,7 +1264,7 @@ function Dashboard() {
                       method: "POST",
                       body: JSON.stringify({
                         url: row.canonicalUrl,
-                        text: (text ?? rowText(row)).trim(),
+                        text: rowText(row, text),
                         scheduledAt: scheduledAt || scheduleEdits[row.canonicalUrl],
                       }),
                     }), "X 예약됨")
@@ -813,8 +1272,44 @@ function Dashboard() {
                   onAutoSchedule={(row, text) =>
                     runAction(`auto-${row.canonicalUrl}`, () => api("/api/discovery/auto-schedule", {
                       method: "POST",
-                      body: JSON.stringify({ url: row.canonicalUrl, text: (text ?? rowText(row)).trim() }),
+                      body: JSON.stringify({ url: row.canonicalUrl, text: rowText(row, text) }),
                     }), "자동 예약됨")
+                  }
+                  onRefetch={(row) =>
+                    runAction(`refetch-${row.canonicalUrl}`, async () => {
+                      await api("/api/discovery/refetch", {
+                        method: "POST",
+                        body: JSON.stringify({ url: row.canonicalUrl }),
+                      });
+                      setTitleEdits((current) => {
+                        const next = { ...current };
+                        delete next[row.canonicalUrl];
+                        return next;
+                      });
+                      setScheduleEdits((current) => {
+                        const next = { ...current };
+                        delete next[row.canonicalUrl];
+                        return next;
+                      });
+                    }, "재수집 완료")
+                  }
+                  onDiscard={(row) =>
+                    runAction(`discard-${row.canonicalUrl}`, async () => {
+                      await api("/api/discovery/discard", {
+                        method: "POST",
+                        body: JSON.stringify({ url: row.canonicalUrl }),
+                      });
+                      setTitleEdits((current) => {
+                        const next = { ...current };
+                        delete next[row.canonicalUrl];
+                        return next;
+                      });
+                      setScheduleEdits((current) => {
+                        const next = { ...current };
+                        delete next[row.canonicalUrl];
+                        return next;
+                      });
+                    }, "삭제됨")
                   }
                   formatDate={formatDate}
                   compact={compact}
@@ -822,6 +1317,8 @@ function Dashboard() {
               )}
                 </>
               )}
+              </>
+            )}
             </div>
           </div>
         </SidebarInset>

@@ -9,7 +9,7 @@
     "import-runtime": "node scripts/import-runtime-state.js",
     "memory": "node scripts/ai-memory.js",
     "mirror-server": "node mirror_server.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test"
   },
   "keywords": [],
   "author": "",

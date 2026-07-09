@@ -9,6 +9,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
+import { Badge } from "@/components/ui/badge"
 import {
   ChartContainer,
   ChartTooltip,
@@ -43,6 +44,20 @@ const chartConfig = {
   },
 } satisfies ChartConfig
 
+function kstDateKey(date = new Date()) {
+  return new Intl.DateTimeFormat("sv-SE", {
+    timeZone: "Asia/Seoul",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date)
+}
+
+function formatMonthDay(value: string) {
+  const [, month, day] = String(value || "").split("-")
+  return month && day ? `${month}.${day}` : String(value || "")
+}
+
 export function ChartAreaInteractive({
   flowDays,
 }: {
@@ -54,6 +69,15 @@ export function ChartAreaInteractive({
   }[]
 }) {
   const [timeRange, setTimeRange] = React.useState("30d")
+  const todayKey = React.useMemo(() => kstDateKey(), [])
+  const today = React.useMemo(() => (
+    flowDays.find((day) => day.date === todayKey) || {
+      date: todayKey,
+      posted: 0,
+      comments: 0,
+      hearts: 0,
+    }
+  ), [flowDays, todayKey])
 
   const chartData = React.useMemo(() => {
     const totalDays = timeRange === "7d" ? 7 : timeRange === "14d" ? 14 : 30
@@ -64,11 +88,23 @@ export function ChartAreaInteractive({
     <Card className="@container/card">
       <CardHeader>
         <CardTitle>게시/댓글/하트 흐름</CardTitle>
-        <CardDescription>
+        <CardDescription className="space-y-2">
           <span className="hidden @[540px]/card:block">
             최근 기간의 게시 처리와 자동화 활동 추이
           </span>
           <span className="@[540px]/card:hidden">운영 활동 추이</span>
+          <div className="flex flex-wrap items-center gap-2 pt-1">
+            <Badge variant="secondary">Today {formatMonthDay(today.date)}</Badge>
+            <span className="rounded-md border bg-background px-2 py-1 text-xs tabular-nums text-foreground">
+              게시 {today.posted.toLocaleString("ko-KR")}
+            </span>
+            <span className="rounded-md border bg-background px-2 py-1 text-xs tabular-nums text-foreground">
+              댓글 {today.comments.toLocaleString("ko-KR")}
+            </span>
+            <span className="rounded-md border bg-background px-2 py-1 text-xs tabular-nums text-foreground">
+              하트 {today.hearts.toLocaleString("ko-KR")}
+            </span>
+          </div>
         </CardDescription>
         <CardAction>
           <ToggleGroup
@@ -128,11 +164,7 @@ export function ChartAreaInteractive({
               tickMargin={8}
               minTickGap={32}
               tickFormatter={(value) => {
-                const date = new Date(value)
-                return date.toLocaleDateString("ko-KR", {
-                  month: "2-digit",
-                  day: "2-digit",
-                })
+                return value === todayKey ? "Today" : formatMonthDay(value)
               }}
             />
             <ChartTooltip
