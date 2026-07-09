@@ -3399,6 +3399,79 @@ function buildCoupangAffiliateReply(link) {
   ].join("\n");
 }
 
+function formatCoupangDate(date) {
+  return new Intl.DateTimeFormat("sv-SE", {
+    timeZone: "Asia/Seoul",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date).replace(/-/g, "");
+}
+
+function parseCoupangDate(value) {
+  const text = String(value || "").replace(/\D/g, "");
+  if (!/^\d{8}$/.test(text)) return "";
+  return text;
+}
+
+function defaultCoupangReportRange() {
+  const now = new Date();
+  const today = formatCoupangDate(now);
+  const monthStart = `${today.slice(0, 6)}01`;
+  return { startDate: monthStart, endDate: today };
+}
+
+function normalizeCoupangPerformanceRows(rows = []) {
+  return rows.map((row) => {
+    const click = Number(row.click || 0);
+    const order = Number(row.order || 0);
+    const cancel = Number(row.cancel || 0);
+    const gmv = Number(row.gmv || 0);
+    const commission = Number(row.commission || 0);
+    return {
+      date: String(row.date || ""),
+      trackingCode: row.trackingCode || "",
+      subId: row.subId || "",
+      click,
+      order,
+      cancel,
+      gmv,
+      commission,
+      conversionRate: click > 0 ? order / click : 0,
+    };
+  }).sort((a, b) => a.date.localeCompare(b.date));
+}
+
+async function getCoupangPerformanceData(options = {}) {
+  const defaults = defaultCoupangReportRange();
+  const startDate = parseCoupangDate(options.startDate) || defaults.startDate;
+  const endDate = parseCoupangDate(options.endDate) || defaults.endDate;
+  const requestPath = "/v2/providers/affiliate_open_api/apis/openapi/v1/reports/commission";
+  const query = new URLSearchParams({ startDate, endDate }).toString();
+  const data = await callCoupangPartnersApi("GET", requestPath, { query });
+  const rows = normalizeCoupangPerformanceRows(data?.data || []);
+  const totals = rows.reduce((acc, row) => {
+    acc.click += row.click;
+    acc.order += row.order;
+    acc.cancel += row.cancel;
+    acc.gmv += row.gmv;
+    acc.commission += row.commission;
+    return acc;
+  }, { click: 0, order: 0, cancel: 0, gmv: 0, commission: 0 });
+  totals.conversionRate = totals.click > 0 ? totals.order / totals.click : 0;
+  const latest = rows.slice().reverse().find((row) => row.click || row.order || row.commission) || rows.at(-1) || null;
+  return {
+    ok: true,
+    startDate,
+    endDate,
+    currency: "KRW",
+    totals,
+    latest,
+    rows,
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
 async function postTerafabxAffiliateComment(payload = {}) {
   if (terafabxBusy) throw new Error("다른 과즙루피 자동화 작업이 진행 중입니다.");
   const state = loadTerafabxState();
@@ -6667,6 +6740,10 @@ async function getDiscoveryDashboardData(requestUrl = "/api/discovery/dashboard"
       return { error: error.message };
     })
     : null;
+  const coupang = await getCoupangPerformanceData().catch((error) => {
+    logEvent("coupang_performance_dashboard_error", { error: error.message });
+    return { ok: false, error: error.message, rows: [], totals: { click: 0, order: 0, cancel: 0, gmv: 0, commission: 0, conversionRate: 0 } };
+  });
   const automation = buildAutomationDashboardData(allRows, nowMs);
   const dashboardRows = allRows.map((row) => dashboardDiscoveryRow(row, nowMs));
   const discoveredStatuses = new Set(["review", "draft", "failed", "failed_post", "failed_draft", "failed_schedule"]);
@@ -6704,6 +6781,7 @@ async function getDiscoveryDashboardData(requestUrl = "/api/discovery/dashboard"
     ok: true,
     view: activeView,
     terafabx: getTerafabxAutomationStatus(),
+    coupang,
     automation,
     avatarEnrichment,
     summary: {
@@ -8046,6 +8124,20 @@ const server = http.createServer(async (req, res) => {
       json(res, 200, { ok: true, result, status: getTerafabxAutomationStatus() });
     } catch (error) {
       logEvent("terafabx_affiliate_comment_action_error", { error: error.message });
+      json(res, 500, { ok: false, error: error.message });
+    }
+    return;
+  }
+  if (req.method === "GET" && req.url.startsWith("/api/coupang/performance")) {
+    try {
+      const parsedUrl = new URL(req.url, "http://localhost");
+      const result = await getCoupangPerformanceData({
+        startDate: parsedUrl.searchParams.get("startDate") || "",
+        endDate: parsedUrl.searchParams.get("endDate") || "",
+      });
+      json(res, 200, result);
+    } catch (error) {
+      logEvent("coupang_performance_api_error", { error: error.message });
       json(res, 500, { ok: false, error: error.message });
     }
     return;

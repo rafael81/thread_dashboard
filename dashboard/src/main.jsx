@@ -86,6 +86,20 @@ function compact(value) {
   return Number(value || 0).toLocaleString("ko-KR");
 }
 
+function won(value) {
+  return `${Math.round(Number(value || 0)).toLocaleString("ko-KR")}원`;
+}
+
+function percent(value) {
+  return `${(Number(value || 0) * 100).toFixed(1)}%`;
+}
+
+function formatCoupangDate(value) {
+  const text = String(value || "");
+  if (!/^\d{8}$/.test(text)) return value || "-";
+  return `${text.slice(0, 4)}-${text.slice(4, 6)}-${text.slice(6, 8)}`;
+}
+
 function InssiderPending({ data, loading, error, onReload, onSave, busy }) {
   const rows = data?.rows || [];
   const categories = data?.categories || [];
@@ -407,6 +421,78 @@ function NaverBlogOps({ data, loading, busy, error, onRunAction, onReload }) {
 
 function totalActivity(day) {
   return Number(day?.posted || 0) + Number(day?.comments || 0) + Number(day?.hearts || 0);
+}
+
+function CoupangPerformance({ data, loading, onReload, busy }) {
+  const coupang = data?.coupang || {};
+  const totals = coupang.totals || {};
+  const rows = (coupang.rows || []).slice().reverse().slice(0, 8);
+
+  return (
+    <Card id="coupang-performance">
+      <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div>
+          <CardTitle className="flex items-center gap-2">
+            <LinkIcon className="size-5" />
+            쿠팡 파트너스 실적
+          </CardTitle>
+          <CardDescription>
+            {coupang.ok === false ? coupang.error : `${formatCoupangDate(coupang.startDate)} ~ ${formatCoupangDate(coupang.endDate)} · 최근 갱신 ${formatDate(coupang.fetchedAt)}`}
+          </CardDescription>
+        </div>
+        <Button variant="outline" size="sm" disabled={busy || loading} onClick={onReload}>
+          {busy ? <Loader2Icon data-icon="inline-start" className="animate-spin" /> : <RefreshCcwIcon data-icon="inline-start" />}
+          새로고침
+        </Button>
+      </CardHeader>
+      <CardContent className="grid gap-4">
+        <div className="grid grid-cols-2 gap-2 md:grid-cols-5">
+          <div className="rounded-lg border p-3">
+            <div className="text-xs text-muted-foreground">수수료</div>
+            <div className="text-xl font-semibold tabular-nums">{loading ? "-" : won(totals.commission)}</div>
+          </div>
+          <div className="rounded-lg border p-3">
+            <div className="text-xs text-muted-foreground">거래액</div>
+            <div className="text-xl font-semibold tabular-nums">{loading ? "-" : won(totals.gmv)}</div>
+          </div>
+          <div className="rounded-lg border p-3">
+            <div className="text-xs text-muted-foreground">주문</div>
+            <div className="text-xl font-semibold tabular-nums">{loading ? "-" : compact(totals.order)}</div>
+          </div>
+          <div className="rounded-lg border p-3">
+            <div className="text-xs text-muted-foreground">클릭</div>
+            <div className="text-xl font-semibold tabular-nums">{loading ? "-" : compact(totals.click)}</div>
+          </div>
+          <div className="rounded-lg border p-3">
+            <div className="text-xs text-muted-foreground">전환율</div>
+            <div className="text-xl font-semibold tabular-nums">{loading ? "-" : percent(totals.conversionRate)}</div>
+          </div>
+        </div>
+        <div className="overflow-hidden rounded-lg border">
+          <div className="grid grid-cols-[1fr_72px_72px_92px_92px] gap-2 bg-muted px-3 py-2 text-xs font-medium text-muted-foreground">
+            <span>일자</span>
+            <span className="text-right">클릭</span>
+            <span className="text-right">주문</span>
+            <span className="text-right">거래액</span>
+            <span className="text-right">수수료</span>
+          </div>
+          {rows.length ? rows.map((row) => (
+            <div key={`${row.date}-${row.subId || "none"}`} className="grid grid-cols-[1fr_72px_72px_92px_92px] gap-2 border-t px-3 py-2 text-sm">
+              <span className="tabular-nums">{formatCoupangDate(row.date)}</span>
+              <span className="text-right tabular-nums">{compact(row.click)}</span>
+              <span className="text-right tabular-nums">{compact(row.order)}</span>
+              <span className="text-right tabular-nums">{won(row.gmv)}</span>
+              <span className="text-right font-medium tabular-nums">{won(row.commission)}</span>
+            </div>
+          )) : (
+            <div className="border-t px-3 py-4 text-sm text-muted-foreground">
+              실적 데이터가 없습니다.
+            </div>
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  );
 }
 
 function growthSummary(flowDays = []) {
@@ -976,6 +1062,17 @@ function Dashboard() {
               ) : (
                 <>
               <SectionCards metrics={metrics} />
+
+              {view !== "automation" ? (
+                <div className="px-4 lg:px-6">
+                  <CoupangPerformance
+                    data={data}
+                    loading={loading}
+                    busy={busy === "coupang-performance-refresh"}
+                    onReload={() => runAction("coupang-performance-refresh", () => load(view), "쿠팡 실적 새로고침 완료")}
+                  />
+                </div>
+              ) : null}
 
               {error ? (
                 <div className="px-4 lg:px-6">
