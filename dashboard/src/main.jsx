@@ -6,6 +6,7 @@ import {
   DatabaseZapIcon,
   HeartIcon,
   Loader2Icon,
+  LinkIcon,
   MessageCircleIcon,
   PauseCircleIcon,
   PlayCircleIcon,
@@ -47,6 +48,7 @@ import {
 } from "@/components/ui/sidebar";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Toaster } from "@/components/ui/sonner";
+import { Textarea } from "@/components/ui/textarea";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import "./styles.css";
 
@@ -366,6 +368,9 @@ function Dashboard() {
   const [titleEdits, setTitleEdits] = useState({});
   const [scheduleEdits, setScheduleEdits] = useState({});
   const [terafabxResult, setTerafabxResult] = useState(null);
+  const [affiliateTargetUrl, setAffiliateTargetUrl] = useState("");
+  const [affiliateLink, setAffiliateLink] = useState("");
+  const [affiliateComment, setAffiliateComment] = useState("");
   const [autoRefresh, setAutoRefresh] = useState(localStorage.getItem("threadDashboard.autoRefreshEnabled") !== "false");
   const [error, setError] = useState("");
   const [automationDate, setAutomationDate] = useState("all");
@@ -422,6 +427,14 @@ function Dashboard() {
       ? commentTimeline
       : commentTimeline.filter((item) => item.date === automationDate)
   ), [automationDate, commentTimeline]);
+
+  useEffect(() => {
+    const affiliate = data?.terafabx?.affiliate;
+    if (!affiliate) return;
+    setAffiliateTargetUrl((current) => current || affiliate.defaultTargetUrl || "");
+    setAffiliateLink((current) => current || affiliate.defaultLink || "");
+    setAffiliateComment((current) => current || affiliate.defaultComment || "");
+  }, [data?.terafabx?.affiliate]);
 
   useEffect(() => {
     if (automationDate !== "all" && availableDates.length && !availableDates.includes(automationDate)) {
@@ -487,6 +500,20 @@ function Dashboard() {
       });
       setTerafabxResult(result);
     }, "자동화 상태 변경됨");
+  }
+
+  async function runAffiliateComment() {
+    await runAction("terafabx-affiliate-comment", async () => {
+      const result = await api("/api/terafabx/affiliate-comment", {
+        method: "POST",
+        body: JSON.stringify({
+          targetUrl: affiliateTargetUrl.trim(),
+          link: affiliateLink.trim(),
+          comment: affiliateComment.trim(),
+        }),
+      });
+      setTerafabxResult(result);
+    }, "쿠팡 파트너스 댓글 게시됨");
   }
 
   const controlsBusy = Boolean(busy);
@@ -689,6 +716,61 @@ function Dashboard() {
                       </div>
                     </div>
                     <div className="grid gap-3 rounded-lg border p-3">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2 font-medium">
+                            <LinkIcon className="size-4" />
+                            쿠팡 파트너스 댓글
+                          </div>
+                          <p className="truncate text-sm text-muted-foreground">
+                            최근 {formatDate(data?.terafabx?.affiliate?.lastRunAt)} · {data?.terafabx?.affiliate?.lastStatus || "대기"}
+                          </p>
+                        </div>
+                      </div>
+                      {data?.terafabx?.affiliate?.lastError ? (
+                        <Alert variant="destructive">
+                          <AlertTitle>파트너스 댓글 실패</AlertTitle>
+                          <AlertDescription>{data.terafabx.affiliate.lastError}</AlertDescription>
+                        </Alert>
+                      ) : null}
+                      <div className="grid gap-2">
+                        <Input
+                          value={affiliateTargetUrl}
+                          onChange={(event) => setAffiliateTargetUrl(event.target.value)}
+                          placeholder="https://x.com/terafabXai/status/..."
+                        />
+                        <Input
+                          value={affiliateLink}
+                          onChange={(event) => {
+                            const nextLink = event.target.value;
+                            setAffiliateLink(nextLink);
+                            if (!affiliateComment || affiliateComment.includes("[쿠팡 파트너스 링크]") || affiliateComment.includes(data?.terafabx?.affiliate?.defaultLink || "__none__")) {
+                              setAffiliateComment([
+                                "초음파 사진으로 누구 닮았는지 보는 방법 여기요 ㅋㅋ",
+                                nextLink || "[쿠팡 파트너스 링크]",
+                                "이 포스팅은 쿠팡 파트너스 활동의 일환으로 수수료를 받을 수 있습니다.",
+                              ].join("\n"));
+                            }
+                          }}
+                          placeholder="쿠팡 파트너스 링크"
+                        />
+                        <Textarea
+                          value={affiliateComment}
+                          rows={4}
+                          maxLength={280}
+                          onChange={(event) => setAffiliateComment(event.target.value)}
+                        />
+                      </div>
+                      <Button
+                        size="sm"
+                        disabled={controlsBusy || !affiliateTargetUrl.trim() || !affiliateLink.trim() || !affiliateComment.trim()}
+                        onClick={runAffiliateComment}
+                      >
+                        {busy === "terafabx-affiliate-comment" ? <Loader2Icon data-icon="inline-start" className="animate-spin" /> : <MessageCircleIcon data-icon="inline-start" />}
+                        파트너스 댓글 달기
+                      </Button>
+                    </div>
+                    <div className="grid gap-3 rounded-lg border p-3">
                       <div className="flex items-center justify-between gap-3">
                         <div className="min-w-0">
                           <div className="flex items-center gap-2 font-medium">
@@ -799,6 +881,15 @@ function Dashboard() {
                       method: "POST",
                       body: JSON.stringify({ url: row.canonicalUrl, text: (text ?? rowText(row)).trim() }),
                     }), "X 초안 저장됨")
+                  }
+                  onCoupangAffiliateComment={(row) =>
+                    runAction(`coupang-affiliate-${row.canonicalUrl}`, async () => {
+                      const result = await api("/api/discovery/coupang-affiliate-comment", {
+                        method: "POST",
+                        body: JSON.stringify({ url: row.canonicalUrl }),
+                      });
+                      setTerafabxResult(result);
+                    }, "쿠팡 파트너스 댓글 게시됨")
                   }
                   onSchedule={(row, text, scheduledAt) =>
                     runAction(`schedule-${row.canonicalUrl}`, () => api("/api/discovery/schedule", {

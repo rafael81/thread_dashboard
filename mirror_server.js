@@ -1,10 +1,30 @@
 const fs = require("fs");
+const crypto = require("crypto");
 const http = require("http");
 const os = require("os");
 const path = require("path");
 const { URL } = require("url");
 const { execFile, spawn } = require("child_process");
 const WebSocket = require("ws");
+
+function loadDotEnvFile(filePath = path.join(__dirname, ".env")) {
+  if (!fs.existsSync(filePath)) return;
+  const lines = fs.readFileSync(filePath, "utf8").split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const index = trimmed.indexOf("=");
+    if (index <= 0) continue;
+    const key = trimmed.slice(0, index).trim();
+    let value = trimmed.slice(index + 1).trim();
+    if ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    if (!Object.prototype.hasOwnProperty.call(process.env, key)) process.env[key] = value;
+  }
+}
+
+loadDotEnvFile();
 
 const PORT = Number(process.env.PORT || 3131);
 const CHROME_PORT = Number(process.env.CHROME_PORT || 9224);
@@ -32,6 +52,12 @@ const TERAFABX_LOCK_PATH = process.env.TERAFABX_LOCK_PATH || path.join(os.tmpdir
 const TERAFABX_COMMENT_INTERVAL_MS = Number(process.env.TERAFABX_COMMENT_INTERVAL_MS || 20 * 60 * 1000);
 const TERAFABX_HEART_INTERVAL_MS = Number(process.env.TERAFABX_HEART_INTERVAL_MS || 10 * 60 * 1000);
 const TERAFABX_HEART_LIMIT = Number(process.env.TERAFABX_HEART_LIMIT || 5);
+const TERAFABX_AFFILIATE_DEFAULT_LINK = process.env.TERAFABX_AFFILIATE_DEFAULT_LINK || "";
+const TERAFABX_AFFILIATE_DEFAULT_TARGET_URL = process.env.TERAFABX_AFFILIATE_DEFAULT_TARGET_URL || "";
+const COUPANG_PARTNERS_ACCESS_KEY = process.env.COUPANG_PARTNERS_ACCESS_KEY || process.env.COUPANG_ACCESS_KEY || "";
+const COUPANG_PARTNERS_SECRET_KEY = process.env.COUPANG_PARTNERS_SECRET_KEY || process.env.COUPANG_SECRET_KEY || "";
+const COUPANG_PARTNERS_SUB_ID = process.env.COUPANG_PARTNERS_SUB_ID || "terafabx";
+const COUPANG_PARTNERS_BASE_URL = process.env.COUPANG_PARTNERS_BASE_URL || "https://api-gateway.coupang.com";
 const DISCOVERY_EXCLUDED_KEYWORDS = ["배재고", "배제고", "이재명"];
 const TERAFABX_JOB_GAP_MS = Number(process.env.TERAFABX_JOB_GAP_MS || 90 * 1000);
 const NAVER_BLOG_STATE_PATH = process.env.NAVER_BLOG_STATE_PATH || path.join(__dirname, ".data", "naver-blog-ops-state.json");
@@ -669,8 +695,23 @@ function loadTerafabxState() {
     lastHeartError: null,
     lastHeartCount: 0,
     heartHistory: [],
+    affiliateDefaultTargetUrl: TERAFABX_AFFILIATE_DEFAULT_TARGET_URL,
+    affiliateDefaultLink: TERAFABX_AFFILIATE_DEFAULT_LINK,
+    affiliateDefaultComment: buildDefaultAffiliateComment(TERAFABX_AFFILIATE_DEFAULT_LINK),
+    affiliateHistory: [],
+    lastAffiliateRunAt: null,
+    lastAffiliateStatus: null,
+    lastAffiliateError: null,
   };
   return { ...defaults, ...readJsonFile(TERAFABX_STATE_PATH, defaults) };
+}
+
+function buildDefaultAffiliateComment(link = "") {
+  return [
+    "초음파 사진으로 누구 닮았는지 보는 방법 여기요 ㅋㅋ",
+    link || "[쿠팡 파트너스 링크]",
+    "이 포스팅은 쿠팡 파트너스 활동의 일환으로 수수료를 받을 수 있습니다.",
+  ].join("\n");
 }
 
 function saveTerafabxState(patchValue) {
@@ -1173,6 +1214,233 @@ async function runTerafabxCommentOnce({ manual = false } = {}) {
   }
 }
 
+function validateAffiliateTargetUrl(value) {
+  const url = String(value || "").trim();
+  if (!/^https:\/\/(x\.com|twitter\.com)\/[^/]+\/status\/\d+/i.test(url)) {
+    throw new Error("대상은 X 게시글 URL이어야 합니다.");
+  }
+  return url.split("?")[0];
+}
+
+function validateAffiliateComment(comment, link) {
+  const text = String(comment || "").trim();
+  if (!text) throw new Error("댓글 본문이 비어 있습니다.");
+  if (!/^https?:\/\/\S+/i.test(String(link || "").trim())) throw new Error("쿠팡 파트너스 링크를 입력해 주세요.");
+  if (!text.includes(String(link).trim())) throw new Error("댓글 본문에 쿠팡 파트너스 링크가 포함되어야 합니다.");
+  if (!/쿠팡\s*파트너스|수수료|파트너스\s*활동/i.test(text)) {
+    throw new Error("댓글 본문에 쿠팡 파트너스 고지 문구가 필요합니다.");
+  }
+  const xLength = xWeightedLength(text.replace(/https?:\/\/\S+/g, "https://t.co/1234567890"));
+  if (xLength > 280) throw new Error(`X 댓글 길이 초과: ${xLength}/280`);
+  return text;
+}
+
+function coupangSignedAuthorization(method, requestPath, query = "") {
+  if (!COUPANG_PARTNERS_ACCESS_KEY || !COUPANG_PARTNERS_SECRET_KEY) {
+    throw new Error("쿠팡 파트너스 API 키가 필요합니다. COUPANG_PARTNERS_ACCESS_KEY / COUPANG_PARTNERS_SECRET_KEY를 설정해 주세요.");
+  }
+  const signedDate = new Date().toISOString().replace(/^20(\d\d)-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d).*$/, "$1$2$3T$4$5$6Z");
+  const message = `${signedDate}${method.toUpperCase()}${requestPath}${query}`;
+  const signature = crypto.createHmac("sha256", COUPANG_PARTNERS_SECRET_KEY).update(message).digest("hex");
+  return `CEA algorithm=HmacSHA256,access-key=${COUPANG_PARTNERS_ACCESS_KEY},signed-date=${signedDate},signature=${signature}`;
+}
+
+async function callCoupangPartnersApi(method, requestPath, { query = "", body = null } = {}) {
+  const url = `${COUPANG_PARTNERS_BASE_URL}${requestPath}${query ? `?${query}` : ""}`;
+  const response = await fetch(url, {
+    method,
+    headers: {
+      authorization: coupangSignedAuthorization(method, requestPath, query),
+      "content-type": "application/json;charset=UTF-8",
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await response.text();
+  let data = {};
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = { raw: text };
+  }
+  if (!response.ok || (data.rCode && data.rCode !== "0")) {
+    throw new Error(`쿠팡 파트너스 API 실패: HTTP ${response.status} ${data.rMessage || data.message || text}`);
+  }
+  return data;
+}
+
+function fallbackAffiliateKeyword(text = "") {
+  const compact = String(text || "").replace(/\s+/g, " ");
+  if (/초음파|태아|아기|임신|출산|신생아|육아/.test(compact)) return "초음파 사진 액자";
+  const words = compact
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .split(/\s+/)
+    .map((word) => word.trim())
+    .filter((word) => [...word].length >= 2 && !/^(https?|www|com|ㅋㅋ|ㅎㅎ|진짜|댓글|게시물|사진|영상)$/i.test(word));
+  return words.slice(0, 3).join(" ") || "육아 선물";
+}
+
+async function generateCoupangSearchKeyword(row) {
+  const text = String(row?.textPreview || "");
+  const fallback = fallbackAffiliateKeyword(text);
+  if (!text.trim()) return fallback;
+  try {
+    const prompt = [
+      "너는 쿠팡 파트너스 상품 검색 키워드 작성기다.",
+      "X 게시글에 댓글로 붙일 연관 상품을 찾기 위해, 구매 의도가 높고 너무 넓지 않은 한국어 검색어 1개만 써라.",
+      "규칙: 2~5단어, 브랜드 추측 금지, 민감한 의료효능/성별/개인정보 추정 금지, 설명 없이 검색어만 출력.",
+      "",
+      `게시글: ${text.slice(0, 500)}`,
+      `기본 후보: ${fallback}`,
+    ].join("\n");
+    const raw = await runGrokCli(prompt, 30_000);
+    const keyword = String(raw || "").split("\n").map((line) => line.trim()).filter(Boolean)[0] || "";
+    return keyword.replace(/^["']|["']$/g, "").slice(0, 40) || fallback;
+  } catch (error) {
+    logEvent("coupang_keyword_grok_fallback", { error: error.message, fallback });
+    return fallback;
+  }
+}
+
+function scoreCoupangProduct(product, keyword, index) {
+  const name = String(product.productName || "");
+  const keywordTerms = String(keyword || "").split(/\s+/).filter(Boolean);
+  const overlap = keywordTerms.reduce((total, term) => total + (name.includes(term) ? 1 : 0), 0);
+  const price = Number(product.productPrice || 0);
+  const priceScore = price >= 5000 && price <= 80000 ? 8 : price > 0 ? 3 : 0;
+  const rocketScore = product.isRocket ? 6 : 0;
+  return overlap * 12 + priceScore + rocketScore + Math.max(0, 10 - index);
+}
+
+async function searchBestCoupangProduct(keyword) {
+  const requestPath = "/v2/providers/affiliate_open_api/apis/openapi/v1/products/search";
+  const query = new URLSearchParams({ keyword, limit: "10", imageSize: "230x230" }).toString();
+  const data = await callCoupangPartnersApi("GET", requestPath, { query });
+  const products = data?.data?.productData || [];
+  if (!products.length) throw new Error(`쿠팡 상품 검색 결과가 없습니다: ${keyword}`);
+  return products
+    .map((product, index) => ({ ...product, affiliateScore: scoreCoupangProduct(product, keyword, index) }))
+    .sort((a, b) => b.affiliateScore - a.affiliateScore)[0];
+}
+
+async function createCoupangDeepLink(productUrl) {
+  if (/^https:\/\/link\.coupang\.com\//i.test(String(productUrl || ""))) return productUrl;
+  const requestPath = "/v2/providers/affiliate_open_api/apis/openapi/v1/deeplink";
+  try {
+    const data = await callCoupangPartnersApi("POST", requestPath, {
+      body: { coupangUrls: [productUrl], subId: COUPANG_PARTNERS_SUB_ID },
+    });
+    const item = data?.data?.[0] || {};
+    return item.shortenUrl || item.landingUrl || item.originalUrl || productUrl;
+  } catch (error) {
+    logEvent("coupang_deeplink_fallback", { error: error.message });
+    return productUrl;
+  }
+}
+
+function buildCoupangAffiliateReply(link) {
+  return [
+    "게시물은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다.",
+    link,
+  ].join("\n");
+}
+
+async function postTerafabxAffiliateComment(payload = {}) {
+  if (terafabxBusy) throw new Error("다른 과즙루피 자동화 작업이 진행 중입니다.");
+  const state = loadTerafabxState();
+  const targetUrl = validateAffiliateTargetUrl(payload.targetUrl || state.affiliateDefaultTargetUrl);
+  const link = String(payload.link || state.affiliateDefaultLink || "").trim();
+  const comment = validateAffiliateComment(payload.comment || buildDefaultAffiliateComment(link), link);
+  terafabxBusy = true;
+  try {
+    return await withTerafabxLock("affiliate-comment", async () => {
+      const posted = await postTerafabxReply(targetUrl, comment, { validate: false });
+      const previous = loadTerafabxState();
+      const record = {
+        at: new Date().toISOString(),
+        targetUrl,
+        comment,
+        link,
+        replyUrl: posted.replyUrl,
+        manual: true,
+        generator: "affiliate-manual",
+      };
+      saveTerafabxState({
+        affiliateDefaultTargetUrl: targetUrl,
+        affiliateDefaultLink: link,
+        affiliateDefaultComment: comment,
+        lastAffiliateRunAt: record.at,
+        lastAffiliateStatus: "ok",
+        lastAffiliateError: null,
+        affiliateHistory: [record, ...(previous.affiliateHistory || [])].slice(0, 50),
+        commentHistory: [record, ...(previous.commentHistory || [])].slice(0, 100),
+      });
+      logEvent("terafabx_affiliate_comment_posted", record);
+      return { ok: true, action: "affiliate-comment", ...record };
+    });
+  } catch (error) {
+    saveTerafabxState({
+      affiliateDefaultTargetUrl: targetUrl,
+      affiliateDefaultLink: link,
+      affiliateDefaultComment: comment,
+      lastAffiliateRunAt: new Date().toISOString(),
+      lastAffiliateStatus: "error",
+      lastAffiliateError: error.message,
+    });
+    logEvent("terafabx_affiliate_comment_error", { targetUrl, error: error.message });
+    throw error;
+  } finally {
+    terafabxBusy = false;
+  }
+}
+
+async function findPostedXTargetForDiscoveryRow(row) {
+  const completed = findCompletedMirror(row.canonicalUrl);
+  if (completed?.postUrl) return completed.postUrl;
+  const postUrl = await findOwnXPostByText(row.textPreview || "");
+  if (!postUrl) throw new Error("게시된 X 글 URL을 찾지 못했습니다. X 게시 직후 히스토리에 postUrl이 없으면 with_replies에서 본문으로 복구합니다.");
+  if (completed) recordCompletedMirror({ ...completed, canonicalUrl: row.canonicalUrl, postUrl });
+  return postUrl;
+}
+
+async function postDiscoveryCoupangAffiliateReply(canonicalUrl) {
+  if (terafabxBusy) throw new Error("다른 과즙루피 자동화 작업이 진행 중입니다.");
+  const row = await getDiscoveryRow(canonicalUrl);
+  if (!row) throw new Error("대시보드 행을 찾지 못했습니다.");
+  if (row.status !== "posted") throw new Error("쿠팡 파트너스 댓글은 게시됨 글에서만 실행할 수 있습니다.");
+  const targetUrl = await findPostedXTargetForDiscoveryRow(row);
+  const keyword = await generateCoupangSearchKeyword(row);
+  const product = await searchBestCoupangProduct(keyword);
+  const productUrl = product.productUrl || product.productUrlPC || product.productUrlMobile;
+  if (!productUrl) throw new Error("선택된 쿠팡 상품에 상품 URL이 없습니다.");
+  const link = await createCoupangDeepLink(productUrl);
+  const comment = validateAffiliateComment(buildCoupangAffiliateReply(link), link);
+  const result = await postTerafabxAffiliateComment({ targetUrl, link, comment });
+  logEvent("discovery_coupang_affiliate_reply_done", {
+    canonicalUrl,
+    targetUrl,
+    keyword,
+    productName: product.productName || "",
+    productPrice: product.productPrice || null,
+    link,
+    replyUrl: result.replyUrl,
+  });
+  return {
+    canonicalUrl,
+    targetUrl,
+    keyword,
+    product: {
+      productName: product.productName || "",
+      productPrice: product.productPrice || null,
+      productImage: product.productImage || "",
+      isRocket: Boolean(product.isRocket),
+      score: product.affiliateScore,
+    },
+    link,
+    comment,
+    replyUrl: result.replyUrl,
+  };
+}
+
 async function runTerafabxHeartOnce({ limit = TERAFABX_HEART_LIMIT, manual = false } = {}) {
   if (terafabxBusy) throw new Error("다른 과즙루피 자동화 작업이 진행 중입니다.");
   terafabxBusy = true;
@@ -1253,6 +1521,15 @@ function getTerafabxAutomationStatus() {
       lastTarget: state.lastCommentTarget,
       lastReplyUrl: state.lastReplyUrl,
       history: (state.commentHistory || []).slice(0, 5),
+    },
+    affiliate: {
+      defaultTargetUrl: state.affiliateDefaultTargetUrl || "",
+      defaultLink: state.affiliateDefaultLink || "",
+      defaultComment: state.affiliateDefaultComment || buildDefaultAffiliateComment(state.affiliateDefaultLink || ""),
+      lastRunAt: state.lastAffiliateRunAt,
+      lastStatus: state.lastAffiliateStatus,
+      lastError: state.lastAffiliateError,
+      history: (state.affiliateHistory || []).slice(0, 5),
     },
     heart: {
       enabled: Boolean(state.heartEnabled),
@@ -2174,6 +2451,7 @@ function recordCompletedMirror(entry) {
     canonicalUrl: entry.canonicalUrl,
     status: entry.status,
     scheduledAt: entry.scheduledAt || null,
+    postUrl: entry.postUrl || null,
     mediaCount: entry.mediaCount,
     completedAt: new Date().toISOString(),
   });
@@ -3954,6 +4232,7 @@ async function mirrorThread(url, options = {}) {
       canonicalUrl,
       status: postResult.scheduledAt ? "scheduled" : "posted",
       scheduledAt: postResult.scheduledAt?.toISOString(),
+      postUrl: postResult.postUrl || null,
       mediaCount: media.files.length,
     });
     logEvent("mirror_success", { canonicalUrl, mediaCount: media.files.length, scheduledAt: postResult.scheduledAt?.toISOString() });
@@ -4073,6 +4352,7 @@ async function postDiscoveryRowToX(canonicalUrl, options = {}) {
       canonicalUrl,
       status: postResult.scheduledAt ? "scheduled" : "posted",
       scheduledAt: postResult.scheduledAt?.toISOString(),
+      postUrl: postResult.postUrl || null,
       mediaCount: media.files.length,
     });
     if (postResult.scheduledAt && replyChunks.length) {
@@ -4671,6 +4951,18 @@ const server = http.createServer(async (req, res) => {
     }
     return;
   }
+  if (req.method === "POST" && req.url === "/api/terafabx/affiliate-comment") {
+    try {
+      const body = await readRequestBody(req);
+      const payload = JSON.parse(body || "{}");
+      const result = await postTerafabxAffiliateComment(payload);
+      json(res, 200, { ok: true, result, status: getTerafabxAutomationStatus() });
+    } catch (error) {
+      logEvent("terafabx_affiliate_comment_action_error", { error: error.message });
+      json(res, 500, { ok: false, error: error.message });
+    }
+    return;
+  }
   if (req.method === "GET" && req.url.startsWith("/discovery")) {
     try {
       if (fs.existsSync(DASHBOARD_INDEX_PATH)) {
@@ -4882,6 +5174,20 @@ const server = http.createServer(async (req, res) => {
       json(res, 500, { ok: false, error: error.message });
     } finally {
       busy = false;
+    }
+    return;
+  }
+  if (req.method === "POST" && req.url === "/api/discovery/coupang-affiliate-comment") {
+    let canonicalUrl = "";
+    try {
+      const body = await readRequestBody(req);
+      const payload = JSON.parse(body || "{}");
+      canonicalUrl = normalizeDiscoveryUrl(payload.url);
+      const result = await postDiscoveryCoupangAffiliateReply(canonicalUrl);
+      json(res, 200, { ok: true, result, status: getTerafabxAutomationStatus() });
+    } catch (error) {
+      logEvent("discovery_coupang_affiliate_comment_error", { canonicalUrl, error: error.message });
+      json(res, 500, { ok: false, error: error.message });
     }
     return;
   }
