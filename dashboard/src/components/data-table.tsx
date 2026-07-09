@@ -106,6 +106,7 @@ type DataTableProps = {
   onSaveTitle: (row: DashboardRow, text?: string) => void
   onPost: (row: DashboardRow, text?: string) => void
   onDraft: (row: DashboardRow, text?: string) => void
+  onCoupangAffiliateComment: (row: DashboardRow) => void
   onSchedule: (row: DashboardRow, text?: string, scheduledAt?: string) => void
   onAutoSchedule: (row: DashboardRow, text?: string) => void
   onRefetch: (row: DashboardRow) => void
@@ -220,6 +221,7 @@ function ThreadSheet({
   onSaveTitle,
   onPost,
   onDraft,
+  onCoupangAffiliateComment,
   onSchedule,
   onAutoSchedule,
   onRefetch,
@@ -327,6 +329,9 @@ function ThreadSheet({
               <Button variant="outline" onClick={() => onDiscard(row)} disabled={Boolean(busy)}>
                 <Trash2Icon data-icon="inline-start" />
                 삭제
+              </Button>
+              <Button variant="outline" onClick={() => onCoupangAffiliateComment(row)} disabled={Boolean(busy) || row.status !== "posted"}>
+                쿠팡 댓글
               </Button>
               {row.mediaPreviewUrl ? (
                 <Button variant="outline" asChild>
@@ -515,6 +520,9 @@ export function DataTable(props: DataTableProps) {
                     </DropdownMenuItem>
                     <DropdownMenuItem onClick={() => props.onAutoSchedule(row.original)} disabled={!row.original.canPost || Boolean(busy)}>
                       자동 예약
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => props.onCoupangAffiliateComment(row.original)} disabled={row.original.status !== "posted" || Boolean(busy)}>
+                      쿠팡 댓글
                     </DropdownMenuItem>
                   </DropdownMenuGroup>
                 </DropdownMenuContent>
