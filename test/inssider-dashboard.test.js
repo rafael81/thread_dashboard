@@ -36,7 +36,7 @@ const {
   xWeightedLength,
   xScheduledTimeNeedles,
 } = require('../mirror_server.js');
-const { DEFAULT_GROK_URL, agentBrowserInvocation, buildGrokBatchCommandChunks, buildGrokBatchCommands, parseDoneMarker } = require('../scripts/terafabx-grok-web-agent.js');
+const { DEFAULT_GROK_URL, agentBrowserInvocation, buildGrokBatchCommandChunks, buildGrokBatchCommands, isGrokPromptEcho, parseDoneMarker } = require('../scripts/terafabx-grok-web-agent.js');
 
 test('sharp runtime dependency is importable', async () => {
   const sharp = await import('sharp');
@@ -544,7 +544,7 @@ test('TerafabX comment monitor still requests prefill during quiet posting hours
   ), true);
 });
 
-test('Grok final judge uses one native X Grok batch with semantic fill and Enter submission', () => {
+test('Grok context batch uses one semantic fill and Enter submission', () => {
   const commands = buildGrokBatchCommands('한 줄\n심사', 'https://x.com/i/grok', 60000, () => 0);
 
   assert.deepEqual(commands.slice(0, 6), [
@@ -565,13 +565,21 @@ test('Grok final judge uses one native X Grok batch with semantic fill and Enter
   assert.ok(responseReadCommand);
   const responseReadScript = Buffer.from(responseReadCommand.slice('eval -b '.length), 'base64').toString('utf8');
   assert.match(responseReadScript, /'\[class\*="r-bnwqim"\]\[class\*="r-11niif6"\]'/);
-  assert.match(responseReadScript, /text\.includes\(prompt\.slice/);
-  assert.ok(commands.includes('press Control+a'));
-  assert.ok(commands.some((command) => command.startsWith('keyboard inserttext ') && command.includes('한 줄\\n심사')));
+  assert.match(responseReadScript, /cleanPrompt = clean\(prompt\)/);
+  assert.match(responseReadScript, /text\.includes\(cleanPrompt\.slice/);
+  assert.ok(!commands.includes('press Control+a'));
+  assert.ok(!commands.some((command) => command.startsWith('keyboard inserttext ')));
   assert.ok(commands.includes('press Enter'));
   assert.ok(commands.some((command) => command.startsWith('eval -b ')));
   assert.ok(!commands.some((command) => command.startsWith('find placeholder ')));
   assert.ok(!commands.some((command) => command.includes('grok.com/')));
+});
+
+test('Grok prompt echo detection handles whitespace normalization and duplication', () => {
+  const prompt = '너는 X 원문 문맥 분석기다.\n반드시 JSON 배열만 반환한다.\n원문 URL 10개를 분석한다.';
+
+  assert.equal(isGrokPromptEcho(`  ${prompt.replace(/\n/g, '   ')}  ${prompt}`, prompt), true);
+  assert.equal(isGrokPromptEcho('[{"index":0,"summary":"고양이가 빠르게 달려온다"}]', prompt), false);
 });
 
 test('TerafabX Grok context automation defaults to grok.com headless', () => {

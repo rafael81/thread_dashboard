@@ -325,6 +325,7 @@ function buildGrokSubmitEvalScript(prompt) {
       return rect.width >= 8 && rect.height >= 8 && style.visibility !== 'hidden' && style.display !== 'none';
     };
     const clean = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+    const cleanPrompt = clean(prompt);
     const readState = () => {
       const nodes = [
         '[data-message-author-role="assistant"]',
@@ -342,7 +343,7 @@ function buildGrokSubmitEvalScript(prompt) {
           const text = clean(node.innerText || node.textContent || '');
           if (text.length < 20) return false;
           if (node.closest('form, aside, nav')) return false;
-          if (prompt && text.includes(prompt.slice(0, Math.min(prompt.length, 120)))) return false;
+          if (cleanPrompt && text.includes(cleanPrompt.slice(0, Math.min(cleanPrompt.length, 120)))) return false;
           return !/^(Grok|History|Today|New chat|새 채팅)$/i.test(text);
         });
       const last = nodes.at(-1);
@@ -407,6 +408,7 @@ function buildGrokReadEvalScript() {
       return rect.width >= 8 && rect.height >= 8 && style.visibility !== 'hidden' && style.display !== 'none';
     };
     const clean = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+    const cleanPrompt = clean(prompt);
     const nodes = [
       '[data-message-author-role="assistant"]',
       '[data-testid="assistant-message"]',
@@ -423,7 +425,7 @@ function buildGrokReadEvalScript() {
         const text = clean(node.innerText || node.textContent || '');
         if (text.length < 20) return false;
         if (node.closest('form, aside, nav')) return false;
-        if (prompt && text.includes(prompt.slice(0, Math.min(prompt.length, 120)))) return false;
+        if (cleanPrompt && text.includes(cleanPrompt.slice(0, Math.min(cleanPrompt.length, 120)))) return false;
         return !/^(Grok|History|Today|New chat|새 채팅)$/i.test(text);
       });
     const last = nodes.at(-1);
@@ -453,8 +455,6 @@ function buildGrokBatchCommandChunks(prompt, url, timeoutMs = DEFAULT_TIMEOUT_MS
     "reload",
     `wait ${randomHumanDelayMs(random, 4200, 6800)}`,
     `eval -b ${encodeEval(buildGrokSubmitEvalScript(prompt))}`,
-    "press Control+a",
-    `keyboard inserttext ${JSON.stringify(prompt)}`,
     `wait ${randomHumanDelayMs(random, 600, 1400)}`,
     "press Enter",
     `wait ${randomHumanDelayMs(random, 900, 1800)}`,
@@ -477,6 +477,25 @@ function buildGrokBatchCommands(prompt, url, timeoutMs = DEFAULT_TIMEOUT_MS, ran
   return buildGrokBatchCommandChunks(prompt, url, timeoutMs, random)[0];
 }
 
+function normalizePromptEchoText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function isGrokPromptEcho(response, prompt) {
+  const text = normalizePromptEchoText(response);
+  const source = normalizePromptEchoText(prompt);
+  if (!text || source.length < 40) return false;
+  const prefix = source.slice(0, Math.min(source.length, 160));
+  return text.includes(prefix);
+}
+
+function acceptGrokResponse(response, prompt) {
+  if (isGrokPromptEcho(response, prompt)) {
+    throw new Error('Grok Web 응답 대신 입력 프롬프트가 감지되었습니다.');
+  }
+  return response;
+}
+
 async function runGrokPromptBatch(prompt, options, url) {
   const timeoutMs = Number(options.timeoutMs || DEFAULT_TIMEOUT_MS);
   const chunks = buildGrokBatchCommandChunks(prompt, url, timeoutMs);
@@ -492,11 +511,11 @@ async function runGrokPromptBatch(prompt, options, url) {
     } catch (error) {
       output = error.message || "";
       const markedDone = parseDoneMarker(output);
-      if (markedDone?.response) return markedDone.response;
+      if (markedDone?.response) return acceptGrokResponse(markedDone.response, prompt);
       throw error;
     }
     const markedDone = parseDoneMarker(output);
-    if (markedDone?.response) return markedDone.response;
+    if (markedDone?.response) return acceptGrokResponse(markedDone.response, prompt);
     const parsedResults = String(output || "")
       .split(/\n/)
       .map((line) => parseBatchEvalJson(line))
@@ -504,7 +523,7 @@ async function runGrokPromptBatch(prompt, options, url) {
     const failed = parsedResults.find((item) => item.ok === false);
     if (failed) throw new Error(`Grok Web batch 실패(${failed.stage || "unknown"}): ${JSON.stringify(failed).slice(0, 1200)}`);
     const done = parsedResults.filter((item) => item.done && item.response).at(-1);
-    if (done) return done.response;
+    if (done) return acceptGrokResponse(done.response, prompt);
     last = parsedResults.at(-1) || last;
     if (!last && chunkIndex === chunks.length - 1) {
       throw new Error(`Grok Web batch 응답을 해석하지 못했습니다: ${String(output || "").slice(-1000)}`);
@@ -763,4 +782,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { DEFAULT_GROK_URL, agentBrowserInvocation, buildGrokBatchCommandChunks, buildGrokBatchCommands, parseDoneMarker, randomHumanDelayMs, runGrokPromptBatch };
+module.exports = { DEFAULT_GROK_URL, agentBrowserInvocation, buildGrokBatchCommandChunks, buildGrokBatchCommands, isGrokPromptEcho, parseDoneMarker, randomHumanDelayMs, runGrokPromptBatch };
