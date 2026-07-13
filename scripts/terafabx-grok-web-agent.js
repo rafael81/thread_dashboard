@@ -450,6 +450,8 @@ function buildGrokBatchCommandChunks(prompt, url, timeoutMs = DEFAULT_TIMEOUT_MS
     "batch",
     "--bail",
     `open ${url}`,
+    `wait ${randomHumanDelayMs(random, 1800, 2800)}`,
+    "reload",
     `wait ${randomHumanDelayMs(random, 4200, 6800)}`,
     `eval -b ${encodeEval(buildGrokSubmitEvalScript(prompt))}`,
     "press Control+a",

@@ -371,13 +371,15 @@ test('TerafabX comment monitor still requests prefill during quiet posting hours
 test('Grok final judge uses one native X Grok batch with semantic fill and Enter submission', () => {
   const commands = buildGrokBatchCommands('한 줄\n심사', 'https://x.com/i/grok', 60000, () => 0);
 
-  assert.deepEqual(commands.slice(0, 4), [
+  assert.deepEqual(commands.slice(0, 6), [
     'batch',
     '--bail',
     'open https://x.com/i/grok',
+    'wait 1800',
+    'reload',
     'wait 4200',
   ]);
-  assert.ok(commands[4].startsWith('eval -b '));
+  assert.ok(commands[6].startsWith('eval -b '));
   const submitCommand = commands.find((command) => command.startsWith('eval -b ') && Buffer.from(command.slice('eval -b '.length), 'base64').toString('utf8').includes('contenteditable'));
   assert.ok(submitCommand);
   const submitScript = Buffer.from(submitCommand.slice('eval -b '.length), 'base64').toString('utf8');
