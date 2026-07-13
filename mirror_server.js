@@ -157,6 +157,7 @@ let naverBlogSchedulerBusy = false;
 let naverBlogManualBusy = false;
 
 let busy = false;
+let autoScheduleAllocationTail = Promise.resolve();
 let discoveryScanBusy = false;
 let discoveryDbPromise = null;
 let terafabxBusy = false;
@@ -8941,12 +8942,17 @@ async function readXScheduledEntries(page) {
   return Array.from(entries.values());
 }
 
-function findXScheduledEntry(entries, scheduledAt) {
+function findXScheduledEntry(entries, scheduledAt, expected = null) {
   const needles = xScheduledTimeNeedles(scheduledAt).map(normalizeXScheduledText);
-  return (entries || []).find((entry) => {
+  const slotEntries = (entries || []).filter((entry) => {
     const text = normalizeXScheduledText(entry.text || entry.rawText || "");
     return needles.length > 0 && needles.every((needle) => text.includes(needle));
-  }) || null;
+  });
+  if (!expected || slotEntries.length <= 1) return slotEntries[0] || null;
+  return slotEntries.find((entry) => assessXScheduledEntry(expected, entry).status === "ok")
+    || slotEntries.find((entry) => assessXScheduledEntry(expected, entry).titlePresent)
+    || slotEntries[0]
+    || null;
 }
 
 async function openXScheduledEntry(page, scheduledAt) {
@@ -8979,10 +8985,11 @@ async function openXScheduledEntry(page, scheduledAt) {
   throw new Error(`X 예약 편집 모달이 열리지 않았습니다: ${needles.join(" / ")}`);
 }
 
-async function deleteXScheduledEntry(page, scheduledAt) {
+async function deleteXScheduledEntry(page, scheduledAt, expected = null) {
   const needles = xScheduledTimeNeedles(scheduledAt);
   const beforeEntries = await readXScheduledEntries(page);
-  if (!findXScheduledEntry(beforeEntries, scheduledAt)) {
+  const beforeEntry = findXScheduledEntry(beforeEntries, scheduledAt, expected);
+  if (!beforeEntry || (expected && assessXScheduledEntry(expected, beforeEntry).status !== "ok")) {
     throw new Error(`X 예약 목록에서 취소할 항목을 찾지 못했습니다: ${needles.join(" / ")}`);
   }
   const selected = await page.eval(`((needles) => {
@@ -8996,9 +9003,11 @@ async function deleteXScheduledEntry(page, scheduledAt) {
   })(${JSON.stringify(needles)})`);
   if (!selected?.ok) throw new Error("X 예약 목록의 수정 버튼을 찾지 못했습니다.");
   await sleep(700);
-  const checked = await page.eval(`((needles) => {
+  const expectedTitleNeedle = normalizeXScheduledText(expected?.text || expected?.textPreview || "").slice(0, 80);
+  const checked = await page.eval(`((needles, expectedTitleNeedle) => {
     const normalize = (value) => String(value || "").replace(/\\s+/g, " ").trim();
     const normalizedNeedles = needles.map(normalize);
+    const normalizedTitleNeedle = normalize(expectedTitleNeedle);
     const boxes = Array.from(document.querySelectorAll('input[type="checkbox"], [role="checkbox"]'));
     const target = boxes.find((el) => {
       const describedBy = el.getAttribute('aria-describedby');
@@ -9006,14 +9015,15 @@ async function deleteXScheduledEntry(page, scheduledAt) {
       const innerLabel = el.closest('label');
       const rowLabel = innerLabel?.parentElement?.closest('label') || innerLabel;
       const text = normalize(el.getAttribute('aria-label') || describedText || rowLabel?.innerText || el.parentElement?.innerText || "");
-      return normalizedNeedles.every((needle) => text.includes(needle));
+      return normalizedNeedles.every((needle) => text.includes(needle))
+        && (!normalizedTitleNeedle || text.includes(normalizedTitleNeedle));
     });
     if (!target) return false;
     const innerLabel = target.closest('label');
     const rowLabel = innerLabel?.parentElement?.closest('label') || innerLabel;
     (rowLabel || target).click();
     return true;
-  })(${JSON.stringify(needles)})`);
+  })(${JSON.stringify(needles)}, ${JSON.stringify(expectedTitleNeedle)})`);
   if (!checked) throw new Error(`X 예약 취소 체크박스를 찾지 못했습니다: ${needles.join(" / ")}`);
   await sleep(500);
   const deleteClicked = await page.eval(`(() => {
@@ -9046,7 +9056,8 @@ async function deleteXScheduledEntry(page, scheduledAt) {
   if (!confirmed) throw new Error("X 예약 취소 확인 버튼을 찾지 못했습니다.");
   await sleep(2500);
   const afterEntries = await readXScheduledEntries(page);
-  if (findXScheduledEntry(afterEntries, scheduledAt)) {
+  const remainingEntry = findXScheduledEntry(afterEntries, scheduledAt, expected);
+  if (remainingEntry && (!expected || assessXScheduledEntry(expected, remainingEntry).status === "ok")) {
     throw new Error(`X 예약 취소 사후 검증 실패: ${needles.join(" / ")}`);
   }
   return { beforeCount: beforeEntries.length, afterCount: afterEntries.length };
@@ -9124,7 +9135,7 @@ async function verifyScheduledPostSubmission(page, expected) {
   let last = null;
   for (let attempt = 0; attempt < 6; attempt += 1) {
     const entries = await readXScheduledEntries(page);
-    const entry = findXScheduledEntry(entries, expected.scheduledAt);
+    const entry = findXScheduledEntry(entries, expected.scheduledAt, expected);
     const assessment = assessXScheduledEntry(expected, entry);
     last = { entry, assessment };
     if (assessment.status === "ok") {
@@ -9207,7 +9218,7 @@ async function postToX(threadPost, mediaFiles, options = {}) {
           text: threadPost.text,
           mediaCount: mediaFiles.length,
         });
-        recordScheduleSlot(scheduledAt);
+        recordScheduleSlot(scheduledAt, { state: "verified" });
       }
       let postUrl = null;
       if (!scheduledAt) {
@@ -9429,18 +9440,58 @@ async function nextAutoScheduleTime() {
   return candidate;
 }
 
-function recordScheduleSlot(scheduledAt) {
+async function reserveNextAutoScheduleTime(canonicalUrl) {
+  let releaseAllocation;
+  const allocationTurn = new Promise((resolve) => { releaseAllocation = resolve; });
+  const previousTurn = autoScheduleAllocationTail;
+  autoScheduleAllocationTail = previousTurn.catch(() => {}).then(() => allocationTurn);
+  await previousTurn.catch(() => {});
+  try {
+    const scheduledAt = await nextAutoScheduleTime();
+    recordScheduleSlot(scheduledAt, {
+      canonicalUrl,
+      state: "reserved",
+      source: "auto_schedule_allocation",
+    });
+    logEvent("discovery_auto_schedule_slot_reserved", {
+      canonicalUrl,
+      scheduledAt: scheduledAt.toISOString(),
+    });
+    return scheduledAt;
+  } finally {
+    releaseAllocation();
+  }
+}
+
+function recordScheduleSlot(scheduledAt, metadata = {}) {
+  const scheduledIso = scheduledAt.toISOString();
   const slots = loadScheduleSlots();
-  slots.push({ scheduledAt: scheduledAt.toISOString(), recordedAt: new Date().toISOString() });
+  const existingIndex = slots.findIndex((entry) => {
+    try {
+      return new Date(entry.scheduledAt).toISOString() === scheduledIso;
+    } catch {
+      return false;
+    }
+  });
+  const entry = {
+    ...(existingIndex >= 0 ? slots[existingIndex] : {}),
+    ...metadata,
+    scheduledAt: scheduledIso,
+    recordedAt: new Date().toISOString(),
+  };
+  if (existingIndex >= 0) slots[existingIndex] = entry;
+  else slots.push(entry);
   saveScheduleSlots(slots);
 }
 
-function removeScheduleSlot(scheduledAt) {
+function removeScheduleSlot(scheduledAt, canonicalUrl = null) {
   const target = new Date(scheduledAt || 0).toISOString();
   const slots = loadScheduleSlots();
   saveScheduleSlots(slots.filter((entry) => {
     try {
-      return new Date(entry.scheduledAt).toISOString() !== target;
+      if (new Date(entry.scheduledAt).toISOString() !== target) return true;
+      if (!canonicalUrl) return false;
+      return !entry.canonicalUrl || entry.canonicalUrl !== canonicalUrl;
     } catch {
       return true;
     }
@@ -10125,11 +10176,11 @@ async function markDiscoveryScheduled(canonicalUrl, mediaCount, scheduledAt) {
 }
 
 async function cancelDiscoveryScheduledPost(canonicalUrl) {
-  const url = validateThreadsUrl(canonicalUrl);
+  const url = normalizeDiscoveryUrl(canonicalUrl);
   const db = await getDiscoveryDb();
   const row = await db.prepare(`
     SELECT canonical_url AS canonicalUrl, status, scheduled_post_at AS scheduledPostAt,
-      media_count AS mediaCount
+      media_count AS mediaCount, text_preview AS textPreview
     FROM thread_discoveries
     WHERE canonical_url = ?
   `).get(url);
@@ -10150,7 +10201,10 @@ async function cancelDiscoveryScheduledPost(canonicalUrl) {
       const page = await newPage(`https://x.com/${REQUIRED_X_HANDLE}`);
       try {
         await verifyXAccount(page);
-        return await deleteXScheduledEntry(page, scheduledAt);
+        return await deleteXScheduledEntry(page, scheduledAt, {
+          textPreview: isDiscoveryPlaceholderText(row.textPreview) ? "" : row.textPreview,
+          mediaCount: Number(row.mediaCount || 0),
+        });
       } finally {
         await page.close();
         logEvent("x_tab_closed", { source: "dashboard_schedule_cancel" });
@@ -10162,7 +10216,7 @@ async function cancelDiscoveryScheduledPost(canonicalUrl) {
       WHERE canonical_url = ? AND status = 'cancelling_schedule'
     `).run(url);
     removeCompletedMirror(url);
-    removeScheduleSlot(scheduledAt);
+    removeScheduleSlot(scheduledAt, url);
     removeScheduledReplyItem(url);
     logEvent("discovery_schedule_cancelled", {
       canonicalUrl: url,
@@ -11669,7 +11723,7 @@ async function runDiscoveryAutoSchedule(canonicalUrl, options = {}) {
     if (options.text && String(options.text).trim()) {
       await updateDiscoveryTitle(canonicalUrl, options.text);
     }
-    const scheduledAt = await nextAutoScheduleTime();
+    const scheduledAt = await reserveNextAutoScheduleTime(canonicalUrl);
     logEvent("discovery_auto_schedule_request", {
       canonicalUrl,
       scheduledAt: scheduledAt.toISOString(),
@@ -13397,7 +13451,10 @@ async function confirmExistingXScheduledPost(canonicalUrl, scheduledAtValue) {
     try {
       await verifyXAccount(page);
       const entries = await readXScheduledEntries(page);
-      const entry = findXScheduledEntry(entries, scheduledAt);
+      const entry = findXScheduledEntry(entries, scheduledAt, {
+        textPreview: isDiscoveryPlaceholderText(row.textPreview) ? "" : row.textPreview,
+        mediaCount: Number(row.mediaCount || 0),
+      });
       const assessment = assessXScheduledEntry({
         textPreview: isDiscoveryPlaceholderText(row.textPreview) ? "" : row.textPreview,
         mediaCount: Number(row.mediaCount || 0),
@@ -13456,7 +13513,7 @@ async function runXScheduleMonitor(options = {}) {
         const anomalies = [];
         const repairs = [];
         for (const expected of expectedRows) {
-          let entry = findXScheduledEntry(actualEntries, expected.scheduledAt);
+          let entry = findXScheduledEntry(actualEntries, expected.scheduledAt, expected);
           let assessment = assessXScheduledEntry(expected, entry);
           const shouldInspectTextOnlyMedia = assessment.status === "ok" && Number(expected.mediaCount || 0) === 0;
           if (assessment.status === "title_missing" || shouldInspectTextOnlyMedia) {
@@ -13467,7 +13524,7 @@ async function runXScheduleMonitor(options = {}) {
                 logEvent("x_schedule_monitor_repaired", { canonicalUrl: expected.canonicalUrl, scheduledAt: expected.scheduledAt, ...repair });
               }
               actualEntries = await readXScheduledEntries(page);
-              entry = findXScheduledEntry(actualEntries, expected.scheduledAt);
+              entry = findXScheduledEntry(actualEntries, expected.scheduledAt, expected);
               assessment = assessXScheduledEntry(expected, entry);
             } catch (error) {
               anomalies.push({ canonicalUrl: expected.canonicalUrl, scheduledAt: expected.scheduledAt, type: "repair_failed", error: error.message });

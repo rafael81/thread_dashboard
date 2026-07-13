@@ -553,6 +553,22 @@ test('X schedule monitor finds the exact KST slot and accepts its title', () => 
   assert.equal(result.status, 'ok');
 });
 
+test('X schedule verification selects the matching title when a slot has multiple posts', () => {
+  const scheduledAt = '2026-07-13T22:00:00.000Z';
+  const entries = [
+    { text: '2026년 7월 14일 (화) 오전 7:00에 전송 예정\n일론머스크가 말했다..' },
+    { text: '2026년 7월 14일 (화) 오전 7:00에 전송 예정\n아 ..ㄹㅇ 눈물 버튼 눌림ㅠㅠ' },
+    { text: '2026년 7월 14일 (화) 오전 7:00에 전송 예정\nㅋㅋ진짜 순수 그 자체?' },
+  ];
+
+  const entry = findXScheduledEntry(entries, scheduledAt, {
+    textPreview: '아 ..ㄹㅇ 눈물 버튼 눌림ㅠㅠ',
+    mediaCount: 2,
+  });
+
+  assert.equal(entry.text.includes('눈물 버튼'), true);
+});
+
 test('X schedule monitor rejects an unexpected standalone ISO date before the expected title', () => {
   const result = assessXScheduledEntry(
     { textPreview: '울 집에 이렁거 있음' },
