@@ -83,8 +83,14 @@ const qualityIssueText = (record) => {
 };
 const audit = monitor.prefillQualityAudit || {};
 const auditItems = Array.isArray(audit.items) ? audit.items : [];
+const auditPendingItems = auditItems.filter((item) => item.status !== "posted");
 const auditPendingCount = Number(audit.pendingCount ?? auditItems.filter((item) => item.status !== "posted").length);
 const auditPendingFailedCount = Number(audit.pendingFailedCount ?? auditItems.filter((item) => item.status !== "posted" && !item.ok).length);
+const auditPendingScores = auditPendingItems.map((item) => Number(item.score)).filter(Number.isFinite);
+const auditPendingMinScore = auditPendingScores.length ? Math.min(...auditPendingScores) : null;
+const auditPendingAverageScore = auditPendingScores.length
+  ? Math.round(auditPendingScores.reduce((sum, score) => sum + score, 0) / auditPendingScores.length)
+  : null;
 const auditPostedCount = Number(audit.postedCount ?? auditItems.filter((item) => item.status === "posted").length);
 const auditPostedFailedCount = Number(audit.postedFailedCount ?? auditItems.filter((item) => item.status === "posted" && !item.ok).length);
 const auditPostedLegacyUnverifiableCount = Number(audit.postedLegacyUnverifiableCount ?? auditItems.filter((item) => (
@@ -114,13 +120,14 @@ const lines = [
   `- 기간: ${since.toISOString()} ~ ${until.toISOString()}`,
   `- 고유 Prefill: ${unique.length}개`,
   `- 게시: ${posted.length}개`,
-  `- 대기: ${pending.length}개`,
+  `- 기간 내 대기: ${pending.length}개`,
   `- 격리/실패: ${failed.length}개`,
   `- 범용성·근거 게이트 격리: ${genericityRejected.length}개`,
   `- 수동 개별 감사 격리: ${manualAuditRejected.length}개`,
   `- 근거 없는 구체 주장 격리: ${unsupportedClaimRejected.length}개`,
   `- 최근 개별 감사: ${Number(audit.checkedCount || 0)}개 검사 / ${Number(audit.failedCount || 0)}개 탈락`,
   `- 현재 대기 Prefill 감사: ${auditPendingCount}개 검사 / ${auditPendingFailedCount}개 탈락`,
+  `- 현재 대기 Prefill 독립심사 점수: 최저 ${auditPendingMinScore ?? "없음"}점 / 평균 ${auditPendingAverageScore ?? "없음"}점`,
   `- 이미 게시된 Prefill 자동 감사: ${auditPostedCount}개 검사 / ${auditPostedLegacyUnverifiableCount}개 레거시 스키마 미검증 / ${auditPostedQualityFailedCount}개 확정 품질 탈락`,
   `- 생성 완료 이벤트: ${eventCount("terafabx_comment_prefill_queued")}회`,
   `- 품질 격리: ${eventCount("terafabx_comment_monitor_prefill_quality_quarantined")}회 / ${eventSum("terafabx_comment_monitor_prefill_quality_quarantined")}개`,
