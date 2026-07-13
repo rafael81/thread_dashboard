@@ -341,7 +341,7 @@ test("own-post batch Gemini JSON parsing preserves review and final judge gates"
   assert.equal(reviewed[0].finalReply, "물 위를 걷는 느낌이라 더 신기하네요");
   assert.equal(reviewed[0].decision, "rewrite");
 
-  const judged = parseTerafabxGeminiBatchFinalJudge('[{"index":0,"context":38,"naturalness":24,"specificity":14,"concision":9,"non_ai_style":9,"fatal_error":false,"language_error":false,"awkward_korean":false,"translation_tone":false,"cliche":false,"context_error":false,"reason":"문맥과 자연스러움이 좋음"}]', [{ finalReply: reviewed[0].finalReply }]);
+  const judged = parseTerafabxGeminiBatchFinalJudge('[{"index":0,"context":38,"naturalness":24,"specificity":14,"concision":9,"non_ai_style":9,"fatal_error":false,"language_error":false,"awkward_korean":false,"translation_tone":false,"cliche":false,"context_error":false,"cross_post_reusable":false,"headline_tone":false,"specificity_error":false,"source_anchor":"물 위를 걷는","reason":"문맥과 자연스러움이 좋음"}]', [{ finalReply: reviewed[0].finalReply, target: { targetText: "물 위를 걷는 장면" } }]);
   assert.equal(judged[0].score, 94);
   assert.equal(judged[0].passed, true);
 

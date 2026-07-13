@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const {
   assessTerafabxCurrentCommentPolicy,
   assessTerafabxLanguageQuality,
+  auditTerafabxPrefillQuality,
   parseTerafabxFinalJudge,
   stripTerafabxListPrefix,
 } = require("../mirror_server");
@@ -65,4 +66,44 @@ test("structured Gemini flags are mandatory only for comments created after roll
   assert.equal(legacy.ok, true);
   assert.equal(current.ok, false);
   assert.ok(current.errors.includes("structured_quality_flags_missing"));
+});
+
+test("prefill audit checks every queued and posted item with the genericity gate", () => {
+  const goodJudge = {
+    passed: true,
+    fatalError: false,
+    qualityFlagsComplete: true,
+    genericityFlagsComplete: true,
+    sourceAnchorGrounded: true,
+    flaggedQualityIssues: [],
+    dimensions: { context: 38 },
+    score: 94,
+    sourceAnchor: "공동 계좌에서 2만 달러",
+    qualityFlags: { cross_post_reusable: false, headline_tone: false, specificity_error: false },
+  };
+  const audit = auditTerafabxPrefillQuality({
+    pendingCommentPosts: [{
+      source: "prefill",
+      status: "pending",
+      queuedAt: "2026-07-13T13:30:00.000Z",
+      targetUrl: "https://x.com/example/status/1",
+      comment: "공동 계좌에서 2만 달러면 신뢰가 흔들릴 만하네요",
+      geminiReview: { finalJudge: goodJudge },
+    }],
+    commentHistory: [{
+      source: "prefill",
+      status: "posted",
+      posted: true,
+      queuedAt: "2026-07-13T13:20:00.000Z",
+      postedAt: "2026-07-13T13:21:00.000Z",
+      targetUrl: "https://x.com/example/status/2",
+      comment: "폭로성 스캔들은 사실 확인이 먼저 필요합니다",
+      geminiReview: { finalJudge: { ...goodJudge, genericityFlagsComplete: false, sourceAnchorGrounded: false } },
+    }],
+  });
+
+  assert.equal(audit.checkedCount, 2);
+  assert.equal(audit.passedCount, 1);
+  assert.equal(audit.failedCount, 1);
+  assert.ok(audit.items.find((item) => !item.ok).errors.includes("genericity_quality_flags_missing"));
 });

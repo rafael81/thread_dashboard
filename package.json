@@ -9,6 +9,7 @@
     "import-runtime": "node scripts/import-runtime-state.js",
     "migrate:mac": "node scripts/mac-migration.js",
     "memory": "node scripts/ai-memory.js",
+    "report:prefill": "node scripts/prefill-quality-report.js",
     "mirror-server": "node mirror_server.js",
     "test": "node --test"
   },

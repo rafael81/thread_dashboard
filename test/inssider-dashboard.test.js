@@ -174,11 +174,32 @@ test('TerafabX final judge passes a natural specific reply at the quality thresh
     non_ai_style: 9,
     fatal_error: false,
     language_error: false, awkward_korean: false, translation_tone: false, cliche: false, context_error: false,
+    cross_post_reusable: false, headline_tone: false, specificity_error: false,
+    source_anchor: '주말 출근자들',
     reason: '원문의 주말 출근 응원에 짧고 자연스럽게 반응함',
-  }), '주말에도 일하시는 분들께 힘이 되는 말이네요. 따뜻한 응원 잘 보고 갑니다.');
+  }), '주말 출근자들에게 건넨 커피 응원이 딱 힘이 되겠네요', {
+    targetText: '주말 출근자들에게 커피 한 잔과 함께 힘내라는 응원을 보냅니다',
+  });
 
   assert.equal(result.score, 90);
   assert.equal(result.passed, true);
+});
+
+test('TerafabX final judge blocks a reusable headline-style prefill despite a perfect score', () => {
+  const result = parseTerafabxFinalJudge(JSON.stringify({
+    context: 40, naturalness: 25, specificity: 15, concision: 10, non_ai_style: 10,
+    fatal_error: false,
+    language_error: false, awkward_korean: false, translation_tone: false, cliche: false, context_error: false,
+    cross_post_reusable: true, headline_tone: true, specificity_error: true,
+    source_anchor: '결혼 사기 의혹',
+    reason: '다른 스캔들 글에도 붙는 기사 제목형 일반론',
+  }), '폭로성 스캔들은 사실 확인이 먼저 필요합니다', {
+    targetText: '결혼 사기 의혹과 임신 기간 중 교제 논란',
+  });
+
+  assert.equal(result.rawScore, 100);
+  assert.equal(result.passed, false);
+  assert.deepEqual(result.flaggedQualityIssues, ['cross_post_reusable', 'headline_tone', 'specificity_error']);
 });
 
 test('TerafabX final judge rejects a high total score when context is below the hard gate', () => {

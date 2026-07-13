@@ -49,6 +49,7 @@ const X_SCHEDULE_MONITOR_INTERVAL_MS = Number(process.env.X_SCHEDULE_MONITOR_INT
 const X_SCHEDULE_MONITOR_STATE_PATH = process.env.X_SCHEDULE_MONITOR_STATE_PATH || path.join(__dirname, ".data", "x-schedule-monitor-state.json");
 const TERAFABX_COMMENT_MONITOR_INTERVAL_MS = Number(process.env.TERAFABX_COMMENT_MONITOR_INTERVAL_MS || 10 * 60 * 1000);
 const TERAFABX_COMMENT_MONITOR_STATE_PATH = process.env.TERAFABX_COMMENT_MONITOR_STATE_PATH || path.join(__dirname, ".data", "terafabx-comment-monitor-state.json");
+const TERAFABX_PREFILL_GENERICITY_ROLLOUT_AT = Date.parse(process.env.TERAFABX_PREFILL_GENERICITY_ROLLOUT_AT || "2026-07-13T13:00:00.000Z");
 const TERAFABX_OWN_POST_REPLY_INTERVAL_MS = Number(process.env.TERAFABX_OWN_POST_REPLY_INTERVAL_MS || 10 * 60 * 1000);
 const TERAFABX_OWN_POST_REPLY_MAX_SCROLLS = Number(process.env.TERAFABX_OWN_POST_REPLY_MAX_SCROLLS || 20);
 const TERAFABX_BROWSER_CONCURRENCY_CAP = 5;
@@ -2090,6 +2091,10 @@ function terafabxGeminiBatchFinalJudgePrompt(items = []) {
     "오기·오타·조사 오류·문법 오류·불완전한 종결어미·번역체를 발견하면 reason에 문제 구절을 그대로 적고 naturalness를 최대 10점으로 제한해라.",
     "상투적 덕담이나 AI식 추상 요약체를 발견하면 non_ai_style을 최대 4점으로 제한해라.",
     "'진짜 신기하게', '딱 보이지 않나요', '계속 보게 되네요'처럼 여러 댓글에 반복될 법한 감탄 템플릿은 non_ai_style에서 크게 감점해라.",
+    "Grok 분석의 대응 조언을 사실 근거로 취급하지 마라. source_anchor에는 반드시 원문 또는 부모 원글에 실제로 적힌 고유 명사·숫자·행동 구절을 원문 그대로 적어라.",
+    "댓글이 같은 분야의 다른 글에도 그대로 붙을 수 있으면 cross_post_reusable=true다. 예: '폭로성 스캔들은 사실 확인이 먼저 필요합니다'처럼 일반 원칙만 말하는 문장.",
+    "대화형 반응이 아니라 기사 제목·안전 표어·교훈 문장처럼 들리면 headline_tone=true다.",
+    "댓글이 source_anchor의 구체적인 대상을 실제로 언급하거나 명확히 가리키지 않으면 specificity_error=true다.",
     "fatal_error는 대상 혼동, 원문과 반대되는 말, 사실 날조, 민감·금지 표현이 있을 때 true다.",
     "language_error는 오기·오타·맞춤법·조사·문법·불완전한 종결어미가 있으면 true다.",
     "awkward_korean은 뜻은 통하지만 한국어 구어체로 어색하거나 명사 연결이 부자연스러우면 true다.",
@@ -2097,7 +2102,7 @@ function terafabxGeminiBatchFinalJudgePrompt(items = []) {
     "cliche는 범용 덕담·추상적 감탄·다른 글에도 붙일 수 있는 AI식 요약체면 true다.",
     "context_error는 원문과 어긋나거나 이미 보이는 대상을 모르는 듯 묻거나 사실을 추측하면 true다.",
     "부모 원글에 대상이나 장면이 이미 드러났는데도 댓글이 누구·무엇·어떤 대상인지 모르는 듯 되물으면 대상 혼동으로 보고 fatal_error=true로 판정해라.",
-    "반드시 JSON 배열 한 줄만 출력해라. 모든 boolean 필드를 빠짐없이 포함해라. 형식: [{\"index\":0,\"context\":0,\"naturalness\":0,\"specificity\":0,\"concision\":0,\"non_ai_style\":0,\"fatal_error\":false,\"language_error\":false,\"awkward_korean\":false,\"translation_tone\":false,\"cliche\":false,\"context_error\":false,\"reason\":\"짧은 이유\"}]",
+    "반드시 JSON 배열 한 줄만 출력해라. 모든 필드를 빠짐없이 포함해라. 형식: [{\"index\":0,\"context\":0,\"naturalness\":0,\"specificity\":0,\"concision\":0,\"non_ai_style\":0,\"fatal_error\":false,\"language_error\":false,\"awkward_korean\":false,\"translation_tone\":false,\"cliche\":false,\"context_error\":false,\"cross_post_reusable\":false,\"headline_tone\":false,\"specificity_error\":false,\"source_anchor\":\"원문에 실제로 있는 구절\",\"reason\":\"짧은 이유\"}]",
     "",
     blocks,
   ].join("\n");
@@ -2302,6 +2307,9 @@ function terafabxFinalJudgePrompt(target, grokInput, finalReply) {
     "오기·오타·조사 오류·문법 오류·불완전한 종결어미·번역체를 발견하면 reason에 문제 구절을 그대로 적고 naturalness를 최대 10점으로 제한해라.",
     "상투적 덕담이나 AI식 추상 요약체를 발견하면 non_ai_style을 최대 4점으로 제한해라.",
     "'진짜 신기하게', '딱 보이지 않나요', '계속 보게 되네요'처럼 여러 댓글에 반복될 법한 감탄 템플릿은 non_ai_style에서 크게 감점해라.",
+    "Grok 분석의 대응 조언을 사실 근거로 취급하지 마라. source_anchor에는 반드시 원문 또는 부모 원글에 실제로 적힌 고유 명사·숫자·행동 구절을 원문 그대로 적어라.",
+    "댓글이 같은 분야의 다른 글에도 그대로 붙을 수 있으면 cross_post_reusable=true다. 기사 제목·표어·교훈 문장처럼 들리면 headline_tone=true다.",
+    "댓글이 source_anchor의 구체적인 대상을 실제로 언급하거나 명확히 가리키지 않으면 specificity_error=true다.",
     "fatal_error는 대상 혼동, 원문과 반대되는 말, 사실 날조, 민감·금지 표현이 있을 때 true다.",
     "language_error는 오기·오타·맞춤법·조사·문법·불완전한 종결어미가 있으면 true다.",
     "awkward_korean은 뜻은 통하지만 한국어 구어체로 어색하거나 명사 연결이 부자연스러우면 true다.",
@@ -2309,7 +2317,7 @@ function terafabxFinalJudgePrompt(target, grokInput, finalReply) {
     "cliche는 범용 덕담·추상적 감탄·다른 글에도 붙일 수 있는 AI식 요약체면 true다.",
     "context_error는 원문과 어긋나거나 이미 보이는 대상을 모르는 듯 묻거나 사실을 추측하면 true다.",
     "부모 원글에 대상이나 장면이 이미 드러났는데도 댓글이 누구·무엇·어떤 대상인지 모르는 듯 되물으면 대상 혼동으로 보고 fatal_error=true로 판정해라.",
-    "반드시 JSON 한 줄만 출력해라. 모든 boolean 필드를 빠짐없이 포함해라. 형식: {\"context\":0,\"naturalness\":0,\"specificity\":0,\"concision\":0,\"non_ai_style\":0,\"fatal_error\":false,\"language_error\":false,\"awkward_korean\":false,\"translation_tone\":false,\"cliche\":false,\"context_error\":false,\"reason\":\"짧은 이유\"}",
+    "반드시 JSON 한 줄만 출력해라. 모든 필드를 빠짐없이 포함해라. 형식: {\"context\":0,\"naturalness\":0,\"specificity\":0,\"concision\":0,\"non_ai_style\":0,\"fatal_error\":false,\"language_error\":false,\"awkward_korean\":false,\"translation_tone\":false,\"cliche\":false,\"context_error\":false,\"cross_post_reusable\":false,\"headline_tone\":false,\"specificity_error\":false,\"source_anchor\":\"원문에 실제로 있는 구절\",\"reason\":\"짧은 이유\"}",
     "",
     ...terafabxPromptContextLines(target),
     `원문 분석: ${grok.contextSummary || "제공 없음"}`,
@@ -2329,9 +2337,11 @@ function normalizeTerafabxFinalJudgeParsed(parsed, finalReply, rawPreview = "") 
   const rawScore = Object.values(dimensions).reduce((sum, value) => sum + value, 0);
   const score = rawScore;
   const qualityFlagKeys = ["language_error", "awkward_korean", "translation_tone", "cliche", "context_error"];
+  const genericityFlagKeys = ["cross_post_reusable", "headline_tone", "specificity_error"];
   const qualityFlagsComplete = qualityFlagKeys.every((key) => typeof parsed[key] === "boolean");
-  const qualityFlags = Object.fromEntries(qualityFlagKeys.map((key) => [key, parsed[key] === true]));
-  const flaggedQualityIssues = qualityFlagKeys.filter((key) => qualityFlags[key]);
+  const genericityFlagsComplete = genericityFlagKeys.every((key) => typeof parsed[key] === "boolean") && cleanSocialText(parsed.source_anchor || "").length > 0;
+  const qualityFlags = Object.fromEntries([...qualityFlagKeys, ...genericityFlagKeys].map((key) => [key, parsed[key] === true]));
+  const flaggedQualityIssues = [...qualityFlagKeys, ...genericityFlagKeys].filter((key) => qualityFlags[key]);
   const fatalError = parsed.fatal_error === true;
   const languageQuality = assessTerafabxLanguageQuality(finalReply);
   return {
@@ -2341,20 +2351,38 @@ function normalizeTerafabxFinalJudgeParsed(parsed, finalReply, rawPreview = "") 
     clicheMatches: cliche.matches,
     score,
     contextPassed: dimensions.context >= 30,
-    passed: qualityFlagsComplete && !fatalError && flaggedQualityIssues.length === 0 && languageQuality.ok && dimensions.context >= 30 && score >= 85,
+    passed: qualityFlagsComplete && genericityFlagsComplete && !fatalError && flaggedQualityIssues.length === 0 && languageQuality.ok && dimensions.context >= 30 && score >= 85,
     fatalError,
     qualityFlagsComplete,
+    genericityFlagsComplete,
     qualityFlags,
     flaggedQualityIssues,
+    sourceAnchor: cleanSocialText(parsed.source_anchor || ""),
     languageQuality,
     reason: cleanSocialText(parsed.reason || ""),
     rawPreview: String(rawPreview || "").slice(0, 1200),
   };
 }
 
-function parseTerafabxFinalJudge(raw, finalReply) {
+function applyTerafabxJudgeSourceGrounding(judge, target = null) {
+  if (!target) return judge;
+  const source = cleanSocialText([target.rootPostText, target.targetText, target.text].filter(Boolean).join(" ")).toLowerCase();
+  const anchor = cleanSocialText(judge.sourceAnchor || "").toLowerCase();
+  const sourceAnchorGrounded = Boolean(source && anchor && source.includes(anchor));
+  const flaggedQualityIssues = sourceAnchorGrounded
+    ? judge.flaggedQualityIssues
+    : [...new Set([...(judge.flaggedQualityIssues || []), "source_anchor_unverifiable"])];
+  return {
+    ...judge,
+    sourceAnchorGrounded,
+    flaggedQualityIssues,
+    passed: Boolean(judge.passed && sourceAnchorGrounded),
+  };
+}
+
+function parseTerafabxFinalJudge(raw, finalReply, target = null) {
   const parsed = JSON.parse(extractJsonObjectText(raw));
-  return normalizeTerafabxFinalJudgeParsed(parsed, finalReply, raw);
+  return applyTerafabxJudgeSourceGrounding(normalizeTerafabxFinalJudgeParsed(parsed, finalReply, raw), target);
 }
 
 function parseTerafabxGeminiBatchFinalJudge(raw, judgedItems = []) {
@@ -2365,11 +2393,11 @@ function parseTerafabxGeminiBatchFinalJudge(raw, judgedItems = []) {
     const index = terafabxBatchResultIndex(row, fallbackIndex, expectedCount || rows.length);
     if (mapped.has(index)) throw new Error(`Gemini 묶음 최종심사 결과 index 중복: ${index}`);
     const finalReply = judgedItems[index]?.finalReply || judgedItems[index]?.review?.finalReply || judgedItems[index]?.prepared?.comment || "";
-    mapped.set(index, {
+    mapped.set(index, applyTerafabxJudgeSourceGrounding({
       index,
       ...normalizeTerafabxFinalJudgeParsed(row, finalReply, raw),
       raw: row,
-    });
+    }, judgedItems[index]?.target || judgedItems[index]?.prepared?.target || null));
   });
   return Array.from({ length: expectedCount || rows.length }, (_, index) => {
     if (!mapped.has(index)) throw new Error(`Gemini 묶음 최종심사 결과 누락: index=${index}`);
@@ -2405,7 +2433,7 @@ async function judgeTerafabxReplyWithGeminiHeadless(target, grokInput, finalRepl
     if (result.code !== 0) throw new Error(result.stderr || result.stdout || "Gemini Web 최종 심사 실패");
     if (!fs.existsSync(outPath)) throw new Error("Gemini Web 최종 심사 출력 파일이 생성되지 않았습니다.");
     const raw = fs.readFileSync(outPath, "utf8");
-    const judged = parseTerafabxFinalJudge(raw, finalReply);
+    const judged = parseTerafabxFinalJudge(raw, finalReply, target);
     logEvent("terafabx_gemini_final_judge_ok", { targetUrl: target.url, finalReply, runDir, ...judged });
     if (!judged.passed) {
       throw new Error(`Gemini 최종 심사 탈락: ${judged.score}점${judged.fatalError ? " (치명적 오류)" : ""} - ${judged.reason || "품질 기준 미달"}`);
@@ -3411,7 +3439,22 @@ async function discoverTerafabxCommentTargetsUnlocked(limit = 1) {
 async function discoverTerafabxCommentTargets(limit = 1) {
   return withTerafabxCommentXLock(
     "comment-target-discovery",
-    () => discoverTerafabxCommentTargetsUnlocked(limit),
+    async () => {
+      let lastError = null;
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        try {
+          return await discoverTerafabxCommentTargetsUnlocked(limit);
+        } catch (error) {
+          lastError = error;
+          const retryable = /X home 로딩 실패|Runtime\.evaluate timed out|Chrome 9236 시작 대기 실패/i.test(error.message);
+          logEvent("terafabx_comment_target_discovery_attempt_error", { attempt, retryable, error: error.message });
+          if (!retryable || attempt >= 2) throw error;
+          await closeTerafabxCommentXHeadlessBrowser().catch(() => null);
+          await sleep(2_000);
+        }
+      }
+      throw lastError || new Error("댓글 대상 수집 실패");
+    },
     { wait: true, timeoutMs: 10 * 60 * 1000 },
   );
 }
@@ -6577,9 +6620,21 @@ function assessTerafabxCurrentCommentPolicy(record) {
   const recordCreatedAt = Date.parse(record?.queuedAt || record?.at || record?.postedAt || "");
   const requiresStructuredQuality = !Number.isFinite(recordCreatedAt) || recordCreatedAt >= structuredQualityRolloutAt;
   if (requiresStructuredQuality && finalJudge?.qualityFlagsComplete !== true) errors.push("structured_quality_flags_missing");
+  const requiresGenericityQuality = record?.source === "prefill"
+    && (!Number.isFinite(recordCreatedAt) || recordCreatedAt >= TERAFABX_PREFILL_GENERICITY_ROLLOUT_AT);
+  if (requiresGenericityQuality && finalJudge?.genericityFlagsComplete !== true) errors.push("genericity_quality_flags_missing");
+  if (requiresGenericityQuality && finalJudge?.sourceAnchorGrounded !== true) errors.push("source_anchor_unverifiable");
   for (const issue of finalJudge?.flaggedQualityIssues || []) errors.push(`gemini_quality:${issue}`);
   if (finalJudge?.passed !== true) errors.push("independent_judge_not_passed");
-  return { ok: errors.length === 0, errors: [...new Set(errors)], length, context: Number.isFinite(context) ? context : null, languageQuality, requiresStructuredQuality };
+  return {
+    ok: errors.length === 0,
+    errors: [...new Set(errors)],
+    length,
+    context: Number.isFinite(context) ? context : null,
+    languageQuality,
+    requiresStructuredQuality,
+    requiresGenericityQuality,
+  };
 }
 
 function assessTerafabxCommentReviewRecord(record, minScore = TERAFABX_REVIEW_COMMENT_MIN_SCORE) {
@@ -7439,6 +7494,77 @@ function quarantineExhaustedTerafabxPendingComments(state = loadTerafabxState())
   return { count: exhausted.length, remainingCount: remaining.length };
 }
 
+function auditTerafabxPrefillQuality(state = loadTerafabxState(), options = {}) {
+  const sinceMs = Number(options.sinceMs || TERAFABX_PREFILL_GENERICITY_ROLLOUT_AT);
+  const limit = Math.max(1, Number(options.limit || 500));
+  const pending = pendingTerafabxCommentPosts(state)
+    .filter((item) => item?.source === "prefill");
+  const posted = (state.commentHistory || [])
+    .filter((item) => item?.source === "prefill")
+    .filter((item) => terafabxCommentRecordTime(item) >= sinceMs);
+  const seen = new Set();
+  const items = [...pending, ...posted].flatMap((record) => {
+    const key = `${normalizeXStatusUrl(record.targetUrl || "")}|${record.queuedAt || record.at || ""}`;
+    if (seen.has(key)) return [];
+    seen.add(key);
+    const policy = assessTerafabxCurrentCommentPolicy(record);
+    return [{
+      key,
+      targetUrl: normalizeXStatusUrl(record.targetUrl || ""),
+      comment: cleanSocialText(record.comment || ""),
+      source: record.source,
+      status: record.status || (record.posted ? "posted" : "pending"),
+      queuedAt: record.queuedAt || null,
+      postedAt: record.postedAt || record.at || null,
+      replyUrl: record.replyUrl || null,
+      score: Number.isFinite(Number(record.geminiReview?.finalJudge?.score)) ? Number(record.geminiReview.finalJudge.score) : null,
+      sourceAnchor: record.geminiReview?.finalJudge?.sourceAnchor || null,
+      sourceAnchorGrounded: record.geminiReview?.finalJudge?.sourceAnchorGrounded === true,
+      genericityFlags: record.geminiReview?.finalJudge?.qualityFlags || {},
+      ok: policy.ok,
+      errors: policy.errors,
+    }];
+  }).slice(0, limit);
+  return {
+    checkedAt: new Date().toISOString(),
+    since: new Date(sinceMs).toISOString(),
+    checkedCount: items.length,
+    passedCount: items.filter((item) => item.ok).length,
+    failedCount: items.filter((item) => !item.ok).length,
+    pendingCount: items.filter((item) => item.status !== "posted").length,
+    postedCount: items.filter((item) => item.status === "posted").length,
+    items,
+  };
+}
+
+function quarantineInvalidTerafabxPrefillComments(state = loadTerafabxState()) {
+  const failedAt = new Date().toISOString();
+  const rejected = [];
+  const remaining = pendingTerafabxCommentPosts(state).filter((item) => {
+    if (item?.source !== "prefill") return true;
+    const createdAt = Date.parse(item.queuedAt || item.at || "");
+    if (Number.isFinite(createdAt) && createdAt < TERAFABX_PREFILL_GENERICITY_ROLLOUT_AT) return true;
+    const policy = assessTerafabxCurrentCommentPolicy(item);
+    if (policy.ok) return true;
+    rejected.push({
+      ...item,
+      status: "error",
+      errorAt: failedAt,
+      failedReason: "monitor_prefill_quality_gate",
+      lastError: policy.errors.join(","),
+    });
+    return false;
+  });
+  if (!rejected.length) return { count: 0, remainingCount: remaining.length, errors: [] };
+  saveTerafabxState({
+    pendingCommentPosts: remaining,
+    failedPendingCommentPosts: [...rejected, ...(state.failedPendingCommentPosts || [])].slice(0, 300),
+  });
+  const errors = [...new Set(rejected.flatMap((item) => String(item.lastError || "").split(",").filter(Boolean)))];
+  logEvent("terafabx_comment_monitor_prefill_quality_quarantined", { count: rejected.length, remainingCount: remaining.length, errors });
+  return { count: rejected.length, remainingCount: remaining.length, errors };
+}
+
 async function runTerafabxCommentMonitor(options = {}) {
   if (terafabxCommentMonitorBusy) {
     return { ok: false, skipped: true, status: "skipped_busy", monitor: loadTerafabxCommentMonitorState() };
@@ -7449,6 +7575,9 @@ async function runTerafabxCommentMonitor(options = {}) {
     let state = loadTerafabxState();
     const quarantine = quarantineExhaustedTerafabxPendingComments(state);
     if (quarantine.count) state = loadTerafabxState();
+    const prefillQualityAudit = auditTerafabxPrefillQuality(state);
+    const prefillQualityQuarantine = quarantineInvalidTerafabxPrefillComments(state);
+    if (prefillQualityQuarantine.count) state = loadTerafabxState();
     const schedulerStartedMs = new Date(terafabxSchedulerStartedAt || 0).getTime();
     const evaluation = evaluateTerafabxCommentWorkflow(state, {
       now: options.now,
@@ -7465,6 +7594,11 @@ async function runTerafabxCommentMonitor(options = {}) {
     };
     const actions = [];
     if (quarantine.count) actions.push({ type: "quarantine_exhausted_pending", count: quarantine.count });
+    if (prefillQualityQuarantine.count) actions.push({
+      type: "quarantine_prefill_quality",
+      count: prefillQualityQuarantine.count,
+      errors: prefillQualityQuarantine.errors,
+    });
     if (shouldTerafabxCommentMonitorRequestPrefill(state, evaluation, {
       targetCount: TERAFABX_COMMENT_PREFILL_TARGET,
       prefillBusy: terafabxCommentPrefillBusy,
@@ -7490,6 +7624,7 @@ async function runTerafabxCommentMonitor(options = {}) {
       ...evaluation,
       runtime,
       actions,
+      prefillQualityAudit,
     };
     saveTerafabxCommentMonitorState({
       lastRunAt: completedAt,
@@ -7503,6 +7638,7 @@ async function runTerafabxCommentMonitor(options = {}) {
       actions,
       runtime,
       qualityFeedback: result.qualityFeedback,
+      prefillQualityAudit,
     });
     logEvent("terafabx_comment_monitor_complete", result);
     return result;
@@ -13230,6 +13366,7 @@ module.exports = {
   evaluateTerafabxCommentWorkflow,
   shouldTerafabxCommentMonitorRequestPrefill,
   assessTerafabxCurrentCommentPolicy,
+  auditTerafabxPrefillQuality,
   assessTerafabxLanguageQuality,
   stripTerafabxListPrefix,
   classifyTerafabxOwnPostReplies,
