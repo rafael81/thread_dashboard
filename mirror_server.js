@@ -165,6 +165,8 @@ let terafabxOwnPostReplyBusy = false;
 let terafabxOwnPostReplySchedulerBusy = false;
 let terafabxCommentPrefillBusy = false;
 let terafabxCommentPrefillLastStartedAt = 0;
+let terafabxCommentPrefillDeferredTimer = null;
+let terafabxCommentPrefillDeferredAt = 0;
 let terafabxSchedulerBusy = false;
 let terafabxCommentSchedulerBusy = false;
 let terafabxSchedulerStartedAt = null;
@@ -6790,20 +6792,44 @@ async function runTerafabxCommentPrefillQueue({ manual = false, targetCount = TE
   }
 }
 
+function terafabxCommentPrefillCooldownDelay(lastStartedAt = terafabxCommentPrefillLastStartedAt, nowMs = Date.now()) {
+  const elapsed = Math.max(0, Number(nowMs) - Math.max(0, Number(lastStartedAt) || 0));
+  return Math.max(0, TERAFABX_COMMENT_MONITOR_INTERVAL_MS - elapsed);
+}
+
 function maybeStartTerafabxCommentPrefill(reason = "tick") {
   const state = loadTerafabxState();
-  if (!state.commentEnabled) return;
-  if (terafabxDailyCommentProgress(state).reached) return;
-  if (terafabxManualActionPending) return;
+  if (!state.commentEnabled) return { scheduled: false, skipped: "comment_disabled" };
+  if (terafabxDailyCommentProgress(state).reached) return { scheduled: false, skipped: "daily_target_reached" };
+  if (terafabxManualActionPending) return { scheduled: false, skipped: "manual_pending" };
   const pendingCount = pendingTerafabxCommentPosts(state).length;
-  if (pendingCount >= TERAFABX_COMMENT_PREFILL_TARGET) return;
-  if (terafabxCommentPrefillBusy) return;
-  if (Date.now() - terafabxCommentPrefillLastStartedAt < TERAFABX_COMMENT_MONITOR_INTERVAL_MS) return;
-  setTimeout(() => {
+  if (pendingCount >= TERAFABX_COMMENT_PREFILL_TARGET) return { scheduled: false, skipped: "target_reached" };
+  if (terafabxCommentPrefillBusy) return { scheduled: false, skipped: "busy" };
+  if (terafabxCommentPrefillDeferredTimer) {
+    return {
+      scheduled: true,
+      reused: true,
+      delayMs: Math.max(0, terafabxCommentPrefillDeferredAt - Date.now()),
+      scheduledFor: new Date(terafabxCommentPrefillDeferredAt).toISOString(),
+    };
+  }
+  const delayMs = terafabxCommentPrefillCooldownDelay();
+  terafabxCommentPrefillDeferredAt = Date.now() + delayMs;
+  terafabxCommentPrefillDeferredTimer = setTimeout(() => {
+    terafabxCommentPrefillDeferredTimer = null;
+    terafabxCommentPrefillDeferredAt = 0;
+    if (delayMs > 0) {
+      maybeStartTerafabxCommentPrefill(`${reason}_cooldown_ready`);
+      return;
+    }
     runTerafabxCommentPrefillQueue({ manual: false })
       .then((result) => logEvent("terafabx_comment_prefill_background_done", { reason, ...result }))
       .catch((error) => logEvent("terafabx_comment_prefill_background_error", { reason, error: error.message }));
-  }, 0);
+  }, delayMs);
+  terafabxCommentPrefillDeferredTimer.unref?.();
+  const scheduledFor = new Date(terafabxCommentPrefillDeferredAt).toISOString();
+  logEvent("terafabx_comment_prefill_scheduled", { reason, pendingCount, delayMs, scheduledFor });
+  return { scheduled: true, reused: false, delayMs, scheduledFor };
 }
 
 function isTerafabxPendingCommentEligible(item = {}, nowMs = Date.now()) {
@@ -7441,6 +7467,8 @@ function getTerafabxAutomationStatus() {
     manualActionPending: terafabxManualActionPending,
     commentPrefill: {
       busy: terafabxCommentPrefillBusy,
+      scheduled: Boolean(terafabxCommentPrefillDeferredTimer),
+      scheduledFor: terafabxCommentPrefillDeferredAt ? new Date(terafabxCommentPrefillDeferredAt).toISOString() : null,
       targetCount: TERAFABX_COMMENT_PREFILL_TARGET,
       concurrency: TERAFABX_COMMENT_PREFILL_CONCURRENCY,
       geminiPortBase: TERAFABX_COMMENT_PREFILL_GEMINI_PORT_BASE,
@@ -8034,8 +8062,18 @@ async function runTerafabxCommentMonitor(options = {}) {
       prefillBusy: terafabxCommentPrefillBusy,
       manualActionPending: terafabxManualActionPending,
     })) {
-      maybeStartTerafabxCommentPrefill("comment_monitor");
-      actions.push({ type: "prefill_requested", pendingCount: evaluation.pendingCount, targetCount: TERAFABX_COMMENT_PREFILL_TARGET, quiet: evaluation.quiet });
+      const request = maybeStartTerafabxCommentPrefill("comment_monitor");
+      if (request?.scheduled) {
+        actions.push({
+          type: Number(request.delayMs || 0) > 0 ? "prefill_scheduled" : "prefill_requested",
+          pendingCount: evaluation.pendingCount,
+          targetCount: TERAFABX_COMMENT_PREFILL_TARGET,
+          quiet: evaluation.quiet,
+          delayMs: Number(request.delayMs || 0),
+          scheduledFor: request.scheduledFor || null,
+          reused: Boolean(request.reused),
+        });
+      }
     }
     const overdue = evaluation.postedInWindow < evaluation.targetInWindow;
     if (state.commentEnabled && !evaluation.quiet && overdue && evaluation.pendingCount > 0 && !terafabxBusy && !terafabxSchedulerBusy && !terafabxManualActionPending) {
@@ -13855,6 +13893,7 @@ module.exports = {
   mirrorHistoryPublishedTime,
   isTerafabxQuietPostingTime,
   terafabxDailyCommentProgress,
+  terafabxCommentPrefillCooldownDelay,
   deriveTerafabxCommentQualityFeedback,
   evaluateTerafabxCommentWorkflow,
   shouldTerafabxCommentMonitorRequestPrefill,

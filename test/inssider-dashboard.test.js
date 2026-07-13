@@ -13,6 +13,7 @@ const {
   isPublishedDiscoveryRow,
   isTerafabxQuietPostingTime,
   terafabxDailyCommentProgress,
+  terafabxCommentPrefillCooldownDelay,
   parseTerafabxFinalJudge,
   scoreTerafabxClichePenalty,
   selectRootPostMediaCandidates,
@@ -162,6 +163,13 @@ test('TerafabX quiet posting window blocks 01:00-07:00 KST only', () => {
   assert.equal(isTerafabxQuietPostingTime(new Date('2026-07-04T16:00:00.000Z')), true); // 01:00 KST
   assert.equal(isTerafabxQuietPostingTime(new Date('2026-07-04T21:59:00.000Z')), true); // 06:59 KST
   assert.equal(isTerafabxQuietPostingTime(new Date('2026-07-04T22:00:00.000Z')), false); // 07:00 KST
+});
+
+test('TerafabX prefill cooldown schedules the exact remaining delay', () => {
+  const now = Date.parse('2026-07-13T16:43:50.000Z');
+  const startedAt = Date.parse('2026-07-13T16:34:35.000Z');
+  assert.equal(terafabxCommentPrefillCooldownDelay(startedAt, now), 45_000);
+  assert.equal(terafabxCommentPrefillCooldownDelay(startedAt, now + 45_000), 0);
 });
 
 test('TerafabX final judge lets structured Gemini cliche flags override a perfect score', () => {
