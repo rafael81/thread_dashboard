@@ -1048,6 +1048,15 @@ function loadTerafabxState() {
     lastComment: null,
     lastCommentTarget: null,
     lastReplyUrl: null,
+    lastCommentPrefillRunAt: null,
+    lastCommentPrefillStatus: null,
+    lastCommentPrefillError: null,
+    lastCommentPrefillRequested: 0,
+    lastCommentPrefillSelected: 0,
+    lastCommentPrefillQueued: 0,
+    lastCommentPrefillFailed: 0,
+    lastCommentPrefillPendingCount: 0,
+    lastCommentPrefillQuotaLimited: false,
     commentHistory: [],
     pendingCommentPosts: [],
     seenTargets: [],
@@ -6597,7 +6606,20 @@ async function runTerafabxCommentPrefillQueue({ manual = false, targetCount = TE
     const missing = Math.max(0, target - currentPending.length);
     const workerCount = terafabxBrowserConcurrency(concurrency, missing);
     logEvent("terafabx_comment_prefill_start", { manual, pendingCount: currentPending.length, targetCount: target, missing, concurrency: workerCount });
-    if (missing <= 0) return { ok: true, action: "comment-prefill", queued: 0, pendingCount: currentPending.length };
+    if (missing <= 0) {
+      saveTerafabxState({
+        lastCommentPrefillRunAt: new Date().toISOString(),
+        lastCommentPrefillStatus: "ok",
+        lastCommentPrefillError: null,
+        lastCommentPrefillRequested: 0,
+        lastCommentPrefillSelected: 0,
+        lastCommentPrefillQueued: 0,
+        lastCommentPrefillFailed: 0,
+        lastCommentPrefillPendingCount: currentPending.length,
+        lastCommentPrefillQuotaLimited: false,
+      });
+      return { ok: true, action: "comment-prefill", queued: 0, pendingCount: currentPending.length };
+    }
     workerResources = await prepareTerafabxCommentPrefillWorkers(workerCount);
     const targets = await discoverTerafabxCommentTargets(missing);
     const selected = targets.slice(0, missing);
@@ -6665,9 +6687,36 @@ async function runTerafabxCommentPrefillQueue({ manual = false, targetCount = TE
     }
     const queued = results.filter((item) => item.ok);
     const failed = results.filter((item) => !item.ok);
-    logEvent("terafabx_comment_prefill_done", { startedAt, requested: missing, selected: selected.length, queued: queued.length, failed: failed.length, pendingCount: pendingTerafabxCommentPosts().length });
-    return { ok: failed.length === 0, action: "comment-prefill", requested: missing, selected: selected.length, queued, failed, pendingCount: pendingTerafabxCommentPosts().length };
+    const pendingCount = pendingTerafabxCommentPosts().length;
+    const failureErrors = [...new Set(failed.map((item) => String(item.error || item.reason || "").trim()).filter(Boolean))];
+    const quotaLimited = failureErrors.some((error) => /grok.*(?:limit|한도)|(?:limit|한도).*grok|limit 문구/i.test(error));
+    const status = failed.length === 0 ? "ok" : queued.length > 0 ? "degraded" : "error";
+    const lastError = failureErrors.join(" · ").slice(0, 500) || null;
+    saveTerafabxState({
+      lastCommentPrefillRunAt: new Date().toISOString(),
+      lastCommentPrefillStatus: status,
+      lastCommentPrefillError: lastError,
+      lastCommentPrefillRequested: missing,
+      lastCommentPrefillSelected: selected.length,
+      lastCommentPrefillQueued: queued.length,
+      lastCommentPrefillFailed: failed.length,
+      lastCommentPrefillPendingCount: pendingCount,
+      lastCommentPrefillQuotaLimited: quotaLimited,
+    });
+    logEvent("terafabx_comment_prefill_done", { startedAt, requested: missing, selected: selected.length, queued: queued.length, failed: failed.length, pendingCount, status, quotaLimited, error: lastError });
+    return { ok: failed.length === 0, action: "comment-prefill", requested: missing, selected: selected.length, queued, failed, pendingCount, status, quotaLimited, error: lastError };
   } catch (error) {
+    saveTerafabxState({
+      lastCommentPrefillRunAt: new Date().toISOString(),
+      lastCommentPrefillStatus: "error",
+      lastCommentPrefillError: error.message,
+      lastCommentPrefillRequested: 0,
+      lastCommentPrefillSelected: 0,
+      lastCommentPrefillQueued: 0,
+      lastCommentPrefillFailed: 0,
+      lastCommentPrefillPendingCount: pendingTerafabxCommentPosts().length,
+      lastCommentPrefillQuotaLimited: /grok.*(?:limit|한도)|(?:limit|한도).*grok|limit 문구/i.test(error.message),
+    });
     logEvent("terafabx_comment_prefill_error", { startedAt, error: error.message });
     return { ok: false, action: "comment-prefill", error: error.message };
   } finally {
@@ -7324,6 +7373,15 @@ function getTerafabxAutomationStatus() {
       targetCount: TERAFABX_COMMENT_PREFILL_TARGET,
       concurrency: TERAFABX_COMMENT_PREFILL_CONCURRENCY,
       geminiPortBase: TERAFABX_COMMENT_PREFILL_GEMINI_PORT_BASE,
+      lastRunAt: state.lastCommentPrefillRunAt,
+      lastStatus: state.lastCommentPrefillStatus,
+      lastError: state.lastCommentPrefillError,
+      requested: Number(state.lastCommentPrefillRequested || 0),
+      selected: Number(state.lastCommentPrefillSelected || 0),
+      queued: Number(state.lastCommentPrefillQueued || 0),
+      failed: Number(state.lastCommentPrefillFailed || 0),
+      pendingCount: Number(state.lastCommentPrefillPendingCount || pendingCommentPosts.length),
+      quotaLimited: Boolean(state.lastCommentPrefillQuotaLimited),
     },
     commentMonitor: loadTerafabxCommentMonitorState(),
     jobGapMs: TERAFABX_JOB_GAP_MS,
@@ -7872,6 +7930,17 @@ async function runTerafabxCommentMonitor(options = {}) {
       now: options.now,
       schedulerBusyAgeMs: terafabxSchedulerBusy && Number.isFinite(schedulerStartedMs) ? Math.max(0, Date.now() - schedulerStartedMs) : 0,
     });
+    const lastPrefillRunMs = Date.parse(state.lastCommentPrefillRunAt || "");
+    if (state.lastCommentPrefillStatus === "error" && Number.isFinite(lastPrefillRunMs) && Date.now() - lastPrefillRunMs <= 30 * 60 * 1000) {
+      evaluation.findings.push({
+        type: state.lastCommentPrefillQuotaLimited ? "grok_quota_limited" : "prefill_generation_error",
+        severity: "error",
+        error: state.lastCommentPrefillError || "Prefill 생성 실패",
+        selected: Number(state.lastCommentPrefillSelected || 0),
+        failed: Number(state.lastCommentPrefillFailed || 0),
+      });
+      evaluation.status = "degraded";
+    }
     const runtime = {
       mainBusy: terafabxBusy,
       schedulerBusy: terafabxSchedulerBusy,

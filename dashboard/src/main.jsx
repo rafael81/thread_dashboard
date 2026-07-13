@@ -1711,6 +1711,19 @@ function Dashboard() {
                             오늘 {compact(data?.terafabx?.comment?.daily?.postedToday)} / {compact(data?.terafabx?.comment?.daily?.dailyTarget || 500)}개
                             {` · 남은 ${compact(data?.terafabx?.comment?.daily?.remaining)} · 간격 ${compact(Math.round(Number(data?.terafabx?.comment?.intervalMs || 0) / 1000))}초`}
                           </p>
+                          <p className={`text-xs ${data?.terafabx?.commentPrefill?.quotaLimited ? "text-destructive" : "text-muted-foreground"}`}>
+                            Prefill {compact(data?.terafabx?.comment?.pendingPostCount)}개
+                            {` · 최근 생성 ${compact(data?.terafabx?.commentPrefill?.queued)} / 실패 ${compact(data?.terafabx?.commentPrefill?.failed)}`}
+                            {data?.terafabx?.commentPrefill?.quotaLimited ? " · Grok 한도" : ""}
+                          </p>
+                          <p className="text-xs text-muted-foreground">
+                            Prefill 최근 실행 {formatDate(data?.terafabx?.commentPrefill?.lastRunAt)}
+                          </p>
+                          {data?.terafabx?.commentPrefill?.lastError ? (
+                            <p className="line-clamp-2 text-xs text-destructive" title={data.terafabx.commentPrefill.lastError}>
+                              {data.terafabx.commentPrefill.lastError}
+                            </p>
+                          ) : null}
                         </div>
                       </div>
                       <div className="grid grid-cols-3 gap-2">
