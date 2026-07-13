@@ -126,8 +126,8 @@ function upload() {
 function latestRuntimeTag(repo) {
   const result = run("gh", [
     "release", "list", "--repo", repo, "--limit", "100",
-    "--json", "tagName,createdAt",
-    "--jq", '[.[] | select(.tagName | startswith("runtime-"))] | sort_by(.createdAt) | reverse | .[0].tagName // ""',
+    "--json", "tagName,publishedAt",
+    "--jq", '[.[] | select(.tagName | startswith("runtime-"))] | sort_by(.publishedAt) | reverse | .[0].tagName // ""',
   ]);
   const tag = result.stdout.trim();
   if (!tag) throw new Error(`No runtime release found in ${repo}`);
