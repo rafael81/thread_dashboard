@@ -87,6 +87,14 @@ const auditPendingCount = Number(audit.pendingCount ?? auditItems.filter((item) 
 const auditPendingFailedCount = Number(audit.pendingFailedCount ?? auditItems.filter((item) => item.status !== "posted" && !item.ok).length);
 const auditPostedCount = Number(audit.postedCount ?? auditItems.filter((item) => item.status === "posted").length);
 const auditPostedFailedCount = Number(audit.postedFailedCount ?? auditItems.filter((item) => item.status === "posted" && !item.ok).length);
+const auditPostedLegacyUnverifiableCount = Number(audit.postedLegacyUnverifiableCount ?? auditItems.filter((item) => (
+  item.status === "posted"
+  && !item.ok
+  && Array.isArray(item.errors)
+  && item.errors.length > 0
+  && item.errors.every((error) => ["genericity_quality_flags_missing", "source_anchor_unverifiable"].includes(error))
+)).length);
+const auditPostedQualityFailedCount = Number(audit.postedQualityFailedCount ?? Math.max(0, auditPostedFailedCount - auditPostedLegacyUnverifiableCount));
 let commits = [];
 try {
   commits = execFileSync("git", [
@@ -113,7 +121,7 @@ const lines = [
   `- 근거 없는 구체 주장 격리: ${unsupportedClaimRejected.length}개`,
   `- 최근 개별 감사: ${Number(audit.checkedCount || 0)}개 검사 / ${Number(audit.failedCount || 0)}개 탈락`,
   `- 현재 대기 Prefill 감사: ${auditPendingCount}개 검사 / ${auditPendingFailedCount}개 탈락`,
-  `- 이미 게시된 Prefill 재감사: ${auditPostedCount}개 검사 / ${auditPostedFailedCount}개 현행 기준 미달`,
+  `- 이미 게시된 Prefill 자동 감사: ${auditPostedCount}개 검사 / ${auditPostedLegacyUnverifiableCount}개 레거시 스키마 미검증 / ${auditPostedQualityFailedCount}개 확정 품질 탈락`,
   `- 생성 완료 이벤트: ${eventCount("terafabx_comment_prefill_queued")}회`,
   `- 품질 격리: ${eventCount("terafabx_comment_monitor_prefill_quality_quarantined")}회 / ${eventSum("terafabx_comment_monitor_prefill_quality_quarantined")}개`,
   `- 일시 오류 복구: ${eventCount("terafabx_comment_monitor_transient_prefill_recovered")}회 / ${eventSum("terafabx_comment_monitor_transient_prefill_recovered")}개`,

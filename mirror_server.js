@@ -8023,6 +8023,10 @@ function auditTerafabxPrefillQuality(state = loadTerafabxState(), options = {}) 
       errors: policy.errors,
     }];
   }).slice(0, limit);
+  const legacyUnverifiableErrors = new Set(["genericity_quality_flags_missing", "source_anchor_unverifiable"]);
+  const isLegacyUnverifiable = (item) => !item.ok
+    && item.errors.length > 0
+    && item.errors.every((error) => legacyUnverifiableErrors.has(error));
   return {
     checkedAt: new Date().toISOString(),
     since: new Date(sinceMs).toISOString(),
@@ -8035,6 +8039,8 @@ function auditTerafabxPrefillQuality(state = loadTerafabxState(), options = {}) 
     pendingFailedCount: items.filter((item) => item.status !== "posted" && !item.ok).length,
     postedPassedCount: items.filter((item) => item.status === "posted" && item.ok).length,
     postedFailedCount: items.filter((item) => item.status === "posted" && !item.ok).length,
+    postedLegacyUnverifiableCount: items.filter((item) => item.status === "posted" && isLegacyUnverifiable(item)).length,
+    postedQualityFailedCount: items.filter((item) => item.status === "posted" && !item.ok && !isLegacyUnverifiable(item)).length,
     items,
   };
 }
