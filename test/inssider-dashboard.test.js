@@ -221,6 +221,26 @@ test('TerafabX final judge passes a natural specific reply at the quality thresh
   assert.equal(result.passed, true);
 });
 
+test('TerafabX final judge rejects an otherwise clean reply below 90', () => {
+  const result = parseTerafabxFinalJudge(JSON.stringify({
+    context: 35,
+    naturalness: 22,
+    specificity: 12,
+    concision: 10,
+    non_ai_style: 10,
+    fatal_error: false,
+    language_error: false, awkward_korean: false, translation_tone: false, cliche: false, context_error: false,
+    cross_post_reusable: false, headline_tone: false, specificity_error: false,
+    source_anchor: '위험한 남자',
+    reason: '문맥은 맞지만 구체성과 자연스러움이 부족함',
+  }), '분위기를 보니 위험한 매력이라는 뜻인 듯', {
+    targetText: '위험한 남자라는 농담과 파티 영상',
+  });
+
+  assert.equal(result.score, 89);
+  assert.equal(result.passed, false);
+});
+
 test('TerafabX final judge blocks a reusable headline-style prefill despite a perfect score', () => {
   const result = parseTerafabxFinalJudge(JSON.stringify({
     context: 40, naturalness: 25, specificity: 15, concision: 10, non_ai_style: 10,
@@ -285,6 +305,27 @@ test('TerafabX pending comments must satisfy the new short context-first policy'
   assert.equal(stale.ok, false);
   assert.ok(stale.errors.some((error) => error.startsWith('comment_too_long')));
   assert.ok(stale.errors.some((error) => error.startsWith('context_gate_failed')));
+});
+
+test('TerafabX current prefill policy quarantines a sub-90 independent score', () => {
+  const result = assessTerafabxCurrentCommentPolicy({
+    source: 'prefill',
+    queuedAt: '2026-07-13T15:52:59.460Z',
+    comment: '영상 분위기가 위험한 매력이라는 뜻인 듯',
+    geminiReview: { finalJudge: {
+      score: 86,
+      passed: true,
+      fatalError: false,
+      qualityFlagsComplete: true,
+      genericityFlagsComplete: true,
+      sourceAnchorGrounded: true,
+      flaggedQualityIssues: [],
+      dimensions: { context: 35 },
+    } },
+  });
+
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.includes('independent_judge_score_below_threshold:86'));
 });
 
 test('TerafabX pending comments reject Grok text fallback even for legacy prefill', () => {

@@ -2314,7 +2314,7 @@ function deriveTerafabxCommentQualityFeedback(commentHistory = [], options = {})
     sampleSize: records.length,
     independentlyJudgedCount: judged.length,
     averageIndependentScore,
-    belowThresholdCount: judged.filter((item) => Number(item.geminiReview.finalJudge.score) < 85).length,
+    belowThresholdCount: judged.filter((item) => Number(item.geminiReview.finalJudge.score) < TERAFABX_REVIEW_COMMENT_MIN_SCORE).length,
     clicheCommentCount: records.filter((item) => scoreTerafabxClichePenalty(item.comment).penalty > 0).length,
     clicheMatches,
     rules,
@@ -2386,7 +2386,7 @@ function normalizeTerafabxFinalJudgeParsed(parsed, finalReply, rawPreview = "") 
     clicheMatches: cliche.matches,
     score,
     contextPassed: dimensions.context >= 30,
-    passed: qualityFlagsComplete && genericityFlagsComplete && !fatalError && flaggedQualityIssues.length === 0 && languageQuality.ok && dimensions.context >= 30 && score >= 85,
+    passed: qualityFlagsComplete && genericityFlagsComplete && !fatalError && flaggedQualityIssues.length === 0 && languageQuality.ok && dimensions.context >= 30 && score >= TERAFABX_REVIEW_COMMENT_MIN_SCORE,
     fatalError,
     qualityFlagsComplete,
     genericityFlagsComplete,
@@ -6894,6 +6894,10 @@ function assessTerafabxCurrentCommentPolicy(record) {
     && (recoveredTransientPrefill || !Number.isFinite(recordCreatedAt) || recordCreatedAt >= TERAFABX_PREFILL_GENERICITY_ROLLOUT_AT);
   if (requiresGenericityQuality && finalJudge?.genericityFlagsComplete !== true) errors.push("genericity_quality_flags_missing");
   if (requiresGenericityQuality && finalJudge?.sourceAnchorGrounded !== true) errors.push("source_anchor_unverifiable");
+  const finalScore = terafabxReplyReviewFinalScore(record?.geminiReview || {});
+  if (requiresGenericityQuality && (!Number.isFinite(finalScore) || finalScore < TERAFABX_REVIEW_COMMENT_MIN_SCORE)) {
+    errors.push(`independent_judge_score_below_threshold:${Number.isFinite(finalScore) ? finalScore : "missing"}`);
+  }
   for (const issue of finalJudge?.flaggedQualityIssues || []) errors.push(`gemini_quality:${issue}`);
   if (finalJudge?.passed !== true) errors.push("independent_judge_not_passed");
   return {

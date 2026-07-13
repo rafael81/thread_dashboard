@@ -479,6 +479,7 @@ test("recent quality-passed prefill exhausted by a blank X page is recoverable",
       failedReason: "max_attempts",
       lastError: 'target root 검증 실패: {"text":""}',
       geminiReview: { finalJudge: {
+        score: 100,
         passed: true,
         fatalError: false,
         qualityFlagsComplete: true,
