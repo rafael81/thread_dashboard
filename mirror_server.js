@@ -7745,7 +7745,10 @@ function quarantineInvalidTerafabxPrefillComments(state = loadTerafabxState()) {
   const remaining = pendingTerafabxCommentPosts(state).filter((item) => {
     if (item?.source !== "prefill") return true;
     const createdAt = Date.parse(item.queuedAt || item.at || "");
-    if (Number.isFinite(createdAt) && createdAt < TERAFABX_PREFILL_GENERICITY_ROLLOUT_AT) return true;
+    const recoveredTransientPrefill = Boolean(item?.nextAttemptAt)
+      && Number(item?.attempts || 0) === 0
+      && isTerafabxTransientReplyPageError(item?.lastError || "");
+    if (Number.isFinite(createdAt) && createdAt < TERAFABX_PREFILL_GENERICITY_ROLLOUT_AT && !recoveredTransientPrefill) return true;
     const policy = assessTerafabxCurrentCommentPolicy(item);
     if (policy.ok) return true;
     rejected.push({
