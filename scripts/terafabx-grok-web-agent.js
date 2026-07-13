@@ -371,26 +371,15 @@ function buildGrokSubmitEvalScript(prompt) {
     if (/TEXTAREA|INPUT/.test(editor.tagName)) {
       editor.value = '';
       editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward', data: null }));
-      editor.value = prompt;
-      editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: prompt }));
     } else {
       const selection = window.getSelection();
       const range = document.createRange();
       range.selectNodeContents(editor);
       selection.removeAllRanges();
       selection.addRange(range);
-      document.execCommand('insertText', false, prompt);
-      if (!clean(editor.innerText || editor.textContent || '')) {
-        try {
-          const data = new DataTransfer();
-          data.setData('text/plain', prompt);
-          editor.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: data }));
-        } catch {}
-      }
-      if (!clean(editor.innerText || editor.textContent || '')) {
-        editor.textContent = prompt;
-      }
-      editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: prompt }));
+      document.execCommand('delete', false);
+      if (clean(editor.innerText || editor.textContent || '')) editor.textContent = '';
+      editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward', data: null }));
     }
     await sleep(800);
     editor.focus();
@@ -455,6 +444,7 @@ function buildGrokBatchCommandChunks(prompt, url, timeoutMs = DEFAULT_TIMEOUT_MS
     "reload",
     `wait ${randomHumanDelayMs(random, 4200, 6800)}`,
     `eval -b ${encodeEval(buildGrokSubmitEvalScript(prompt))}`,
+    `keyboard inserttext ${JSON.stringify(prompt)}`,
     `wait ${randomHumanDelayMs(random, 600, 1400)}`,
     "press Enter",
     `wait ${randomHumanDelayMs(random, 900, 1800)}`,

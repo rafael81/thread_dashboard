@@ -568,7 +568,8 @@ test('Grok context batch uses one semantic fill and Enter submission', () => {
   assert.match(responseReadScript, /cleanPrompt = clean\(prompt\)/);
   assert.match(responseReadScript, /text\.includes\(cleanPrompt\.slice/);
   assert.ok(!commands.includes('press Control+a'));
-  assert.ok(!commands.some((command) => command.startsWith('keyboard inserttext ')));
+  assert.equal(commands.filter((command) => command.startsWith('keyboard inserttext ')).length, 1);
+  assert.ok(commands.some((command) => command.startsWith('keyboard inserttext ') && command.includes('한 줄\\n심사')));
   assert.ok(commands.includes('press Enter'));
   assert.ok(commands.some((command) => command.startsWith('eval -b ')));
   assert.ok(!commands.some((command) => command.startsWith('find placeholder ')));
