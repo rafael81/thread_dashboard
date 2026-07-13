@@ -68,7 +68,7 @@ const TERAFABX_GROK_PROVIDER = String(process.env.TERAFABX_GROK_PROVIDER || "web
 const TERAFABX_GROK_WEB_STATE_PATH = process.env.TERAFABX_GROK_WEB_STATE_PATH || path.join(__dirname, ".data", "agent-browser", "terafabx-grok-state.json");
 const TERAFABX_GROK_WEB_RUN_DIR = process.env.TERAFABX_GROK_WEB_RUN_DIR || path.join(__dirname, ".data", "terafabx-grok-web-runs");
 const TERAFABX_GROK_WEB_SESSION = process.env.TERAFABX_GROK_WEB_SESSION || "terafabx-grok-headless";
-const TERAFABX_GROK_WEB_URL = process.env.TERAFABX_GROK_WEB_URL || "https://x.com/i/grok";
+const TERAFABX_GROK_WEB_URL = process.env.TERAFABX_GROK_WEB_URL || "https://grok.com/";
 const TERAFABX_GROK_WEB_TIMEOUT_MS = Number(process.env.TERAFABX_GROK_WEB_TIMEOUT_MS || 180_000);
 const TERAFABX_GROK_WEB_SOURCE_CDP_PORT = Number(process.env.TERAFABX_GROK_WEB_SOURCE_CDP_PORT || CHROME_PORT);
 const TERAFABX_GROK_WEB_REFRESH_STATE = process.env.TERAFABX_GROK_WEB_REFRESH_STATE !== "false";
@@ -13774,6 +13774,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  TERAFABX_GROK_WEB_URL,
   cleanThreadText,
   dashboardDiscoveryRow,
   DuplicateMirrorError,

@@ -33,7 +33,7 @@ const {
   xWeightedLength,
   xScheduledTimeNeedles,
 } = require('../mirror_server.js');
-const { agentBrowserInvocation, buildGrokBatchCommandChunks, buildGrokBatchCommands, parseDoneMarker } = require('../scripts/terafabx-grok-web-agent.js');
+const { DEFAULT_GROK_URL, agentBrowserInvocation, buildGrokBatchCommandChunks, buildGrokBatchCommands, parseDoneMarker } = require('../scripts/terafabx-grok-web-agent.js');
 
 test('sharp runtime dependency is importable', async () => {
   const sharp = await import('sharp');
@@ -398,6 +398,11 @@ test('Grok final judge uses one native X Grok batch with semantic fill and Enter
   assert.ok(!commands.some((command) => command.includes('grok.com/')));
 });
 
+test('TerafabX Grok context automation defaults to grok.com headless', () => {
+  assert.equal(DEFAULT_GROK_URL, 'https://grok.com/');
+  assert.equal(require('../mirror_server.js').TERAFABX_GROK_WEB_URL, 'https://grok.com/');
+});
+
 test('Grok headless browser uses the regular Chrome identity and system Chrome binary', () => {
   const invocation = agentBrowserInvocation(['open', 'https://x.com/i/grok'], { session: 'ua-test' });
   const userAgentIndex = invocation.args.indexOf('--user-agent');
@@ -413,10 +418,10 @@ test('Grok headless browser uses the regular Chrome identity and system Chrome b
 test('Grok final judge chunks long polling so the browser command line stays bounded', () => {
   const chunks = buildGrokBatchCommandChunks('긴 심사', 'https://x.com/i/grok', 180000);
 
-  assert.equal(chunks.length, 4);
+  assert.equal(chunks.length, 24);
   assert.equal(chunks[0][2], 'open https://x.com/i/grok');
   assert.ok(chunks.slice(1).every((commands) => commands.slice(0, 2).join(' ') === 'batch --bail'));
-  assert.ok(chunks.every((commands, index) => commands.filter((command) => command.startsWith('eval -b ')).length <= (index === 0 ? 13 : 12)));
+  assert.ok(chunks.every((commands, index) => commands.filter((command) => command.startsWith('eval -b ')).length <= (index === 0 ? 3 : 2)));
   assert.equal(chunks.flat().filter((command) => command.startsWith('eval -b ')).length, 49);
 });
 

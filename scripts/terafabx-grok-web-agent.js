@@ -9,7 +9,7 @@ const DEFAULT_SESSION = "terafabx-grok-headless";
 const DEFAULT_TIMEOUT_MS = 180000;
 const POLL_INTERVAL_MS = 2500;
 const RESPONSE_STABLE_POLLS = 2;
-const BATCH_POLL_CHUNK_SIZE = 12;
+const BATCH_POLL_CHUNK_SIZE = 2;
 const DEBUG = process.env.TERAFABX_GROK_WEB_DEBUG === "true";
 const DEFAULT_SYSTEM_CHROME_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const DEFAULT_HUMAN_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
@@ -439,7 +439,6 @@ function buildGrokReadEvalScript() {
     }
     const done = Boolean(looksNew && looksComplete && !isGenerating && Number(window.__terafabxGrokStableCount || 0) >= ${RESPONSE_STABLE_POLLS - 1});
     const payload = { ok: true, stage: 'read', done, response: done ? text : '', textPreview: text.slice(0, 500), count: nodes.length, isGenerating, stableCount: Number(window.__terafabxGrokStableCount || 0), url: location.href, title: document.title };
-    if (done) throw new Error('TERAFABX_GROK_DONE:' + encodeURIComponent(JSON.stringify({ response: text })));
     return JSON.stringify(payload);
   })()`;
 }
@@ -764,4 +763,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { agentBrowserInvocation, buildGrokBatchCommandChunks, buildGrokBatchCommands, parseDoneMarker, randomHumanDelayMs, runGrokPromptBatch };
+module.exports = { DEFAULT_GROK_URL, agentBrowserInvocation, buildGrokBatchCommandChunks, buildGrokBatchCommands, parseDoneMarker, randomHumanDelayMs, runGrokPromptBatch };
