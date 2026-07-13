@@ -60,6 +60,7 @@ async function main() {
     priority: "comment",
     timeoutMs: Number(args.timeout || 300000),
     skipReview: args["skip-review"] === "true",
+    repairFailed: args.repair === "true",
   });
   if (results.length !== selected.length) {
     throw new Error(`Gemini 감사 결과 개수 불일치: ${results.length}/${selected.length}`);

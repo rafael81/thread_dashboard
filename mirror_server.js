@@ -2169,6 +2169,7 @@ function terafabxGeminiBatchFinalJudgePrompt(items = []) {
     "'고민이 깊으시겠습니다', '마음이 무거우시겠습니다'처럼 상담 기록 같은 격식체 추측 공감은 awkward_korean=true 또는 translation_tone=true로 판정해라.",
     "'진짜 신기하게', '딱 보이지 않나요', '계속 보게 되네요'처럼 여러 댓글에 반복될 법한 감탄 템플릿은 non_ai_style에서 크게 감점해라.",
     "'마음에 와닿네요', '도움이 되면 좋겠네요', '미리 저장해 둡니다'처럼 대상만 바꿔 반복 가능한 참여 유도형 종결은 cliche 또는 cross_post_reusable 여부를 엄격히 판정해라.",
+    "댓글 작성자가 실제로 먹어 봤다·가 봤다·겪었다는 근거가 없는데 '나도', '~해봤는데', '~더라'처럼 직접 경험을 꾸며내면 unsupported_claim=true로 판정해라. 제공된 영상·사진을 보고 한 관찰은 직접 경험 주장과 구분한다.",
     "Grok 분석의 대응 조언을 사실 근거로 취급하지 마라. source_anchor에는 반드시 원문 또는 부모 원글에 실제로 적힌 고유 명사·숫자·행동 구절을 원문 그대로 적어라.",
     "댓글이 같은 분야의 다른 글에도 그대로 붙을 수 있으면 cross_post_reusable=true다. 예: '폭로성 스캔들은 사실 확인이 먼저 필요합니다'처럼 일반 원칙만 말하는 문장.",
     "'배려가 필요합니다', '확인이 필요합니다', '안전합니다', '해야 합니다'처럼 대화형 반응 없이 당위적 결론만 말하거나 기사 제목·안전 표어·교훈 문장처럼 들리면 headline_tone=true다.",
@@ -2371,6 +2372,7 @@ function terafabxCommentQualityPromptLines() {
   return [
     "상투 표현 금지: 마음이 훈훈해지네요, 작성자님, 재충전의 시간 보내세요, 행복한 하루 보내세요, 인상적이네요, 응원합니다.",
     "'마음에 와닿네요', '도움이 되면 좋겠네요', '미리 저장해 둡니다'처럼 대상만 바꿔 반복 가능한 참여 유도형 종결은 그대로 두지 말고, 원문의 구체 장면에 반응하는 실제 구어체인지 엄격히 판단해라.",
+    "댓글 작성자가 실제로 먹어 봤다·가 봤다·겪었다는 근거가 없으면 '나도', '~해봤는데', '~더라'처럼 직접 경험을 꾸며내지 마라. 제공된 영상·사진을 보고 한 관찰은 가능하다.",
     "대화형 반응 대신 '배려가 필요합니다', '확인이 필요합니다', '안전합니다', '해야 합니다'처럼 기사 결론·안전 표어·교훈으로 끝내지 마라.",
     "'고민이 깊으시겠습니다', '마음이 무거우시겠습니다'처럼 상담 기록 같은 격식체 추측 공감은 쓰지 말고 실제 X 대화처럼 짧고 담백하게 말해라.",
     ...dynamicRules.map((rule) => `최근 10분 품질 피드백: ${rule}`),
@@ -2391,6 +2393,7 @@ function terafabxFinalJudgePrompt(target, grokInput, finalReply) {
     "'고민이 깊으시겠습니다', '마음이 무거우시겠습니다'처럼 상담 기록 같은 격식체 추측 공감은 awkward_korean=true 또는 translation_tone=true로 판정해라.",
     "'진짜 신기하게', '딱 보이지 않나요', '계속 보게 되네요'처럼 여러 댓글에 반복될 법한 감탄 템플릿은 non_ai_style에서 크게 감점해라.",
     "'마음에 와닿네요', '도움이 되면 좋겠네요', '미리 저장해 둡니다'처럼 대상만 바꿔 반복 가능한 참여 유도형 종결은 cliche 또는 cross_post_reusable 여부를 엄격히 판정해라.",
+    "댓글 작성자가 실제로 먹어 봤다·가 봤다·겪었다는 근거가 없는데 '나도', '~해봤는데', '~더라'처럼 직접 경험을 꾸며내면 unsupported_claim=true로 판정해라. 제공된 영상·사진을 보고 한 관찰은 직접 경험 주장과 구분한다.",
     "Grok 분석의 대응 조언을 사실 근거로 취급하지 마라. source_anchor에는 반드시 원문 또는 부모 원글에 실제로 적힌 고유 명사·숫자·행동 구절을 원문 그대로 적어라.",
     "댓글이 같은 분야의 다른 글에도 그대로 붙을 수 있으면 cross_post_reusable=true다. '배려가 필요합니다', '확인이 필요합니다', '안전합니다', '해야 합니다'처럼 대화형 반응 없이 당위적 결론만 말하거나 기사 제목·표어·교훈 문장처럼 들리면 headline_tone=true다.",
     "댓글이 source_anchor의 구체적인 대상을 실제로 언급하거나 명확히 가리키지 않으면 specificity_error=true다.",
@@ -3118,7 +3121,7 @@ async function reviewTerafabxPreparedReplyBatchWithGemini(items = [], options = 
       .map((result, index) => ({ result, index }))
       .filter(({ result }) => !result.ok && result.stage === "batch_final_judge")
       .map(({ index }) => index);
-    if (repairableIndexes.length && Number(options.repairAttempt || 0) < 1) {
+    if (repairableIndexes.length && shouldRepairTerafabxBatchFailures(options)) {
       logEvent("terafabx_gemini_batch_quality_rewrite_start", { count: repairableIndexes.length, runDir });
       const repairSeeds = repairableIndexes.map((index) => ({
         target: reviewable[index].target,
@@ -3173,6 +3176,10 @@ async function reviewTerafabxPreparedReplyBatchWithGemini(items = [], options = 
       logEvent("terafabx_gemini_batch_review_cleanup", { count: inputs.length, cleanup });
     }
   }
+}
+
+function shouldRepairTerafabxBatchFailures(options = {}) {
+  return options.repairFailed !== false && Number(options.repairAttempt || 0) < 1;
 }
 
 async function generateTerafabxReplyWithGeminiFallback(target, options = {}) {
@@ -13952,6 +13959,7 @@ module.exports = {
   parseTerafabxGeminiBatchReview,
   parseTerafabxGeminiBatchFinalJudge,
   reviewTerafabxPreparedReplyBatchWithGemini,
+  shouldRepairTerafabxBatchFailures,
   enqueueTerafabxPendingCommentPost,
   scoreTerafabxClichePenalty,
   selectRootPostMediaCandidates,

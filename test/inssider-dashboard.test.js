@@ -231,6 +231,24 @@ test('TerafabX Gemini quality prompts flag reusable engagement endings', () => {
   assert.match(prompt, /미리 저장해 둡니다/);
 });
 
+test('TerafabX Gemini quality prompts forbid invented personal experience', () => {
+  const prompt = require('../mirror_server.js').terafabxGeminiBatchFinalJudgePrompt([{
+    target: { url: 'https://x.com/example/status/1', targetText: '엽떡 덜매운맛도 이제 맵다' },
+    prepared: { comment: '어느 순간부터 확 매워지더라', grokContext: { summary: '매운맛 이야기', keyPoints: [] } },
+  }]);
+
+  assert.match(prompt, /직접 경험을 꾸며내면 unsupported_claim=true/);
+  assert.match(prompt, /제공된 영상·사진을 보고 한 관찰은 직접 경험 주장과 구분/);
+});
+
+test('TerafabX manual audit can disable automatic repair after final judge rejection', () => {
+  const { shouldRepairTerafabxBatchFailures } = require('../mirror_server.js');
+
+  assert.equal(shouldRepairTerafabxBatchFailures({}), true);
+  assert.equal(shouldRepairTerafabxBatchFailures({ repairAttempt: 1 }), false);
+  assert.equal(shouldRepairTerafabxBatchFailures({ repairFailed: false }), false);
+});
+
 test('TerafabX final judge passes a natural specific reply at the quality threshold', () => {
   const result = parseTerafabxFinalJudge(JSON.stringify({
     context: 36,
