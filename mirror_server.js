@@ -7635,6 +7635,56 @@ function quarantineExhaustedTerafabxPendingComments(state = loadTerafabxState())
   return { count: exhausted.length, remainingCount: remaining.length };
 }
 
+function recoverRecentTransientPrefillFailures(state = loadTerafabxState(), options = {}) {
+  const nowMs = Number(options.nowMs || Date.now());
+  const sinceMs = nowMs - Number(options.windowMs || 2 * 60 * 60 * 1000);
+  const pending = pendingTerafabxCommentPosts(state);
+  const pendingTargets = new Set(pending.map((item) => normalizeXStatusUrl(item.targetUrl || "")));
+  const postedTargets = new Set((state.commentHistory || []).map((item) => normalizeXStatusUrl(item.targetUrl || "")));
+  const recovered = [];
+  const failed = [];
+  for (const item of state.failedPendingCommentPosts || []) {
+    const targetUrl = normalizeXStatusUrl(item.targetUrl || "");
+    const failedAtMs = Date.parse(item.errorAt || item.updatedAt || item.lastAttemptAt || "");
+    const eligible = item.source === "prefill"
+      && ["max_attempts", "monitor_max_attempts"].includes(String(item.failedReason || ""))
+      && isTerafabxTransientReplyPageError(item.lastError || "")
+      && Number.isFinite(failedAtMs)
+      && failedAtMs >= sinceMs
+      && targetUrl
+      && !pendingTargets.has(targetUrl)
+      && !postedTargets.has(targetUrl)
+      && assessTerafabxCurrentCommentPolicy(item).ok;
+    if (!eligible || recovered.length >= 20) {
+      failed.push(item);
+      continue;
+    }
+    const nextAttemptAt = new Date(nowMs + TERAFABX_PENDING_COMMENT_TRANSIENT_RETRY_MS).toISOString();
+    recovered.push({
+      ...item,
+      status: "pending",
+      attempts: 0,
+      failedReason: null,
+      errorAt: null,
+      nextAttemptAt,
+      updatedAt: new Date(nowMs).toISOString(),
+    });
+    pendingTargets.add(targetUrl);
+  }
+  if (!recovered.length) return { count: 0, pendingCount: pending.length, recovered: [] };
+  if (options.persist !== false) {
+    saveTerafabxState({
+      pendingCommentPosts: [...pending, ...recovered],
+      failedPendingCommentPosts: failed,
+    });
+    logEvent("terafabx_comment_monitor_transient_prefill_recovered", {
+      count: recovered.length,
+      targetUrls: recovered.map((item) => item.targetUrl),
+    });
+  }
+  return { count: recovered.length, pendingCount: pending.length + recovered.length, recovered };
+}
+
 function auditTerafabxPrefillQuality(state = loadTerafabxState(), options = {}) {
   const sinceMs = Number(options.sinceMs || TERAFABX_PREFILL_GENERICITY_ROLLOUT_AT);
   const limit = Math.max(1, Number(options.limit || 500));
@@ -7714,6 +7764,8 @@ async function runTerafabxCommentMonitor(options = {}) {
   const startedAt = new Date().toISOString();
   try {
     let state = loadTerafabxState();
+    const transientRecovery = recoverRecentTransientPrefillFailures(state);
+    if (transientRecovery.count) state = loadTerafabxState();
     const quarantine = quarantineExhaustedTerafabxPendingComments(state);
     if (quarantine.count) state = loadTerafabxState();
     const prefillQualityAudit = auditTerafabxPrefillQuality(state);
@@ -7734,6 +7786,7 @@ async function runTerafabxCommentMonitor(options = {}) {
       commentXLock: getTerafabxCommentXLockState(),
     };
     const actions = [];
+    if (transientRecovery.count) actions.push({ type: "recover_transient_prefill", count: transientRecovery.count });
     if (quarantine.count) actions.push({ type: "quarantine_exhausted_pending", count: quarantine.count });
     if (prefillQualityQuarantine.count) actions.push({
       type: "quarantine_prefill_quality",
@@ -13523,6 +13576,7 @@ module.exports = {
   isTerafabxReplySubmissionUncertain,
   isTerafabxTransientReplyPageError,
   terafabxPendingCommentFailureDisposition,
+  recoverRecentTransientPrefillFailures,
   terafabxBrowserConcurrency,
   terafabxCommentPrefillWorkerResources,
   isTerafabxGeminiWorkTab,

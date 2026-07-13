@@ -40,6 +40,7 @@ const {
   isTerafabxReplySubmitCandidate,
   isTerafabxReplySubmissionUncertain,
   isTerafabxTransientReplyPageError,
+  recoverRecentTransientPrefillFailures,
   terafabxPendingCommentFailureDisposition,
   withTerafabxBrowserSetupCleanup,
   xPageReadyState,
@@ -451,6 +452,46 @@ test("a blank X reply page is retried with a cooldown instead of being exhausted
   assert.equal(result.removeFromPending, false);
   assert.equal(result.transientPageError, true);
   assert.ok(Date.parse(result.nextAttemptAt) > Date.now());
+});
+
+test("recent quality-passed prefill exhausted by a blank X page is recoverable", () => {
+  const nowMs = Date.parse("2026-07-13T15:00:00.000Z");
+  const state = {
+    pendingCommentPosts: [],
+    commentHistory: [],
+    failedPendingCommentPosts: [{
+      source: "prefill",
+      targetUrl: "https://x.com/a/status/1",
+      comment: "의정부고 졸업사진은 매년 퀄리티가 엄청나네요",
+      queuedAt: "2026-07-13T14:30:00.000Z",
+      errorAt: "2026-07-13T14:40:00.000Z",
+      failedReason: "max_attempts",
+      lastError: 'target root 검증 실패: {"text":""}',
+      geminiReview: { finalJudge: {
+        passed: true,
+        fatalError: false,
+        qualityFlagsComplete: true,
+        genericityFlagsComplete: true,
+        sourceAnchorGrounded: true,
+        flaggedQualityIssues: [],
+        qualityFlags: {
+          language_error: false,
+          awkward_korean: false,
+          translation_tone: false,
+          cliche: false,
+          context_error: false,
+          cross_post_reusable: false,
+          headline_tone: false,
+          specificity_error: false,
+        },
+        dimensions: { context: 40 },
+      } },
+    }],
+  };
+  const result = recoverRecentTransientPrefillFailures(state, { nowMs, persist: false });
+  assert.equal(result.count, 1);
+  assert.equal(result.recovered[0].attempts, 0);
+  assert.ok(Date.parse(result.recovered[0].nextAttemptAt) > nowMs);
 });
 
 test("Grok quota text is not converted into a typed own-post backoff error", () => {
