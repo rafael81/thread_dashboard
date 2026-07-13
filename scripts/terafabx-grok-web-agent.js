@@ -422,6 +422,13 @@ function buildGrokReadEvalScript() {
     const clean = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
     const cleanPrompt = clean(prompt);
     const promptFingerprint = cleanPrompt.replace(/\\s+/g, '').replace(/n/g, '');
+    const alertText = clean([...document.querySelectorAll('output[role="alert"], [role="alert"]')]
+      .filter(visible)
+      .map((node) => node.innerText || node.textContent || '')
+      .join(' '));
+    if (/주간 한도에 도달|일일 한도에 도달|weekly limit|daily limit|usage limit|rate limit/i.test(alertText)) {
+      return JSON.stringify({ ok: false, stage: 'quota', error: alertText.slice(0, 500), url: location.href, title: document.title });
+    }
     const nodes = [
       '[data-message-author-role="assistant"]',
       '[data-testid="assistant-message"]',

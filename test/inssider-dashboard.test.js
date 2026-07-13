@@ -567,6 +567,8 @@ test('Grok context batch validates the editor and clicks submit after one keyboa
   assert.match(responseReadScript, /'\[class\*="r-bnwqim"\]\[class\*="r-11niif6"\]'/);
   assert.match(responseReadScript, /cleanPrompt = clean\(prompt\)/);
   assert.match(responseReadScript, /textFingerprint\.includes\(promptFingerprint\.slice/);
+  assert.match(responseReadScript, /주간 한도에 도달/);
+  assert.match(responseReadScript, /stage: 'quota'/);
   assert.ok(commands.includes('press Control+a'));
   assert.ok(commands.includes('press Backspace'));
   assert.equal(commands.filter((command) => command.startsWith('keyboard inserttext ')).length, 1);
