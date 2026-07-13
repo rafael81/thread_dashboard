@@ -23,6 +23,8 @@ const {
   findXScheduledEntry,
   terafabxGeminiReviewPrompt,
   terafabxGeminiBatchFinalJudgePrompt,
+  TERAFABX_GROK_CONTEXT_MODE,
+  terafabxGrokLightweightContextPrompt,
   terafabxGrokContextBatchPrompt,
   normalizeTerafabxContextResult,
   parseTerafabxGrokContextBatch,
@@ -65,6 +67,19 @@ test('TerafabX Grok context batch keeps target indexes isolated', () => {
   assert.match(parsed[0].context.contextSummary, /손흥민/);
   assert.equal(parsed[1].ok, true);
   assert.match(parsed[1].context.contextSummary, /백 개/);
+});
+
+test('TerafabX Grok Prefill uses a lightweight single-item prompt', () => {
+  const target = { url: 'https://x.com/a/status/1', targetText: '길에서 우연히 만난 고양이가 사람을 졸졸 따라온다.' };
+  const prompt = terafabxGrokLightweightContextPrompt(target, '', 'gctx-12345678-1234-1234-1234-123456789abc');
+  const batchPrompt = terafabxGrokContextBatchPrompt([target, target]);
+
+  assert.match(prompt, /X 글 1개/);
+  assert.match(prompt, /댓글은 작성하지 마/);
+  assert.match(prompt, /context_summary/);
+  assert.match(prompt, /gctx-12345678-1234-1234-1234-123456789abc/);
+  assert.doesNotMatch(prompt, /### index=/);
+  assert.ok(prompt.length < batchPrompt.length);
 });
 
 test('TerafabX Grok context batch fails closed for a missing index', () => {
@@ -655,6 +670,7 @@ test('TerafabX monitor keeps running but suppresses Grok prefill until the displ
   const retryAt = parseTerafabxGrokQuotaRetryAt('주간 한도에 도달했습니다 7월 19일에 초기화됩니다.', now);
   const state = {
     commentEnabled: true,
+    lastCommentPrefillGrokMode: TERAFABX_GROK_CONTEXT_MODE,
     lastCommentPrefillQuotaLimited: true,
     lastCommentPrefillQuotaRetryAt: retryAt,
   };
@@ -662,6 +678,7 @@ test('TerafabX monitor keeps running but suppresses Grok prefill until the displ
 
   assert.equal(retryAt, '2026-07-18T15:05:00.000Z');
   assert.equal(isTerafabxGrokQuotaBackoffActive(state, now.getTime()), true);
+  assert.equal(isTerafabxGrokQuotaBackoffActive({ ...state, lastCommentPrefillGrokMode: null }, now.getTime()), false);
   assert.equal(shouldTerafabxCommentMonitorRequestPrefill(state, evaluation, {
     targetCount: 200,
     nowMs: now.getTime(),

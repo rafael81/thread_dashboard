@@ -421,6 +421,7 @@ function buildGrokReadEvalScript() {
     };
     const clean = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
     const cleanPrompt = clean(prompt);
+    const responseMarker = (cleanPrompt.match(/gctx-[0-9a-f-]{12,}/i) || [])[0] || '';
     const promptFingerprint = cleanPrompt.replace(/\\s+/g, '').replace(/n/g, '');
     const alertText = clean([...document.querySelectorAll('output[role="alert"], [role="alert"]')]
       .filter(visible)
@@ -460,8 +461,9 @@ function buildGrokReadEvalScript() {
       window.__terafabxGrokStableCount = 0;
       window.__terafabxGrokLastText = text;
     }
-    const done = Boolean(looksNew && looksComplete && !isGenerating && Number(window.__terafabxGrokStableCount || 0) >= ${RESPONSE_STABLE_POLLS - 1});
-    const payload = { ok: true, stage: 'read', done, response: done ? text : '', textPreview: text.slice(0, 500), count: nodes.length, isGenerating, stableCount: Number(window.__terafabxGrokStableCount || 0), url: location.href, title: document.title };
+    const markerMatched = !responseMarker || text.includes(responseMarker);
+    const done = Boolean(looksNew && looksComplete && markerMatched && !isGenerating && Number(window.__terafabxGrokStableCount || 0) >= ${RESPONSE_STABLE_POLLS - 1});
+    const payload = { ok: true, stage: 'read', done, response: done ? text : '', textPreview: text.slice(0, 500), count: nodes.length, isGenerating, markerMatched, stableCount: Number(window.__terafabxGrokStableCount || 0), url: location.href, title: document.title };
     return JSON.stringify(payload);
   })()`;
 }

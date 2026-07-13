@@ -65,6 +65,7 @@ const DISCOVERY_MAX_SCROLLS = Number(process.env.DISCOVERY_MAX_SCROLLS || 20);
 const GROK_BIN = process.env.GROK_BIN || "/Users/user/.local/bin/grok";
 const AGENT_BROWSER_BIN = process.env.AGENT_BROWSER_BIN || "npx";
 const TERAFABX_GROK_PROVIDER = String(process.env.TERAFABX_GROK_PROVIDER || "web").toLowerCase();
+const TERAFABX_GROK_CONTEXT_MODE = "single-lightweight-v1";
 const TERAFABX_GROK_WEB_STATE_PATH = process.env.TERAFABX_GROK_WEB_STATE_PATH || path.join(__dirname, ".data", "agent-browser", "terafabx-grok-state.json");
 const TERAFABX_GROK_WEB_RUN_DIR = process.env.TERAFABX_GROK_WEB_RUN_DIR || path.join(__dirname, ".data", "terafabx-grok-web-runs");
 const TERAFABX_GROK_WEB_SESSION = process.env.TERAFABX_GROK_WEB_SESSION || "terafabx-grok-headless";
@@ -1060,6 +1061,7 @@ function loadTerafabxState() {
     lastCommentPrefillPendingCount: 0,
     lastCommentPrefillQuotaLimited: false,
     lastCommentPrefillQuotaRetryAt: null,
+    lastCommentPrefillGrokMode: null,
     commentHistory: [],
     pendingCommentPosts: [],
     seenTargets: [],
@@ -4728,6 +4730,17 @@ function terafabxGrokContextPrompt(target, extraRule = "", actor = "Grok") {
   ].filter(Boolean).join("\n");
 }
 
+function terafabxGrokLightweightContextPrompt(target, extraRule = "", requestId = "gctx-00000000-0000-0000-0000-000000000000") {
+  return [
+    "아래 X 글 1개의 내용을 한국어로 짧게 파악해줘.",
+    "댓글은 작성하지 마.",
+    `반드시 JSON 한 줄만 출력해: {\"request_id\":\"${requestId}\",\"context_summary\":\"30자 이상의 내용 요약\",\"key_points\":[\"핵심1\",\"핵심2\"]}`,
+    extraRule,
+    "",
+    ...terafabxPromptContextLines(target),
+  ].filter(Boolean).join("\n");
+}
+
 function terafabxGrokContextBatchPrompt(targets = [], extraRule = "", actor = "Grok") {
   const selected = (Array.isArray(targets) ? targets : []).slice(0, 10);
   const blocks = selected.map((target, index) => [
@@ -4961,7 +4974,8 @@ async function runGrokWebAgent(prompt, options = {}) {
 
 async function analyzeTerafabxContextWithGrok(target, options = {}) {
   const provider = TERAFABX_GROK_PROVIDER === "cli" ? "cli" : "web";
-  logEvent("terafabx_grok_context_start", { provider, targetUrl: target.url, textLength: String(target.targetText || target.text || "").length });
+  const mode = options.lightweight ? TERAFABX_GROK_CONTEXT_MODE : "single-detailed";
+  logEvent("terafabx_grok_context_start", { provider, mode, targetUrl: target.url, textLength: String(target.targetText || target.text || "").length });
   const timeoutMs = Number(options.timeoutMs || 90_000);
   const maxAttempts = Math.max(1, Math.min(Number(options.maxAttempts || 2), 2));
   for (const [attempt, extraRule] of [
@@ -4969,7 +4983,10 @@ async function analyzeTerafabxContextWithGrok(target, options = {}) {
     [2, "문맥이 애매하면 추정이라고 표시하고 안전하게 반응할 수 있는 관찰 포인트만 정리해라."],
   ].slice(0, maxAttempts)) {
     try {
-      const prompt = terafabxGrokContextPrompt(target, extraRule, "Grok");
+      const requestId = options.lightweight ? `gctx-${crypto.randomUUID()}` : null;
+      const prompt = options.lightweight
+        ? terafabxGrokLightweightContextPrompt(target, extraRule, requestId)
+        : terafabxGrokContextPrompt(target, extraRule, "Grok");
       const raw = provider === "web"
         ? await runGrokWebAgent(prompt, {
           attempt,
@@ -4992,18 +5009,23 @@ async function analyzeTerafabxContextWithGrok(target, options = {}) {
         });
         throw error;
       }
+      if (requestId) {
+        const responseRequestId = JSON.parse(extractJsonObjectText(raw)).request_id;
+        if (responseRequestId !== requestId) throw new Error("Grok 단건 응답 request_id가 일치하지 않습니다.");
+      }
       const result = parseTerafabxGrokContext(raw);
       if (!hasDetailedTerafabxGrokContext(result)) {
         throw new Error("Grok 상세 문맥 분석 JSON이 비어 있거나 부족합니다.");
       }
       logEvent("terafabx_grok_context_ok", {
         provider,
+        mode,
         attempt,
         targetUrl: target.url,
         contextPreview: result.contextSummary.slice(0, 240),
         keyPointCount: result.keyPoints.length,
       });
-      return { ...result, provider: `${provider}-context` };
+      return { ...result, provider: `${provider}-context`, mode };
     } catch (error) {
       logEvent("terafabx_grok_context_attempt_failed", { provider, attempt, targetUrl: target.url, error: error.message });
       if (error.noRetry) throw error;
@@ -6734,34 +6756,34 @@ async function runTerafabxCommentPrefillQueue({ manual = false, targetCount = TE
         lastCommentPrefillPendingCount: currentPending.length,
         lastCommentPrefillQuotaLimited: false,
         lastCommentPrefillQuotaRetryAt: null,
+        lastCommentPrefillGrokMode: TERAFABX_GROK_CONTEXT_MODE,
       });
       return { ok: true, action: "comment-prefill", queued: 0, pendingCount: currentPending.length };
     }
     workerResources = await prepareTerafabxCommentPrefillWorkers(workerCount);
     const targets = await discoverTerafabxCommentTargets(missing);
     const selected = targets.slice(0, missing);
-    const targetChunks = [];
-    for (let offset = 0; offset < selected.length; offset += 10) targetChunks.push(selected.slice(offset, offset + 10));
-    const chunkWorkerCount = Math.max(1, Math.min(workerCount, targetChunks.length));
-    const contextChunks = await runFixedWorkerPool(targetChunks, chunkWorkerCount, async (targetChunk, workerIndex) => {
+    const contextResults = await runFixedWorkerPool(selected, workerCount, async (targetItem, workerIndex) => {
       const resource = workerResources[workerIndex];
-      const batch = await analyzeTerafabxContextsWithGrok(targetChunk, {
-        session: resource.grokContextSession,
-        skipGrokStateSync: true,
-        timeoutMs: 240_000,
-      });
-      return batch.map((item) => {
-        if (item.ok) return { ok: true, target: item.target, grokContext: item.context, workerIndex };
-        logEvent("terafabx_comment_prefill_item_error", {
-          targetUrl: item.target?.url,
-          error: item.error,
-          workerIndex,
-          stage: "grok_context_batch",
+      try {
+        const grokContext = await analyzeTerafabxContextWithGrok(targetItem, {
+          session: resource.grokContextSession,
+          skipGrokStateSync: true,
+          timeoutMs: 120_000,
+          maxAttempts: 1,
+          lightweight: true,
         });
-        return { ok: false, targetUrl: item.target?.url, error: item.error, workerIndex, stage: "grok_context_batch" };
-      });
+        return { ok: true, target: targetItem, grokContext, workerIndex };
+      } catch (error) {
+        logEvent("terafabx_comment_prefill_item_error", {
+          targetUrl: targetItem.url,
+          error: error.message,
+          workerIndex,
+          stage: "grok_context_single",
+        });
+        return { ok: false, targetUrl: targetItem.url, error: error.message, workerIndex, stage: "grok_context_single" };
+      }
     });
-    const contextResults = contextChunks.flat();
     const results = contextResults.filter((item) => !item.ok);
     const ready = contextResults.filter((item) => item.ok);
     for (let offset = 0; offset < ready.length; offset += 5) {
@@ -6822,6 +6844,7 @@ async function runTerafabxCommentPrefillQueue({ manual = false, targetCount = TE
       lastCommentPrefillPendingCount: pendingCount,
       lastCommentPrefillQuotaLimited: quotaLimited,
       lastCommentPrefillQuotaRetryAt: quotaRetryAt,
+      lastCommentPrefillGrokMode: TERAFABX_GROK_CONTEXT_MODE,
     });
     logEvent("terafabx_comment_prefill_done", { startedAt, requested: missing, selected: selected.length, queued: queued.length, failed: failed.length, pendingCount, status, quotaLimited, error: lastError });
     return { ok: failed.length === 0, action: "comment-prefill", requested: missing, selected: selected.length, queued, failed, pendingCount, status, quotaLimited, error: lastError };
@@ -6838,6 +6861,7 @@ async function runTerafabxCommentPrefillQueue({ manual = false, targetCount = TE
       lastCommentPrefillPendingCount: pendingTerafabxCommentPosts().length,
       lastCommentPrefillQuotaLimited: quotaLimited,
       lastCommentPrefillQuotaRetryAt: quotaLimited ? parseTerafabxGrokQuotaRetryAt(error.message) : null,
+      lastCommentPrefillGrokMode: TERAFABX_GROK_CONTEXT_MODE,
     });
     logEvent("terafabx_comment_prefill_error", { startedAt, error: error.message });
     return { ok: false, action: "comment-prefill", error: error.message };
@@ -6871,7 +6895,8 @@ function parseTerafabxGrokQuotaRetryAt(errorText, now = new Date()) {
 
 function isTerafabxGrokQuotaBackoffActive(state = {}, nowMs = Date.now()) {
   const retryAtMs = Date.parse(state.lastCommentPrefillQuotaRetryAt || "");
-  return state.lastCommentPrefillQuotaLimited === true
+  return state.lastCommentPrefillGrokMode === TERAFABX_GROK_CONTEXT_MODE
+    && state.lastCommentPrefillQuotaLimited === true
     && Number.isFinite(retryAtMs)
     && retryAtMs > Number(nowMs);
 }
@@ -7558,6 +7583,7 @@ function getTerafabxAutomationStatus() {
     schedulerBusy: terafabxSchedulerBusy,
     manualActionPending: terafabxManualActionPending,
     commentPrefill: {
+      grokMode: TERAFABX_GROK_CONTEXT_MODE,
       busy: terafabxCommentPrefillBusy,
       scheduled: Boolean(terafabxCommentPrefillDeferredTimer),
       scheduledFor: terafabxCommentPrefillDeferredAt ? new Date(terafabxCommentPrefillDeferredAt).toISOString() : null,
@@ -7572,8 +7598,8 @@ function getTerafabxAutomationStatus() {
       queued: Number(state.lastCommentPrefillQueued || 0),
       failed: Number(state.lastCommentPrefillFailed || 0),
       pendingCount: Number(state.lastCommentPrefillPendingCount || pendingCommentPosts.length),
-      quotaLimited: Boolean(state.lastCommentPrefillQuotaLimited),
-      quotaRetryAt: state.lastCommentPrefillQuotaRetryAt || null,
+      quotaLimited: isTerafabxGrokQuotaBackoffActive(state),
+      quotaRetryAt: isTerafabxGrokQuotaBackoffActive(state) ? state.lastCommentPrefillQuotaRetryAt || null : null,
     },
     commentMonitor: loadTerafabxCommentMonitorState(),
     jobGapMs: TERAFABX_JOB_GAP_MS,
@@ -14011,6 +14037,7 @@ if (require.main === module) {
 
 module.exports = {
   TERAFABX_GROK_WEB_URL,
+  TERAFABX_GROK_CONTEXT_MODE,
   cleanThreadText,
   dashboardDiscoveryRow,
   DuplicateMirrorError,
@@ -14084,6 +14111,7 @@ module.exports = {
   findXScheduledEntry,
   xScheduledTimeNeedles,
   terafabxGrokContextPrompt,
+  terafabxGrokLightweightContextPrompt,
   terafabxGrokContextBatchPrompt,
   normalizeTerafabxContextResult,
   parseTerafabxGrokContextBatch,
