@@ -11,6 +11,7 @@ const {
   DuplicateMirrorError,
   evaluateTerafabxCommentWorkflow,
   shouldTerafabxCommentMonitorRequestPrefill,
+  terafabxGrokQuotaMonitorFinding,
   isPublishedDiscoveryRow,
   isTerafabxQuietPostingTime,
   terafabxDailyCommentProgress,
@@ -669,6 +670,21 @@ test('TerafabX monitor keeps running but suppresses Grok prefill until the displ
     targetCount: 200,
     nowMs: Date.parse('2026-07-18T15:06:00.000Z'),
   }), true);
+  assert.deepEqual(terafabxGrokQuotaMonitorFinding(state, evaluation, {
+    targetCount: 200,
+    nowMs: now.getTime(),
+  }), {
+    type: 'grok_quota_limited',
+    severity: 'error',
+    error: 'Grok 사용 한도로 Prefill 생성이 일시 중지되었습니다.',
+    retryAt,
+    selected: 0,
+    failed: 0,
+  });
+  assert.equal(terafabxGrokQuotaMonitorFinding(state, evaluation, {
+    targetCount: 200,
+    nowMs: Date.parse('2026-07-18T15:06:00.000Z'),
+  }), null);
 });
 
 test('Grok context batch validates the editor and clicks submit after one keyboard fill', () => {

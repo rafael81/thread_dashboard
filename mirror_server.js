@@ -7955,6 +7955,21 @@ function shouldTerafabxCommentMonitorRequestPrefill(state = {}, evaluation = {},
   );
 }
 
+function terafabxGrokQuotaMonitorFinding(state = {}, evaluation = {}, options = {}) {
+  const nowMs = Number(options.nowMs ?? Date.now());
+  const targetCount = Math.max(0, Number(options.targetCount ?? TERAFABX_COMMENT_PREFILL_TARGET) || 0);
+  if (!isTerafabxGrokQuotaBackoffActive(state, nowMs)) return null;
+  if (evaluation.daily?.reached || Number(evaluation.pendingCount || 0) >= targetCount) return null;
+  return {
+    type: "grok_quota_limited",
+    severity: "error",
+    error: state.lastCommentPrefillError || "Grok 사용 한도로 Prefill 생성이 일시 중지되었습니다.",
+    retryAt: state.lastCommentPrefillQuotaRetryAt || null,
+    selected: Number(state.lastCommentPrefillSelected || 0),
+    failed: Number(state.lastCommentPrefillFailed || 0),
+  };
+}
+
 function quarantineExhaustedTerafabxPendingComments(state = loadTerafabxState()) {
   const failedAt = new Date().toISOString();
   const exhausted = [];
@@ -8145,6 +8160,11 @@ async function runTerafabxCommentMonitor(options = {}) {
         selected: Number(state.lastCommentPrefillSelected || 0),
         failed: Number(state.lastCommentPrefillFailed || 0),
       });
+      evaluation.status = "degraded";
+    }
+    const quotaFinding = terafabxGrokQuotaMonitorFinding(state, evaluation);
+    if (quotaFinding && !evaluation.findings.some((item) => item.type === "grok_quota_limited")) {
+      evaluation.findings.push(quotaFinding);
       evaluation.status = "degraded";
     }
     const runtime = {
@@ -14004,6 +14024,7 @@ module.exports = {
   deriveTerafabxCommentQualityFeedback,
   evaluateTerafabxCommentWorkflow,
   shouldTerafabxCommentMonitorRequestPrefill,
+  terafabxGrokQuotaMonitorFinding,
   assessTerafabxCurrentCommentPolicy,
   quarantineTerafabxPendingCommentPost,
   auditTerafabxPrefillQuality,
