@@ -41,6 +41,7 @@ const {
   isTerafabxReplySubmitCandidate,
   isTerafabxReplySubmissionUncertain,
   isTerafabxTransientReplyPageError,
+  shouldRetryTerafabxHeadlessReply,
   isTerafabxPendingCommentEligible,
   recoverRecentTransientPrefillFailures,
   terafabxPendingCommentFailureDisposition,
@@ -498,6 +499,18 @@ test("a blank X reply page is retried with a cooldown instead of being exhausted
   assert.equal(result.removeFromPending, false);
   assert.equal(result.transientPageError, true);
   assert.ok(Date.parse(result.nextAttemptAt) > Date.now());
+});
+
+test("headless reply retries one pre-submit transient browser failure only", () => {
+  const transient = new Error("Runtime.evaluate timed out");
+  const uncertain = new Error("reply relationship verification failed");
+  uncertain.code = "TERAFABX_REPLY_SUBMISSION_UNCERTAIN";
+
+  assert.equal(shouldRetryTerafabxHeadlessReply(transient, 1, { headless: true }), true);
+  assert.equal(shouldRetryTerafabxHeadlessReply(transient, 2, { headless: true }), false);
+  assert.equal(shouldRetryTerafabxHeadlessReply(transient, 1, { headless: false }), false);
+  assert.equal(shouldRetryTerafabxHeadlessReply(transient, 1, { headless: true, retryTransient: false }), false);
+  assert.equal(shouldRetryTerafabxHeadlessReply(uncertain, 1, { headless: true }), false);
 });
 
 test("a pending comment remains ineligible until its retry cooldown expires", () => {

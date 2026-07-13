@@ -5168,6 +5168,14 @@ function isTerafabxTransientReplyPageError(error) {
   return /target root 검증 실패:.*\"text\":\"\"|활성화된 답글 게시 버튼을 찾지 못했습니다|X .*로딩 실패|Runtime\.evaluate timed out|missing_editor/i.test(message);
 }
 
+function shouldRetryTerafabxHeadlessReply(error, attempt = 1, options = {}) {
+  return options.headless === true
+    && options.retryTransient !== false
+    && Number(attempt || 1) < 2
+    && !isTerafabxReplySubmissionUncertain(error)
+    && isTerafabxTransientReplyPageError(error);
+}
+
 function terafabxPendingCommentMaxAttempts(item = {}, error = null) {
   const candidateError = error || item.lastError || "";
   return isTerafabxTransientReplyPageError(candidateError)
@@ -5198,7 +5206,23 @@ function terafabxPendingCommentFailureDisposition(item = {}, error, maxAttempts 
 async function postTerafabxReply(targetUrl, comment, options = {}) {
   let result;
   if (options.headless) {
-    result = await withTerafabxCommentXLock(options.lockAction || "reply-post", () => postTerafabxReplyUnlocked(targetUrl, comment, options), {
+    result = await withTerafabxCommentXLock(options.lockAction || "reply-post", async () => {
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        try {
+          return await postTerafabxReplyUnlocked(targetUrl, comment, options);
+        } catch (error) {
+          if (!shouldRetryTerafabxHeadlessReply(error, attempt, options)) throw error;
+          logEvent("terafabx_reply_transient_retry", {
+            targetUrl,
+            attempt,
+            error: error.message,
+          });
+          await closeTerafabxCommentXHeadlessBrowser().catch(() => null);
+          await sleep(1_000);
+        }
+      }
+      throw new Error("헤드리스 X 답글 재시도 횟수를 초과했습니다.");
+    }, {
       wait: options.lockWait !== false,
       timeoutMs: Number(options.lockTimeoutMs || 6 * 60 * 1000),
     });
@@ -13997,6 +14021,7 @@ module.exports = {
   isTerafabxReplySubmitCandidate,
   isTerafabxReplySubmissionUncertain,
   isTerafabxTransientReplyPageError,
+  shouldRetryTerafabxHeadlessReply,
   isTerafabxPendingCommentEligible,
   terafabxPendingCommentFailureDisposition,
   recoverRecentTransientPrefillFailures,
