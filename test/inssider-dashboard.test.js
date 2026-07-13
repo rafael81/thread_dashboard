@@ -286,6 +286,33 @@ test('TerafabX final judge rejects a high total score when context is below the 
   assert.equal(result.passed, false);
 });
 
+test('TerafabX final judge accepts a source anchor found in quoted post text', () => {
+  const result = parseTerafabxFinalJudge(JSON.stringify({
+    context: 40,
+    naturalness: 25,
+    specificity: 15,
+    concision: 10,
+    non_ai_style: 10,
+    fatal_error: false,
+    language_error: false,
+    awkward_korean: false,
+    translation_tone: false,
+    cliche: false,
+    context_error: false,
+    cross_post_reusable: false,
+    headline_tone: false,
+    specificity_error: false,
+    source_anchor: '엉덩이 가운데에 넣어줍니다',
+    reason: '인용 원문의 구체적인 행동을 정확히 짚음',
+  }), '엉덩이 밑에 손 넣는 것부터 따라 해봐야겠어요', {
+    targetText: '물리치료사가 알려주는 수제 동영상',
+    quotePostText: '중지 손가락을 엉덩이 가운데에 넣어줍니다',
+  });
+
+  assert.equal(result.sourceAnchorGrounded, true);
+  assert.equal(result.passed, true);
+});
+
 test('TerafabX daily comment cadence targets 600 and accelerates when behind pace', () => {
   const now = new Date('2026-07-11T00:18:00.000Z'); // 09:18 KST
   const commentHistory = Array.from({ length: 45 }, (_, index) => ({

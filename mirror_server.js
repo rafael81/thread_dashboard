@@ -2439,7 +2439,7 @@ function normalizeTerafabxFinalJudgeParsed(parsed, finalReply, rawPreview = "") 
 
 function applyTerafabxJudgeSourceGrounding(judge, target = null) {
   if (!target) return judge;
-  const source = cleanSocialText([target.rootPostText, target.targetText, target.text].filter(Boolean).join(" ")).toLowerCase();
+  const source = cleanSocialText([target.rootPostText, target.targetText, target.text, target.quotePostText].filter(Boolean).join(" ")).toLowerCase();
   const anchor = cleanSocialText(judge.sourceAnchor || "").toLowerCase();
   const sourceAnchorGrounded = Boolean(source && anchor && source.includes(anchor));
   const flaggedQualityIssues = sourceAnchorGrounded
