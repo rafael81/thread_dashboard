@@ -105,5 +105,11 @@ test("prefill audit checks every queued and posted item with the genericity gate
   assert.equal(audit.checkedCount, 2);
   assert.equal(audit.passedCount, 1);
   assert.equal(audit.failedCount, 1);
+  assert.equal(audit.pendingCount, 1);
+  assert.equal(audit.pendingPassedCount, 1);
+  assert.equal(audit.pendingFailedCount, 0);
+  assert.equal(audit.postedCount, 1);
+  assert.equal(audit.postedPassedCount, 0);
+  assert.equal(audit.postedFailedCount, 1);
   assert.ok(audit.items.find((item) => !item.ok).errors.includes("genericity_quality_flags_missing"));
 });

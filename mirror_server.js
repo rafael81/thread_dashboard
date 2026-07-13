@@ -8030,6 +8030,10 @@ function auditTerafabxPrefillQuality(state = loadTerafabxState(), options = {}) 
     failedCount: items.filter((item) => !item.ok).length,
     pendingCount: items.filter((item) => item.status !== "posted").length,
     postedCount: items.filter((item) => item.status === "posted").length,
+    pendingPassedCount: items.filter((item) => item.status !== "posted" && item.ok).length,
+    pendingFailedCount: items.filter((item) => item.status !== "posted" && !item.ok).length,
+    postedPassedCount: items.filter((item) => item.status === "posted" && item.ok).length,
+    postedFailedCount: items.filter((item) => item.status === "posted" && !item.ok).length,
     items,
   };
 }
