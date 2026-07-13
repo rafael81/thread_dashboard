@@ -4792,48 +4792,6 @@ async function generateTerafabxReplyWithGrok(target, options = {}) {
   };
 }
 
-async function postTerafabxReplyViaIntent(page, targetUrl, comment, id) {
-  const intentUrl = `https://x.com/intent/tweet?in_reply_to=${encodeURIComponent(id)}&text=${encodeURIComponent(comment)}`;
-  await page.navigate(intentUrl, 6000);
-  await sleep(900);
-  logEvent("terafabx_reply_intent_opened", { targetUrl });
-  const clickedPost = await page.eval(`(async () => {
-    async function wait(ms) { await new Promise((resolve) => setTimeout(resolve, ms)); }
-    for (let attempt = 0; attempt < 20; attempt += 1) {
-      const buttons = Array.from(document.querySelectorAll('[data-testid="tweetButton"], [data-testid="tweetButtonInline"]'))
-        .filter((el) => el.offsetWidth && el.offsetHeight && !(el.disabled || el.getAttribute("aria-disabled") === "true"));
-      const button = buttons.pop();
-      if (button) {
-        button.click();
-        return { clicked: true, text: button.innerText || button.getAttribute("aria-label") || "", attempt };
-      }
-      await wait(300);
-    }
-    return { clicked: false };
-  })()`);
-  if (!clickedPost.clicked) throw new Error("quick intent 답글 게시 버튼을 찾지 못했습니다.");
-  logEvent("terafabx_reply_submit_clicked", { targetUrl, button: clickedPost.text, quick: true, mode: "intent" });
-  await sleep(1600);
-  const verifyNeedle = String(comment).split(/\n+/).map((line) => line.trim()).filter(Boolean).join(" ").slice(0, 64);
-  await page.navigate("https://x.com/terafabXai/with_replies", 5000);
-  const verify = await page.eval(`(() => {
-    const needle = ${JSON.stringify(verifyNeedle)};
-    function clean(s) { return (s || "").replace(/\\s+/g, " ").trim(); }
-    for (const article of Array.from(document.querySelectorAll("article")).slice(0, 12)) {
-      const text = clean(article.innerText || "");
-      if (!needle || !text.includes(needle)) continue;
-      const href = Array.from(article.querySelectorAll('a[href*="/status/"]'))
-        .map((a) => a.href)
-        .find((href) => href.includes('/terafabXai/status/') && !href.includes('/analytics'));
-      if (href) return { found: true, href: href.split("?")[0], text: text.slice(0, 800), url: location.href };
-    }
-    return { found: false, url: location.href };
-  })()`);
-  if (!verify.found || !verify.href) throw new Error(`quick intent 답글 게시 검증 실패: ${JSON.stringify(verify)}`);
-  logEvent("terafabx_reply_verified_quick", { targetUrl, replyUrl: verify.href, mode: "intent" });
-  return { ok: true, replyUrl: verify.href, verify: { ...verify, quick: true, mode: "intent" } };
-}
-
 function terafabxStatusHrefMatches(href, targetId) {
   const wanted = String(targetId || "").trim();
   if (!wanted) return false;
@@ -4844,6 +4802,30 @@ function terafabxStatusHrefMatches(href, targetId) {
   } catch {
     return false;
   }
+}
+
+function isTerafabxReplySubmitCandidate(candidate = {}) {
+  if (!candidate.withinReplyComposer) return false;
+  const testid = String(candidate.testid || "").trim();
+  const text = String(candidate.text || "").replace(/\s+/g, " ").trim();
+  const recognizedControl = testid === "tweetButton" || testid === "tweetButtonInline" || candidate.role === "button";
+  return recognizedControl && /^(답글|Reply)$/i.test(text);
+}
+
+function isTerafabxReplySubmissionUncertain(error) {
+  return String(error?.code || "") === "TERAFABX_REPLY_SUBMISSION_UNCERTAIN";
+}
+
+function terafabxPendingCommentFailureDisposition(item = {}, error, maxAttempts = TERAFABX_PENDING_COMMENT_MAX_ATTEMPTS) {
+  const attempts = Number(item.attempts || 0) + 1;
+  const submissionUncertain = isTerafabxReplySubmissionUncertain(error);
+  const removeFromPending = submissionUncertain || attempts >= maxAttempts;
+  return {
+    attempts,
+    submissionUncertain,
+    removeFromPending,
+    failedReason: submissionUncertain ? "submission_uncertain" : (removeFromPending ? "max_attempts" : null),
+  };
 }
 
 async function postTerafabxReply(targetUrl, comment, options = {}) {
@@ -4857,7 +4839,12 @@ async function postTerafabxReply(targetUrl, comment, options = {}) {
     result = await postTerafabxReplyUnlocked(targetUrl, comment, options);
   }
   if (result?.ok && result.replyUrl && options.verifyRelationship !== false) {
-    result.relationship = await verifyTerafabxReplyRelationship(result.replyUrl, targetUrl);
+    try {
+      result.relationship = await verifyTerafabxReplyRelationship(result.replyUrl, targetUrl);
+    } catch (error) {
+      error.code = "TERAFABX_REPLY_SUBMISSION_UNCERTAIN";
+      throw error;
+    }
   }
   return result;
 }
@@ -4930,29 +4917,22 @@ async function likeTerafabxTarget(targetUrl, options = {}) {
 }
 
 function shouldUseTerafabxQuickIntent(options = {}, targetId = "") {
-  return Boolean(options.quick && String(targetId || "").trim());
+  // X intent may render a generic top-level composer. It cannot prove the
+  // parent relationship before submit, so reply automation must never use it.
+  return false;
 }
 
 async function postTerafabxReplyUnlocked(targetUrl, comment, options = {}) {
   logEvent("terafabx_reply_post_start", { targetUrl, comment });
   const id = (targetUrl.match(/status\/(\d+)/) || [])[1] || "";
   const useHeadless = Boolean(options.headless);
-  const useQuickIntent = shouldUseTerafabxQuickIntent(options, id);
+  let replySubmissionClicked = false;
   const page = useHeadless
-    ? await getTerafabxCommentXHeadlessPage(useQuickIntent ? "https://x.com/home" : targetUrl)
-    : (useQuickIntent
-      ? await newPage("https://x.com/home")
-      : await getExistingXPage(targetUrl));
+    ? await getTerafabxCommentXHeadlessPage(targetUrl)
+    : await getExistingXPage(targetUrl);
   try {
     await closeXDialogs(page);
     await verifyXAccount(page);
-    if (useQuickIntent) {
-      try {
-        return await postTerafabxReplyViaIntent(page, targetUrl, comment, id);
-      } catch (error) {
-        logEvent("terafabx_reply_quick_intent_fallback", { targetUrl, error: error.message });
-      }
-    }
     await page.navigate(targetUrl, 7500);
     const pre = await page.eval(`(() => {
       const id = ${JSON.stringify(id)};
@@ -5063,21 +5043,20 @@ async function postTerafabxReplyUnlocked(targetUrl, comment, options = {}) {
       function buttonText(el) {
         return (el?.innerText || el?.getAttribute("aria-label") || el?.getAttribute("data-testid") || "").trim();
       }
-      function isSubmitButton(el) {
-        const testid = el.getAttribute("data-testid") || "";
-        const text = buttonText(el).replace(/\\s+/g, " ");
-        return /^(tweetButton|tweetButtonInline)$/.test(testid)
-          || /^(답글|게시|Post|Reply|Tweet)$/i.test(text);
-      }
       function findSubmitButton() {
         const editors = Array.from(document.querySelectorAll('[data-testid="tweetTextarea_0"], [role="textbox"][contenteditable="true"], [contenteditable="true"]')).filter(visible);
         const editor = editors.pop();
-        const scope = editor?.closest('[role="dialog"], [data-testid="sheetDialog"], article, main') || document;
-        const scopedButtons = Array.from(scope.querySelectorAll('[data-testid="tweetButton"], [data-testid="tweetButtonInline"], button, [role="button"]'));
-        const globalButtons = Array.from(document.querySelectorAll('[data-testid="tweetButton"], [data-testid="tweetButtonInline"]'));
-        return [...scopedButtons, ...globalButtons]
+        const scope = editor?.closest('[role="dialog"], [data-testid="sheetDialog"]') || null;
+        if (!scope) return null;
+        const isReplySubmitCandidate = ${isTerafabxReplySubmitCandidate.toString()};
+        return Array.from(scope.querySelectorAll('[data-testid="tweetButton"], [data-testid="tweetButtonInline"], button, [role="button"]'))
           .filter(enabled)
-          .find(isSubmitButton);
+          .find((el) => isReplySubmitCandidate({
+            withinReplyComposer: true,
+            testid: el.getAttribute("data-testid") || "",
+            text: buttonText(el),
+            role: el.getAttribute("role") || (el.tagName === "BUTTON" ? "button" : ""),
+          }));
       }
       for (let attempt = 0; attempt < 18; attempt += 1) {
         const button = findSubmitButton();
@@ -5105,63 +5084,9 @@ async function postTerafabxReplyUnlocked(targetUrl, comment, options = {}) {
         length: [...String(comment || "")].length,
         candidates: clickedPost.candidates,
       });
-      if (id) {
-        const intentUrl = `https://x.com/intent/tweet?in_reply_to=${encodeURIComponent(id)}&text=${encodeURIComponent(comment)}`;
-        logEvent("terafabx_reply_submit_intent_fallback_start", { targetUrl, validate: options.validate !== false });
-        await page.navigate(intentUrl, 8000);
-        await sleep(1800);
-        clickedPost = await page.eval(`(async () => {
-          async function wait(ms) { await new Promise((resolve) => setTimeout(resolve, ms)); }
-          function visible(el) {
-            const rect = el && el.getBoundingClientRect();
-            const style = el && getComputedStyle(el);
-            return Boolean(rect && rect.width && rect.height && style.visibility !== "hidden" && style.display !== "none");
-          }
-          function enabled(el) {
-            return visible(el) && !(el.disabled || el.getAttribute("aria-disabled") === "true");
-          }
-          function buttonText(el) {
-            return (el?.innerText || el?.getAttribute("aria-label") || el?.getAttribute("data-testid") || "").trim();
-          }
-          function isSubmitButton(el) {
-            const testid = el.getAttribute("data-testid") || "";
-            const text = buttonText(el).replace(/\\s+/g, " ");
-            return /^(tweetButton|tweetButtonInline)$/.test(testid)
-              || /^(답글|게시|Post|Reply|Tweet)$/i.test(text);
-          }
-          function findSubmitButton() {
-            const editors = Array.from(document.querySelectorAll('[data-testid="tweetTextarea_0"], [role="textbox"][contenteditable="true"], [contenteditable="true"]')).filter(visible);
-            const editor = editors.pop();
-            const scope = editor?.closest('[role="dialog"], [data-testid="sheetDialog"], article, main') || document;
-            const scopedButtons = Array.from(scope.querySelectorAll('[data-testid="tweetButton"], [data-testid="tweetButtonInline"], button, [role="button"]'));
-            const globalButtons = Array.from(document.querySelectorAll('[data-testid="tweetButton"], [data-testid="tweetButtonInline"]'));
-            return [...scopedButtons, ...globalButtons]
-              .filter(enabled)
-              .find(isSubmitButton);
-          }
-          for (let attempt = 0; attempt < 18; attempt += 1) {
-            const button = findSubmitButton();
-            if (button) {
-              button.click();
-              return { clicked: true, text: button.innerText || button.getAttribute("aria-label") || "", attempt, fallback: "intent" };
-            }
-            await wait(500);
-          }
-          return {
-            clicked: false,
-            fallback: "intent",
-            keyboardFallbackAttempted: false,
-            candidates: Array.from(document.querySelectorAll('button, [role="button"]')).map((el) => ({
-              text: el.innerText || "",
-              label: el.getAttribute("aria-label") || "",
-              testid: el.getAttribute("data-testid") || "",
-              disabled: Boolean(el.disabled || el.getAttribute("aria-disabled") === "true"),
-            })).slice(-12),
-          };
-        })()`);
-      }
       if (!clickedPost.clicked) throw new Error("활성화된 답글 게시 버튼을 찾지 못했습니다.");
     }
+    replySubmissionClicked = true;
     logEvent("terafabx_reply_submit_clicked", { targetUrl, button: clickedPost.text });
     if (options.quick) {
       await sleep(1200);
@@ -5243,10 +5168,15 @@ async function postTerafabxReplyUnlocked(targetUrl, comment, options = {}) {
         logEvent("terafabx_reply_verify_relaxed", { targetUrl, replyUrl, verify });
         return { ok: true, replyUrl, verify: { ...verify, relaxed: true } };
       }
-      throw new Error(`답글 게시 검증 실패: ${JSON.stringify(verify)}`);
+      const error = new Error(`답글 게시 검증 실패: ${JSON.stringify(verify)}`);
+      error.code = "TERAFABX_REPLY_SUBMISSION_UNCERTAIN";
+      throw error;
     }
     logEvent("terafabx_reply_verified", { targetUrl, replyUrl: verify.href });
     return { ok: true, replyUrl: verify.href, verify };
+  } catch (error) {
+    if (replySubmissionClicked && !error.code) error.code = "TERAFABX_REPLY_SUBMISSION_UNCERTAIN";
+    throw error;
   } finally {
     logEvent("terafabx_reply_page_close_start", { targetUrl });
     await page.close();
@@ -6519,10 +6449,10 @@ async function runTerafabxPendingCommentPosts({ manual = false, limit = 5 } = {}
           let failedRecord = null;
           const pending = pendingTerafabxCommentPosts(previous).flatMap((item) => {
             if (normalizeXStatusUrl(item.targetUrl || "") !== targetUrl) return [item];
-            const attempts = Number(item.attempts || 0) + 1;
-            const nextItem = { ...item, attempts, lastError: error.message, lastAttemptAt: failedAt, updatedAt: failedAt };
-            if (attempts >= TERAFABX_PENDING_COMMENT_MAX_ATTEMPTS) {
-              failedRecord = { ...nextItem, status: "error", errorAt: failedAt, failedReason: "max_attempts" };
+            const disposition = terafabxPendingCommentFailureDisposition(item, error);
+            const nextItem = { ...item, attempts: disposition.attempts, lastError: error.message, lastAttemptAt: failedAt, updatedAt: failedAt };
+            if (disposition.removeFromPending) {
+              failedRecord = { ...nextItem, status: "error", errorAt: failedAt, failedReason: disposition.failedReason };
               return [];
             }
             return [nextItem];
@@ -6546,6 +6476,7 @@ async function runTerafabxPendingCommentPosts({ manual = false, limit = 5 } = {}
             targetUrl,
             error: error.message,
             removedFromPending: Boolean(failedRecord),
+            submissionUncertain: isTerafabxReplySubmissionUncertain(error),
             maxAttempts: TERAFABX_PENDING_COMMENT_MAX_ATTEMPTS,
           });
           break;
@@ -13239,6 +13170,9 @@ module.exports = {
   isTerafabxAdComment,
   isTerafabxSkippableOwnPostReplyTargetError,
   terafabxStatusHrefMatches,
+  isTerafabxReplySubmitCandidate,
+  isTerafabxReplySubmissionUncertain,
+  terafabxPendingCommentFailureDisposition,
   terafabxBrowserConcurrency,
   terafabxCommentPrefillWorkerResources,
   isTerafabxGeminiWorkTab,

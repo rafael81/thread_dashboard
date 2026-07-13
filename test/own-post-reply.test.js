@@ -37,6 +37,9 @@ const {
   terafabxGeminiBatchGeneratePrompt,
   terafabxGeminiReviewPrompt,
   terafabxStatusHrefMatches,
+  isTerafabxReplySubmitCandidate,
+  isTerafabxReplySubmissionUncertain,
+  terafabxPendingCommentFailureDisposition,
   withTerafabxBrowserSetupCleanup,
   terafabxGeminiPriorityValue,
 } = require("../mirror_server");
@@ -392,11 +395,37 @@ test("own-post batch delay is an inclusive 10 to 20 second random interval", () 
   assert.equal(randomTerafabxOwnPostReplyDelayMs(() => 0.5), 15_000);
 });
 
-test("quick reply helper still requires an explicit target id", () => {
-  assert.equal(shouldUseTerafabxQuickIntent({ quick: true }, "2075864860676809145"), true);
-  assert.equal(shouldUseTerafabxQuickIntent({ quick: true, validate: true }, "2075864860676809145"), true);
+test("quick intent submission is disabled because it cannot prove reply context before posting", () => {
+  assert.equal(shouldUseTerafabxQuickIntent({ quick: true }, "2075864860676809145"), false);
+  assert.equal(shouldUseTerafabxQuickIntent({ quick: true, validate: true }, "2075864860676809145"), false);
   assert.equal(shouldUseTerafabxQuickIntent({ quick: false }, "2075864860676809145"), false);
   assert.equal(shouldUseTerafabxQuickIntent({ quick: true }, ""), false);
+});
+
+test("reply submit accepts only an explicit Reply button inside the reply composer", () => {
+  assert.equal(isTerafabxReplySubmitCandidate({ withinReplyComposer: true, testid: "tweetButton", text: "답글" }), true);
+  assert.equal(isTerafabxReplySubmitCandidate({ withinReplyComposer: true, testid: "tweetButtonInline", text: "Reply" }), true);
+  assert.equal(isTerafabxReplySubmitCandidate({ withinReplyComposer: false, testid: "tweetButton", text: "답글" }), false);
+  assert.equal(isTerafabxReplySubmitCandidate({ withinReplyComposer: true, testid: "tweetButton", text: "게시하기" }), false);
+  assert.equal(isTerafabxReplySubmitCandidate({ withinReplyComposer: true, testid: "tweetButton", text: "Post" }), false);
+});
+
+test("an uncertain reply submission is quarantined instead of retried", () => {
+  const error = new Error("reply verification timed out after submit");
+  error.code = "TERAFABX_REPLY_SUBMISSION_UNCERTAIN";
+  assert.equal(isTerafabxReplySubmissionUncertain(error), true);
+  assert.deepEqual(terafabxPendingCommentFailureDisposition({ attempts: 0 }, error, 3), {
+    attempts: 1,
+    submissionUncertain: true,
+    removeFromPending: true,
+    failedReason: "submission_uncertain",
+  });
+  assert.deepEqual(terafabxPendingCommentFailureDisposition({ attempts: 0 }, new Error("browser did not open"), 3), {
+    attempts: 1,
+    submissionUncertain: false,
+    removeFromPending: false,
+    failedReason: null,
+  });
 });
 
 test("Grok quota text is not converted into a typed own-post backoff error", () => {
