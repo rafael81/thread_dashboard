@@ -39,6 +39,7 @@ const {
   terafabxStatusHrefMatches,
   isTerafabxReplySubmitCandidate,
   isTerafabxReplySubmissionUncertain,
+  isTerafabxTransientReplyPageError,
   terafabxPendingCommentFailureDisposition,
   withTerafabxBrowserSetupCleanup,
   xPageReadyState,
@@ -439,6 +440,17 @@ test("an uncertain reply submission is quarantined instead of retried", () => {
     removeFromPending: false,
     failedReason: null,
   });
+});
+
+test("a blank X reply page is retried with a cooldown instead of being exhausted rapidly", () => {
+  const error = new Error('target root 검증 실패: {"ok":false,"text":"","url":"https://x.com/a/status/1"}');
+  assert.equal(isTerafabxTransientReplyPageError(error), true);
+  const result = terafabxPendingCommentFailureDisposition({ attempts: 2 }, error, 3);
+  assert.equal(result.attempts, 3);
+  assert.equal(result.submissionUncertain, false);
+  assert.equal(result.removeFromPending, false);
+  assert.equal(result.transientPageError, true);
+  assert.ok(Date.parse(result.nextAttemptAt) > Date.now());
 });
 
 test("Grok quota text is not converted into a typed own-post backoff error", () => {

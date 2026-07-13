@@ -100,6 +100,8 @@ const TERAFABX_COMMENT_PREFILL_TARGET = Number(process.env.TERAFABX_COMMENT_PREF
 const TERAFABX_COMMENT_PREFILL_CONCURRENCY = Number(process.env.TERAFABX_COMMENT_PREFILL_CONCURRENCY || TERAFABX_BROWSER_CONCURRENCY_CAP);
 const TERAFABX_COMMENT_PREFILL_GEMINI_PORT_BASE = Number(process.env.TERAFABX_COMMENT_PREFILL_GEMINI_PORT_BASE || 9254);
 const TERAFABX_PENDING_COMMENT_MAX_ATTEMPTS = Number(process.env.TERAFABX_PENDING_COMMENT_MAX_ATTEMPTS || 3);
+const TERAFABX_PENDING_COMMENT_TRANSIENT_MAX_ATTEMPTS = Number(process.env.TERAFABX_PENDING_COMMENT_TRANSIENT_MAX_ATTEMPTS || 12);
+const TERAFABX_PENDING_COMMENT_TRANSIENT_RETRY_MS = Number(process.env.TERAFABX_PENDING_COMMENT_TRANSIENT_RETRY_MS || 10 * 60 * 1000);
 const CDP_HTTP_TIMEOUT_MS = Number(process.env.CDP_HTTP_TIMEOUT_MS || 10_000);
 const CDP_WS_OPEN_TIMEOUT_MS = Number(process.env.CDP_WS_OPEN_TIMEOUT_MS || 10_000);
 const TERAFABX_REVIEW_COMMENT_MIN_SCORE = Number(process.env.TERAFABX_REVIEW_COMMENT_MIN_SCORE || 90);
@@ -5029,15 +5031,35 @@ function isTerafabxReplySubmissionUncertain(error) {
   return String(error?.code || "") === "TERAFABX_REPLY_SUBMISSION_UNCERTAIN";
 }
 
+function isTerafabxTransientReplyPageError(error) {
+  const message = String(error?.message || error || "");
+  return /target root 검증 실패:.*\"text\":\"\"|활성화된 답글 게시 버튼을 찾지 못했습니다|X .*로딩 실패|Runtime\.evaluate timed out|missing_editor/i.test(message);
+}
+
+function terafabxPendingCommentMaxAttempts(item = {}, error = null) {
+  const candidateError = error || item.lastError || "";
+  return isTerafabxTransientReplyPageError(candidateError)
+    ? Math.max(TERAFABX_PENDING_COMMENT_MAX_ATTEMPTS, TERAFABX_PENDING_COMMENT_TRANSIENT_MAX_ATTEMPTS)
+    : TERAFABX_PENDING_COMMENT_MAX_ATTEMPTS;
+}
+
 function terafabxPendingCommentFailureDisposition(item = {}, error, maxAttempts = TERAFABX_PENDING_COMMENT_MAX_ATTEMPTS) {
   const attempts = Number(item.attempts || 0) + 1;
   const submissionUncertain = isTerafabxReplySubmissionUncertain(error);
-  const removeFromPending = submissionUncertain || attempts >= maxAttempts;
+  const transientPageError = isTerafabxTransientReplyPageError(error);
+  const effectiveMaxAttempts = transientPageError
+    ? Math.max(maxAttempts, TERAFABX_PENDING_COMMENT_TRANSIENT_MAX_ATTEMPTS)
+    : maxAttempts;
+  const removeFromPending = submissionUncertain || attempts >= effectiveMaxAttempts;
   return {
     attempts,
     submissionUncertain,
     removeFromPending,
     failedReason: submissionUncertain ? "submission_uncertain" : (removeFromPending ? "max_attempts" : null),
+    ...(transientPageError && !removeFromPending ? {
+      transientPageError: true,
+      nextAttemptAt: new Date(Date.now() + TERAFABX_PENDING_COMMENT_TRANSIENT_RETRY_MS).toISOString(),
+    } : {}),
   };
 }
 
@@ -6612,7 +6634,13 @@ async function runTerafabxPendingCommentPosts({ manual = false, limit = 5 } = {}
   try {
       const requestedLimit = Math.max(0, Number(limit || 0)) || 5;
       const effectiveLimit = manual ? requestedLimit : Math.min(requestedLimit, daily.remaining);
-      const candidates = pendingTerafabxCommentPosts().slice(0, effectiveLimit);
+      const nowMs = Date.now();
+      const candidates = pendingTerafabxCommentPosts()
+        .filter((item) => {
+          const nextAttemptMs = Date.parse(item.nextAttemptAt || "");
+          return !Number.isFinite(nextAttemptMs) || nextAttemptMs <= nowMs;
+        })
+        .slice(0, effectiveLimit);
       const posted = [];
       const failed = [];
       logEvent("terafabx_pending_comment_post_start", { count: candidates.length, manual });
@@ -6670,7 +6698,14 @@ async function runTerafabxPendingCommentPosts({ manual = false, limit = 5 } = {}
           const pending = pendingTerafabxCommentPosts(previous).flatMap((item) => {
             if (normalizeXStatusUrl(item.targetUrl || "") !== targetUrl) return [item];
             const disposition = terafabxPendingCommentFailureDisposition(item, error);
-            const nextItem = { ...item, attempts: disposition.attempts, lastError: error.message, lastAttemptAt: failedAt, updatedAt: failedAt };
+            const nextItem = {
+              ...item,
+              attempts: disposition.attempts,
+              lastError: error.message,
+              lastAttemptAt: failedAt,
+              nextAttemptAt: disposition.nextAttemptAt || null,
+              updatedAt: failedAt,
+            };
             if (disposition.removeFromPending) {
               failedRecord = { ...nextItem, status: "error", errorAt: failedAt, failedReason: disposition.failedReason };
               return [];
@@ -7587,7 +7622,7 @@ function quarantineExhaustedTerafabxPendingComments(state = loadTerafabxState())
   const failedAt = new Date().toISOString();
   const exhausted = [];
   const remaining = pendingTerafabxCommentPosts(state).filter((item) => {
-    if (Number(item.attempts || 0) < TERAFABX_PENDING_COMMENT_MAX_ATTEMPTS) return true;
+    if (Number(item.attempts || 0) < terafabxPendingCommentMaxAttempts(item)) return true;
     exhausted.push({ ...item, status: "error", errorAt: failedAt, failedReason: "monitor_max_attempts" });
     return false;
   });
@@ -13486,6 +13521,7 @@ module.exports = {
   terafabxStatusHrefMatches,
   isTerafabxReplySubmitCandidate,
   isTerafabxReplySubmissionUncertain,
+  isTerafabxTransientReplyPageError,
   terafabxPendingCommentFailureDisposition,
   terafabxBrowserConcurrency,
   terafabxCommentPrefillWorkerResources,
