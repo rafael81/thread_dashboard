@@ -220,6 +220,17 @@ test('TerafabX Gemini rewrite prompt does not ask the rewriting model to score i
   assert.match(prompt, /길이를 늘리기보다 원문의 구체적인/);
 });
 
+test('TerafabX Gemini quality prompts flag reusable engagement endings', () => {
+  const prompt = require('../mirror_server.js').terafabxGeminiBatchFinalJudgePrompt([{
+    target: { url: 'https://x.com/example/status/1', targetText: '결항확인서를 꼭 발급하세요' },
+    prepared: { comment: '미리 저장해 둡니다', grokContext: { summary: '결항 대처 팁', keyPoints: [] } },
+  }]);
+
+  assert.match(prompt, /마음에 와닿네요/);
+  assert.match(prompt, /도움이 되면 좋겠네요/);
+  assert.match(prompt, /미리 저장해 둡니다/);
+});
+
 test('TerafabX final judge passes a natural specific reply at the quality threshold', () => {
   const result = parseTerafabxFinalJudge(JSON.stringify({
     context: 36,
@@ -349,6 +360,33 @@ test('TerafabX final judge rejects a concrete association absent from the source
   assert.equal(result.rawScore, 100);
   assert.equal(result.passed, false);
   assert.deepEqual(result.flaggedQualityIssues, ['unsupported_claim']);
+});
+
+test('TerafabX current policy rejects a currency unit invented from a bare number', () => {
+  const result = assessTerafabxCurrentCommentPolicy({
+    source: 'prefill',
+    queuedAt: '2026-07-13T16:38:51.152Z',
+    targetText: '살까',
+    quotePostText: '결승전 잔디를 한조각에 60에 판다고',
+    comment: '결승전 잔디 한 조각이 육십만 원이라니',
+    grokContext: { summary: '잔디 가격에 놀라는 글' },
+    geminiReview: {
+      score: 100,
+      finalJudge: {
+        score: 100,
+        dimensions: { context: 40 },
+        passed: true,
+        fatalError: false,
+        qualityFlagsComplete: true,
+        genericityFlagsComplete: true,
+        sourceAnchorGrounded: true,
+        flaggedQualityIssues: [],
+      },
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.includes('unsupported_currency_unit_expansion'));
 });
 
 test('TerafabX daily comment cadence targets 600 and accelerates when behind pace', () => {
