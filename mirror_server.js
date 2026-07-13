@@ -6761,8 +6761,12 @@ function assessTerafabxCurrentCommentPolicy(record) {
   const recordCreatedAt = Date.parse(record?.queuedAt || record?.at || record?.postedAt || "");
   const requiresStructuredQuality = !Number.isFinite(recordCreatedAt) || recordCreatedAt >= structuredQualityRolloutAt;
   if (requiresStructuredQuality && finalJudge?.qualityFlagsComplete !== true) errors.push("structured_quality_flags_missing");
+  const recoveredTransientPrefill = record?.source === "prefill"
+    && Boolean(record?.nextAttemptAt)
+    && Number(record?.attempts || 0) === 0
+    && isTerafabxTransientReplyPageError(record?.lastError || "");
   const requiresGenericityQuality = record?.source === "prefill"
-    && (!Number.isFinite(recordCreatedAt) || recordCreatedAt >= TERAFABX_PREFILL_GENERICITY_ROLLOUT_AT);
+    && (recoveredTransientPrefill || !Number.isFinite(recordCreatedAt) || recordCreatedAt >= TERAFABX_PREFILL_GENERICITY_ROLLOUT_AT);
   if (requiresGenericityQuality && finalJudge?.genericityFlagsComplete !== true) errors.push("genericity_quality_flags_missing");
   if (requiresGenericityQuality && finalJudge?.sourceAnchorGrounded !== true) errors.push("source_anchor_unverifiable");
   for (const issue of finalJudge?.flaggedQualityIssues || []) errors.push(`gemini_quality:${issue}`);
@@ -7646,11 +7650,18 @@ function recoverRecentTransientPrefillFailures(state = loadTerafabxState(), opti
   for (const item of state.failedPendingCommentPosts || []) {
     const targetUrl = normalizeXStatusUrl(item.targetUrl || "");
     const failedAtMs = Date.parse(item.errorAt || item.updatedAt || item.lastAttemptAt || "");
+    const queuedAtMs = Date.parse(item.queuedAt || item.at || "");
+    const finalJudge = item?.geminiReview?.finalJudge || {};
     const eligible = item.source === "prefill"
       && ["max_attempts", "monitor_max_attempts"].includes(String(item.failedReason || ""))
       && isTerafabxTransientReplyPageError(item.lastError || "")
       && Number.isFinite(failedAtMs)
       && failedAtMs >= sinceMs
+      && Number.isFinite(queuedAtMs)
+      && queuedAtMs >= TERAFABX_PREFILL_GENERICITY_ROLLOUT_AT
+      && finalJudge.genericityFlagsComplete === true
+      && finalJudge.sourceAnchorGrounded === true
+      && finalJudge.passed === true
       && targetUrl
       && !pendingTargets.has(targetUrl)
       && !postedTargets.has(targetUrl)

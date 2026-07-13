@@ -492,6 +492,10 @@ test("recent quality-passed prefill exhausted by a blank X page is recoverable",
   assert.equal(result.count, 1);
   assert.equal(result.recovered[0].attempts, 0);
   assert.ok(Date.parse(result.recovered[0].nextAttemptAt) > nowMs);
+
+  const legacyState = JSON.parse(JSON.stringify(state));
+  legacyState.failedPendingCommentPosts[0].queuedAt = "2026-07-13T12:15:00.000Z";
+  assert.equal(recoverRecentTransientPrefillFailures(legacyState, { nowMs, persist: false }).count, 0);
 });
 
 test("Grok quota text is not converted into a typed own-post backoff error", () => {
