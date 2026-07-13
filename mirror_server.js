@@ -163,6 +163,7 @@ let terafabxBusy = false;
 let terafabxOwnPostReplyBusy = false;
 let terafabxOwnPostReplySchedulerBusy = false;
 let terafabxCommentPrefillBusy = false;
+let terafabxCommentPrefillLastStartedAt = 0;
 let terafabxSchedulerBusy = false;
 let terafabxCommentSchedulerBusy = false;
 let terafabxSchedulerStartedAt = null;
@@ -6515,6 +6516,7 @@ async function runTerafabxCommentPrefillQueue({ manual = false, targetCount = TE
     logEvent("terafabx_comment_prefill_quiet_continue", { quietUntil: nextTerafabxQuietPostingEnd() });
   }
   terafabxCommentPrefillBusy = true;
+  terafabxCommentPrefillLastStartedAt = Date.now();
   const startedAt = new Date().toISOString();
   let workerResources = [];
   try {
@@ -6611,11 +6613,17 @@ function maybeStartTerafabxCommentPrefill(reason = "tick") {
   const pendingCount = pendingTerafabxCommentPosts(state).length;
   if (pendingCount >= TERAFABX_COMMENT_PREFILL_TARGET) return;
   if (terafabxCommentPrefillBusy) return;
+  if (Date.now() - terafabxCommentPrefillLastStartedAt < TERAFABX_COMMENT_MONITOR_INTERVAL_MS) return;
   setTimeout(() => {
     runTerafabxCommentPrefillQueue({ manual: false })
       .then((result) => logEvent("terafabx_comment_prefill_background_done", { reason, ...result }))
       .catch((error) => logEvent("terafabx_comment_prefill_background_error", { reason, error: error.message }));
   }, 0);
+}
+
+function isTerafabxPendingCommentEligible(item = {}, nowMs = Date.now()) {
+  const nextAttemptMs = Date.parse(item.nextAttemptAt || "");
+  return !Number.isFinite(nextAttemptMs) || nextAttemptMs <= Number(nowMs);
 }
 
 async function runTerafabxPendingCommentPosts({ manual = false, limit = 5 } = {}) {
@@ -6636,10 +6644,7 @@ async function runTerafabxPendingCommentPosts({ manual = false, limit = 5 } = {}
       const effectiveLimit = manual ? requestedLimit : Math.min(requestedLimit, daily.remaining);
       const nowMs = Date.now();
       const candidates = pendingTerafabxCommentPosts()
-        .filter((item) => {
-          const nextAttemptMs = Date.parse(item.nextAttemptAt || "");
-          return !Number.isFinite(nextAttemptMs) || nextAttemptMs <= nowMs;
-        })
+        .filter((item) => isTerafabxPendingCommentEligible(item, nowMs))
         .slice(0, effectiveLimit);
       const posted = [];
       const failed = [];
@@ -7367,10 +7372,16 @@ async function maybeRunTerafabxCommentAutomation() {
     return;
   }
   if (pendingCount > 0 && isTerafabxQuietPostingTime()) return;
+  const eligiblePendingCount = pendingTerafabxCommentPosts(state)
+    .filter((item) => isTerafabxPendingCommentEligible(item)).length;
+  if (eligiblePendingCount <= 0) {
+    if (!terafabxCommentPrefillBusy) maybeStartTerafabxCommentPrefill("pending_retry_cooldown");
+    return;
+  }
   terafabxCommentSchedulerBusy = true;
   const startedAt = new Date().toISOString();
   try {
-    logEvent("terafabx_comment_scheduler_start", { startedAt, pendingCount, intervalMs: 0 });
+    logEvent("terafabx_comment_scheduler_start", { startedAt, pendingCount, eligiblePendingCount, intervalMs: 0 });
     if (pendingCount > 0) await runTerafabxPendingCommentPosts({ manual: false, limit: 1 });
     else await runTerafabxCommentOnce({ manual: false });
   } catch (error) {
@@ -13589,6 +13600,7 @@ module.exports = {
   isTerafabxReplySubmitCandidate,
   isTerafabxReplySubmissionUncertain,
   isTerafabxTransientReplyPageError,
+  isTerafabxPendingCommentEligible,
   terafabxPendingCommentFailureDisposition,
   recoverRecentTransientPrefillFailures,
   terafabxBrowserConcurrency,

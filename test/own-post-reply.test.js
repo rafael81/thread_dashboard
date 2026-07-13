@@ -40,6 +40,7 @@ const {
   isTerafabxReplySubmitCandidate,
   isTerafabxReplySubmissionUncertain,
   isTerafabxTransientReplyPageError,
+  isTerafabxPendingCommentEligible,
   recoverRecentTransientPrefillFailures,
   terafabxPendingCommentFailureDisposition,
   withTerafabxBrowserSetupCleanup,
@@ -452,6 +453,13 @@ test("a blank X reply page is retried with a cooldown instead of being exhausted
   assert.equal(result.removeFromPending, false);
   assert.equal(result.transientPageError, true);
   assert.ok(Date.parse(result.nextAttemptAt) > Date.now());
+});
+
+test("a pending comment remains ineligible until its retry cooldown expires", () => {
+  const nowMs = Date.parse("2026-07-13T15:00:00.000Z");
+  assert.equal(isTerafabxPendingCommentEligible({ nextAttemptAt: "2026-07-13T15:10:00.000Z" }, nowMs), false);
+  assert.equal(isTerafabxPendingCommentEligible({ nextAttemptAt: "2026-07-13T14:59:59.000Z" }, nowMs), true);
+  assert.equal(isTerafabxPendingCommentEligible({}, nowMs), true);
 });
 
 test("recent quality-passed prefill exhausted by a blank X page is recoverable", () => {
