@@ -19,6 +19,7 @@ const {
   shouldAutoRecoverXScheduledAnomaly,
   findXScheduledEntry,
   terafabxGeminiReviewPrompt,
+  terafabxGeminiBatchFinalJudgePrompt,
   terafabxGrokContextBatchPrompt,
   normalizeTerafabxContextResult,
   parseTerafabxGrokContextBatch,
@@ -359,6 +360,42 @@ test('TerafabX current policy rejects asking what an already visible meme is', (
 
   assert.equal(result.ok, false);
   assert.ok(result.errors.includes('visible_subject_unknown_question'));
+});
+
+test('TerafabX current policy rejects asking what will appear in an attached video', () => {
+  const result = assessTerafabxCurrentCommentPolicy({
+    source: 'prefill',
+    queuedAt: '2026-07-13T16:15:20.000Z',
+    targetText: '실험용 영상2',
+    visibleMediaCount: 1,
+    comment: '테스트 영상이라니 뭐가 나올지 궁금하다',
+    grokContext: { summary: '실험용 영상이 첨부된 게시물이다.', keyPoints: ['첨부 영상'], rawPreview: 'grok.com' },
+    geminiReview: { finalJudge: {
+      score: 100,
+      passed: true,
+      fatalError: false,
+      qualityFlagsComplete: true,
+      genericityFlagsComplete: true,
+      sourceAnchorGrounded: true,
+      flaggedQualityIssues: [],
+      dimensions: { context: 40 },
+    } },
+  });
+
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.includes('visible_subject_unknown_question'));
+});
+
+test('TerafabX final judge explicitly treats generic duty statements as headline tone', () => {
+  const prompt = terafabxGeminiBatchFinalJudgePrompt([{
+    target: { url: 'https://x.com/example/status/1', targetText: '임산부석에 짐이 놓여 있다' },
+    prepared: { comment: '임산부석 비워두는 배려가 필요합니다' },
+    grokContext: { summary: '임산부석 배려 문제다.', keyPoints: ['임산부석'] },
+  }]);
+
+  assert.match(prompt, /배려가 필요합니다/);
+  assert.match(prompt, /당위적 결론/);
+  assert.match(prompt, /headline_tone=true/);
 });
 
 test('TerafabX pending comments reject Grok text fallback even for legacy prefill', () => {

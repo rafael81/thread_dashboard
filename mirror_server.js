@@ -1364,6 +1364,34 @@ function removeTerafabxPendingCommentPost(targetUrl) {
   return { before: pending.length, after: nextPending.length };
 }
 
+function quarantineTerafabxPendingCommentPost(targetUrl, reason = "manual_quality_audit") {
+  const previous = loadTerafabxState();
+  const normalized = normalizeXStatusUrl(targetUrl || "");
+  const pending = pendingTerafabxCommentPosts(previous);
+  const target = pending.find((item) => normalizeXStatusUrl(item.targetUrl || "") === normalized);
+  if (!target) return { ok: false, targetUrl: normalized, reason: "pending_target_not_found", pendingCount: pending.length };
+  const failedAt = new Date().toISOString();
+  const failed = {
+    ...target,
+    status: "error",
+    errorAt: failedAt,
+    failedReason: "manual_quality_audit",
+    lastError: cleanSocialText(reason || "manual_quality_audit"),
+  };
+  const remaining = pending.filter((item) => normalizeXStatusUrl(item.targetUrl || "") !== normalized);
+  saveTerafabxState({
+    pendingCommentPosts: remaining,
+    failedPendingCommentPosts: [failed, ...(previous.failedPendingCommentPosts || [])].slice(0, 300),
+  });
+  logEvent("terafabx_pending_comment_manual_quality_quarantined", {
+    targetUrl: normalized,
+    comment: target.comment,
+    reason: failed.lastError,
+    pendingCount: remaining.length,
+  });
+  return { ok: true, targetUrl: normalized, comment: target.comment, reason: failed.lastError, pendingCount: remaining.length };
+}
+
 function formatKstDateKey(value) {
   const date = value ? new Date(value) : new Date();
   if (!Number.isFinite(date.getTime())) return "";
@@ -2004,7 +2032,7 @@ function assessTerafabxParentContextMismatch(target = {}, reply = "") {
   const praisesVisibleSubject = /귀엽|기특|예쁘|멋지|착하|사랑스럽/.test(targetText);
   const hasVisibleSubject = Math.max(0, Number(target.visibleMediaCount || target.mediaCount || target.quoteMediaCount || 0)) > 0
     || /(?:이|그|저)\s*(?:짤|사진|영상|장면|아이|애|강아지|고양이)|(?:이거|그거|저거)/.test(targetText);
-  const asksUnknownSubject = /도대체\s*(?:어떤|누구|무슨)|(?:어떤|누구|무슨)\s*.{0,14}(?:길래|인가요|일까요|거예요)/.test(comment);
+  const asksUnknownSubject = /도대체\s*(?:어떤|누구|무슨)|(?:어떤|누구|무슨)\s*.{0,14}(?:길래|인가요|일까요|거예요)|(?:무엇이|뭐가|뭔지).{0,14}(?:궁금|나올지|보일지)/.test(comment);
   const mismatch = Boolean(asksUnknownSubject && ((rootPostText && praisesVisibleSubject) || hasVisibleSubject));
   return {
     ok: !mismatch,
@@ -2137,7 +2165,7 @@ function terafabxGeminiBatchFinalJudgePrompt(items = []) {
     "'진짜 신기하게', '딱 보이지 않나요', '계속 보게 되네요'처럼 여러 댓글에 반복될 법한 감탄 템플릿은 non_ai_style에서 크게 감점해라.",
     "Grok 분석의 대응 조언을 사실 근거로 취급하지 마라. source_anchor에는 반드시 원문 또는 부모 원글에 실제로 적힌 고유 명사·숫자·행동 구절을 원문 그대로 적어라.",
     "댓글이 같은 분야의 다른 글에도 그대로 붙을 수 있으면 cross_post_reusable=true다. 예: '폭로성 스캔들은 사실 확인이 먼저 필요합니다'처럼 일반 원칙만 말하는 문장.",
-    "대화형 반응이 아니라 기사 제목·안전 표어·교훈 문장처럼 들리면 headline_tone=true다.",
+    "'배려가 필요합니다', '확인이 필요합니다', '안전합니다', '해야 합니다'처럼 대화형 반응 없이 당위적 결론만 말하거나 기사 제목·안전 표어·교훈 문장처럼 들리면 headline_tone=true다.",
     "댓글이 source_anchor의 구체적인 대상을 실제로 언급하거나 명확히 가리키지 않으면 specificity_error=true다.",
     "fatal_error는 대상 혼동, 원문과 반대되는 말, 사실 날조, 민감·금지 표현이 있을 때 true다.",
     "language_error는 오기·오타·맞춤법·조사·문법·불완전한 종결어미가 있으면 true다.",
@@ -2335,6 +2363,7 @@ function terafabxCommentQualityPromptLines() {
   const dynamicRules = Array.isArray(feedback.rules) ? feedback.rules.slice(0, 5) : [];
   return [
     "상투 표현 금지: 마음이 훈훈해지네요, 작성자님, 재충전의 시간 보내세요, 행복한 하루 보내세요, 인상적이네요, 응원합니다.",
+    "대화형 반응 대신 '배려가 필요합니다', '확인이 필요합니다', '안전합니다', '해야 합니다'처럼 기사 결론·안전 표어·교훈으로 끝내지 마라.",
     ...dynamicRules.map((rule) => `최근 10분 품질 피드백: ${rule}`),
   ];
 }
@@ -2352,7 +2381,7 @@ function terafabxFinalJudgePrompt(target, grokInput, finalReply) {
     "상투적 덕담이나 AI식 추상 요약체를 발견하면 non_ai_style을 최대 4점으로 제한해라.",
     "'진짜 신기하게', '딱 보이지 않나요', '계속 보게 되네요'처럼 여러 댓글에 반복될 법한 감탄 템플릿은 non_ai_style에서 크게 감점해라.",
     "Grok 분석의 대응 조언을 사실 근거로 취급하지 마라. source_anchor에는 반드시 원문 또는 부모 원글에 실제로 적힌 고유 명사·숫자·행동 구절을 원문 그대로 적어라.",
-    "댓글이 같은 분야의 다른 글에도 그대로 붙을 수 있으면 cross_post_reusable=true다. 기사 제목·표어·교훈 문장처럼 들리면 headline_tone=true다.",
+    "댓글이 같은 분야의 다른 글에도 그대로 붙을 수 있으면 cross_post_reusable=true다. '배려가 필요합니다', '확인이 필요합니다', '안전합니다', '해야 합니다'처럼 대화형 반응 없이 당위적 결론만 말하거나 기사 제목·표어·교훈 문장처럼 들리면 headline_tone=true다.",
     "댓글이 source_anchor의 구체적인 대상을 실제로 언급하거나 명확히 가리키지 않으면 specificity_error=true다.",
     "fatal_error는 대상 혼동, 원문과 반대되는 말, 사실 날조, 민감·금지 표현이 있을 때 true다.",
     "language_error는 오기·오타·맞춤법·조사·문법·불완전한 종결어미가 있으면 true다.",
@@ -6685,6 +6714,7 @@ async function runTerafabxCommentPrefillQueue({ manual = false, targetCount = TE
           chromePort: workerResources[0].chromePort,
           profileDir: workerResources[0].profileDir,
         });
+        results.push(...generated.filter((item) => !item.ok));
         const reviewed = await reviewTerafabxPreparedReplyBatchWithGemini(generated, {
           skipReview: true,
           priority: "comment",
@@ -13822,6 +13852,7 @@ module.exports = {
   evaluateTerafabxCommentWorkflow,
   shouldTerafabxCommentMonitorRequestPrefill,
   assessTerafabxCurrentCommentPolicy,
+  quarantineTerafabxPendingCommentPost,
   auditTerafabxPrefillQuality,
   assessTerafabxLanguageQuality,
   stripTerafabxListPrefix,
