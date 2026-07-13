@@ -1059,6 +1059,7 @@ function loadTerafabxState() {
     lastCommentPrefillFailed: 0,
     lastCommentPrefillPendingCount: 0,
     lastCommentPrefillQuotaLimited: false,
+    lastCommentPrefillQuotaRetryAt: null,
     commentHistory: [],
     pendingCommentPosts: [],
     seenTargets: [],
@@ -6698,6 +6699,7 @@ async function runTerafabxCommentPrefillQueue({ manual = false, targetCount = TE
         lastCommentPrefillFailed: 0,
         lastCommentPrefillPendingCount: currentPending.length,
         lastCommentPrefillQuotaLimited: false,
+        lastCommentPrefillQuotaRetryAt: null,
       });
       return { ok: true, action: "comment-prefill", queued: 0, pendingCount: currentPending.length };
     }
@@ -6772,6 +6774,7 @@ async function runTerafabxCommentPrefillQueue({ manual = false, targetCount = TE
     const pendingCount = pendingTerafabxCommentPosts().length;
     const failureErrors = [...new Set(failed.map((item) => String(item.error || item.reason || "").trim()).filter(Boolean))];
     const quotaLimited = failureErrors.some((error) => /grok.*(?:limit|한도)|(?:limit|한도).*grok|limit 문구/i.test(error));
+    const quotaRetryAt = quotaLimited ? parseTerafabxGrokQuotaRetryAt(failureErrors.join(" ")) : null;
     const status = failed.length === 0 ? "ok" : queued.length > 0 ? "degraded" : "error";
     const lastError = failureErrors.join(" · ").slice(0, 500) || null;
     saveTerafabxState({
@@ -6784,10 +6787,12 @@ async function runTerafabxCommentPrefillQueue({ manual = false, targetCount = TE
       lastCommentPrefillFailed: failed.length,
       lastCommentPrefillPendingCount: pendingCount,
       lastCommentPrefillQuotaLimited: quotaLimited,
+      lastCommentPrefillQuotaRetryAt: quotaRetryAt,
     });
     logEvent("terafabx_comment_prefill_done", { startedAt, requested: missing, selected: selected.length, queued: queued.length, failed: failed.length, pendingCount, status, quotaLimited, error: lastError });
     return { ok: failed.length === 0, action: "comment-prefill", requested: missing, selected: selected.length, queued, failed, pendingCount, status, quotaLimited, error: lastError };
   } catch (error) {
+    const quotaLimited = /grok.*(?:limit|한도)|(?:limit|한도).*grok|limit 문구/i.test(error.message);
     saveTerafabxState({
       lastCommentPrefillRunAt: new Date().toISOString(),
       lastCommentPrefillStatus: "error",
@@ -6797,7 +6802,8 @@ async function runTerafabxCommentPrefillQueue({ manual = false, targetCount = TE
       lastCommentPrefillQueued: 0,
       lastCommentPrefillFailed: 0,
       lastCommentPrefillPendingCount: pendingTerafabxCommentPosts().length,
-      lastCommentPrefillQuotaLimited: /grok.*(?:limit|한도)|(?:limit|한도).*grok|limit 문구/i.test(error.message),
+      lastCommentPrefillQuotaLimited: quotaLimited,
+      lastCommentPrefillQuotaRetryAt: quotaLimited ? parseTerafabxGrokQuotaRetryAt(error.message) : null,
     });
     logEvent("terafabx_comment_prefill_error", { startedAt, error: error.message });
     return { ok: false, action: "comment-prefill", error: error.message };
@@ -6812,11 +6818,38 @@ function terafabxCommentPrefillCooldownDelay(lastStartedAt = terafabxCommentPref
   return Math.max(0, TERAFABX_COMMENT_MONITOR_INTERVAL_MS - elapsed);
 }
 
+function parseTerafabxGrokQuotaRetryAt(errorText, now = new Date()) {
+  const match = String(errorText || "").match(/(\d{1,2})\s*월\s*(\d{1,2})\s*일(?:에)?\s*초기화/);
+  if (!match) return null;
+  const nowDate = now instanceof Date ? now : new Date(now);
+  if (!Number.isFinite(nowDate.getTime())) return null;
+  const month = Number(match[1]);
+  const day = Number(match[2]);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  const kstYear = Number(new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Seoul", year: "numeric" }).format(nowDate));
+  const isoForYear = (year) => `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}T00:05:00+09:00`;
+  let candidate = new Date(isoForYear(kstYear));
+  if (!Number.isFinite(candidate.getTime())) return null;
+  if (candidate.getTime() < nowDate.getTime() - 36 * 60 * 60 * 1000) candidate = new Date(isoForYear(kstYear + 1));
+  if (candidate.getTime() <= nowDate.getTime()) candidate = new Date(nowDate.getTime() + 30 * 60 * 1000);
+  return candidate.toISOString();
+}
+
+function isTerafabxGrokQuotaBackoffActive(state = {}, nowMs = Date.now()) {
+  const retryAtMs = Date.parse(state.lastCommentPrefillQuotaRetryAt || "");
+  return state.lastCommentPrefillQuotaLimited === true
+    && Number.isFinite(retryAtMs)
+    && retryAtMs > Number(nowMs);
+}
+
 function maybeStartTerafabxCommentPrefill(reason = "tick") {
   const state = loadTerafabxState();
   if (!state.commentEnabled) return { scheduled: false, skipped: "comment_disabled" };
   if (terafabxDailyCommentProgress(state).reached) return { scheduled: false, skipped: "daily_target_reached" };
   if (terafabxManualActionPending) return { scheduled: false, skipped: "manual_pending" };
+  if (isTerafabxGrokQuotaBackoffActive(state)) {
+    return { scheduled: false, skipped: "grok_quota_backoff", retryAt: state.lastCommentPrefillQuotaRetryAt };
+  }
   const pendingCount = pendingTerafabxCommentPosts(state).length;
   if (pendingCount >= TERAFABX_COMMENT_PREFILL_TARGET) return { scheduled: false, skipped: "target_reached" };
   if (terafabxCommentPrefillBusy) return { scheduled: false, skipped: "busy" };
@@ -7502,6 +7535,7 @@ function getTerafabxAutomationStatus() {
       failed: Number(state.lastCommentPrefillFailed || 0),
       pendingCount: Number(state.lastCommentPrefillPendingCount || pendingCommentPosts.length),
       quotaLimited: Boolean(state.lastCommentPrefillQuotaLimited),
+      quotaRetryAt: state.lastCommentPrefillQuotaRetryAt || null,
     },
     commentMonitor: loadTerafabxCommentMonitorState(),
     jobGapMs: TERAFABX_JOB_GAP_MS,
@@ -7879,6 +7913,7 @@ function shouldTerafabxCommentMonitorRequestPrefill(state = {}, evaluation = {},
     && Number(evaluation.pendingCount || 0) < targetCount
     && !options.prefillBusy
     && !options.manualActionPending
+    && !isTerafabxGrokQuotaBackoffActive(state, options.nowMs ?? Date.now())
   );
 }
 
@@ -8056,6 +8091,7 @@ async function runTerafabxCommentMonitor(options = {}) {
         type: state.lastCommentPrefillQuotaLimited ? "grok_quota_limited" : "prefill_generation_error",
         severity: "error",
         error: state.lastCommentPrefillError || "Prefill 생성 실패",
+        retryAt: state.lastCommentPrefillQuotaRetryAt || null,
         selected: Number(state.lastCommentPrefillSelected || 0),
         failed: Number(state.lastCommentPrefillFailed || 0),
       });
@@ -13965,6 +14001,9 @@ module.exports = {
   parseTerafabxGeminiBatchFinalJudge,
   reviewTerafabxPreparedReplyBatchWithGemini,
   shouldRepairTerafabxBatchFailures,
+  parseTerafabxGrokQuotaRetryAt,
+  isTerafabxGrokQuotaBackoffActive,
+  shouldTerafabxCommentMonitorRequestPrefill,
   enqueueTerafabxPendingCommentPost,
   scoreTerafabxClichePenalty,
   selectRootPostMediaCandidates,

@@ -610,6 +610,33 @@ test('TerafabX comment monitor still requests prefill during quiet posting hours
   ), true);
 });
 
+test('TerafabX monitor keeps running but suppresses Grok prefill until the displayed quota reset date', () => {
+  const {
+    isTerafabxGrokQuotaBackoffActive,
+    parseTerafabxGrokQuotaRetryAt,
+    shouldTerafabxCommentMonitorRequestPrefill,
+  } = require('../mirror_server.js');
+  const now = new Date('2026-07-13T18:00:00.000Z');
+  const retryAt = parseTerafabxGrokQuotaRetryAt('주간 한도에 도달했습니다 7월 19일에 초기화됩니다.', now);
+  const state = {
+    commentEnabled: true,
+    lastCommentPrefillQuotaLimited: true,
+    lastCommentPrefillQuotaRetryAt: retryAt,
+  };
+  const evaluation = { pendingCount: 21, daily: { reached: false }, quiet: true };
+
+  assert.equal(retryAt, '2026-07-18T15:05:00.000Z');
+  assert.equal(isTerafabxGrokQuotaBackoffActive(state, now.getTime()), true);
+  assert.equal(shouldTerafabxCommentMonitorRequestPrefill(state, evaluation, {
+    targetCount: 200,
+    nowMs: now.getTime(),
+  }), false);
+  assert.equal(shouldTerafabxCommentMonitorRequestPrefill(state, evaluation, {
+    targetCount: 200,
+    nowMs: Date.parse('2026-07-18T15:06:00.000Z'),
+  }), true);
+});
+
 test('Grok context batch validates the editor and clicks submit after one keyboard fill', () => {
   const commands = buildGrokBatchCommands('한 줄\n심사', 'https://x.com/i/grok', 60000, () => 0);
 
