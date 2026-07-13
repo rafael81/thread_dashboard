@@ -2,6 +2,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const { execFileSync } = require("child_process");
 
 const root = path.resolve(__dirname, "..");
 const statePath = process.env.TERAFABX_STATE_PATH || path.join(root, ".data", "terafabx-automation-state.json");
@@ -51,6 +52,8 @@ const posted = unique.filter((record) => record.posted || record.replyUrl || rec
 const pending = unique.filter((record) => !record.posted && !record.replyUrl && record.status !== "error");
 const failed = unique.filter((record) => record.status === "error" || record.failedReason);
 const genericityRejected = failed.filter((record) => /genericity|source_anchor|cross_post|headline|specificity/i.test(`${record.lastError || ""} ${record.failedReason || ""}`));
+const manualAuditRejected = failed.filter((record) => record.failedReason === "manual_quality_audit" || /manual_quality_audit/i.test(String(record.lastError || "")));
+const unsupportedClaimRejected = failed.filter((record) => /unsupported|ungrounded|invented|원문에 없는|근거 없는|image_says/i.test(String(record.lastError || "")));
 const events = fs.existsSync(eventsPath)
   ? fs.readFileSync(eventsPath, "utf8").split("\n").flatMap((line) => {
       try {
@@ -65,6 +68,7 @@ const eventSum = (type, field = "count") => events
   .filter((event) => event.type === type)
   .reduce((sum, event) => sum + Number(event[field] || 0), 0);
 const batchStarts = events.filter((event) => event.type === "terafabx_grok_context_batch_start");
+const batchSuccesses = events.filter((event) => event.type === "terafabx_grok_context_batch_ok");
 const batchFailures = events.filter((event) => event.type === "terafabx_grok_context_batch_failed");
 const batchLimitFailures = batchFailures.filter((event) => /limit 문구|reached your limit/i.test(String(event.error || "")));
 const xHomeFailures = events.filter((event) => event.type === "terafabx_comment_prefill_error" && /X home 로딩 실패/i.test(String(event.error || "")));
@@ -78,6 +82,19 @@ const qualityIssueText = (record) => {
   return issues.length ? issues.join(", ") : "없음";
 };
 const audit = monitor.prefillQualityAudit || {};
+let commits = [];
+try {
+  commits = execFileSync("git", [
+    "log",
+    `--since=${since.toISOString()}`,
+    `--until=${until.toISOString()}`,
+    "--format=%h %s",
+    "--",
+    "mirror_server.js",
+    "scripts/prefill-quality-report.js",
+    "test",
+  ], { cwd: root, encoding: "utf8" }).trim().split("\n").filter(Boolean);
+} catch {}
 const lines = [
   "# Prefill 품질 모니터링 보고서",
   "",
@@ -87,6 +104,8 @@ const lines = [
   `- 대기: ${pending.length}개`,
   `- 격리/실패: ${failed.length}개`,
   `- 범용성·근거 게이트 격리: ${genericityRejected.length}개`,
+  `- 수동 개별 감사 격리: ${manualAuditRejected.length}개`,
+  `- 근거 없는 구체 주장 격리: ${unsupportedClaimRejected.length}개`,
   `- 최근 개별 감사: ${Number(audit.checkedCount || 0)}개 검사 / ${Number(audit.failedCount || 0)}개 탈락`,
   `- 생성 완료 이벤트: ${eventCount("terafabx_comment_prefill_queued")}회`,
   `- 품질 격리: ${eventCount("terafabx_comment_monitor_prefill_quality_quarantined")}회 / ${eventSum("terafabx_comment_monitor_prefill_quality_quarantined")}개`,
@@ -94,6 +113,8 @@ const lines = [
   `- Prefill 오류 이벤트: ${eventCount("terafabx_comment_prefill_error")}회`,
   `- X 홈 로딩 실패: ${xHomeFailures.length}회`,
   `- Grok 묶음 호출: ${batchStarts.length}회 / ${batchStarts.reduce((sum, event) => sum + Number(event.count || 0), 0)}개 문맥`,
+  `- Grok 묶음 성공: ${batchSuccesses.length}회 / ${batchSuccesses.reduce((sum, event) => sum + Number(event.passed || 0), 0)}개 성공 / ${batchSuccesses.reduce((sum, event) => sum + Number(event.failed || 0), 0)}개 누락`,
+  `- Grok 묶음 전체 실패: ${batchFailures.length}회 / ${batchFailures.reduce((sum, event) => sum + Number(event.count || 0), 0)}개 미생성`,
   `- Grok 한도 응답: ${batchLimitFailures.length}회 / ${batchLimitFailures.reduce((sum, event) => sum + Number(event.count || 0), 0)}개 미생성`,
   "",
   "## 항목별 감사",
@@ -110,6 +131,10 @@ const lines = [
   ...(failed.slice(0, 100).length
     ? failed.slice(0, 100).map((record) => `- ${record.comment || "(댓글 없음)"} — ${record.lastError || record.failedReason || "unknown"} — ${record.targetUrl || ""}`)
     : ["- 없음"]),
+  "",
+  "## 적용 커밋",
+  "",
+  ...(commits.length ? commits.map((commit) => `- ${commit}`) : ["- 없음"]),
 ];
 const output = lines.join("\n");
 const outputPath = argValue("--out");
