@@ -2621,21 +2621,23 @@ async function prepareTerafabxCommentPrefillWorkers(workerCount) {
 }
 
 async function cleanupTerafabxCommentPrefillWorkers(resources = []) {
-  const results = await Promise.all(resources.map(async (resource) => ({
-    workerIndex: resource.workerIndex,
-    grok: { keptAlive: true, session: resource.grokContextSession },
-    gemini: await cleanupTerafabxGeminiWorkTabs({
+  const results = await Promise.all(resources.map(async (resource) => {
+    const grok = await closeTerafabxGrokWebSession(resource.grokContextSession)
+      .then((result) => ({ keptAlive: false, session: resource.grokContextSession, code: result?.code ?? null }))
+      .catch((error) => ({ keptAlive: false, session: resource.grokContextSession, error: error.message }));
+    const gemini = await cleanupTerafabxGeminiWorkTabs({
       port: resource.chromePort,
       profileDir: resource.profileDir,
-    }).catch((error) => ({ error: error.message })),
-  })));
+    }).catch((error) => ({ error: error.message }));
+    return { workerIndex: resource.workerIndex, grok, gemini };
+  }));
   logEvent("terafabx_comment_prefill_workers_cleanup", {
     count: results.length,
     workers: results.map((item) => ({
       workerIndex: item.workerIndex,
       grokError: item.grok?.error || null,
       geminiError: item.gemini?.error || null,
-      keptAlive: true,
+      keptAlive: false,
       remainingGeminiPids: item.gemini?.remainingPids || [],
     })),
   });
@@ -4721,6 +4723,30 @@ async function closeTerafabxGrokWebSession(session = TERAFABX_GROK_WEB_SESSION) 
   }
 }
 
+function knownTerafabxGrokWebSessions() {
+  return Array.from(new Set([
+    TERAFABX_GROK_WEB_SESSION,
+    ...Array.from({ length: TERAFABX_BROWSER_CONCURRENCY_CAP }, (_, index) => `${TERAFABX_GROK_WEB_SESSION}-comment-prefill-${index + 1}`),
+    `${TERAFABX_GROK_WEB_SESSION}-own-post-root-context`,
+    ...Array.from({ length: TERAFABX_BROWSER_CONCURRENCY_CAP }, (_, index) => `${TERAFABX_GROK_WEB_SESSION}-own-post-reply-context-${index + 1}`),
+  ]));
+}
+
+async function cleanupKnownTerafabxGrokWebSessions(reason = "startup") {
+  const sessions = knownTerafabxGrokWebSessions();
+  const results = await Promise.all(sessions.map(async (session) => {
+    const result = await closeTerafabxGrokWebSession(session).catch((error) => ({ error: error.message }));
+    return { session, ok: !result?.error, code: result?.code ?? null, error: result?.error || null };
+  }));
+  logEvent("terafabx_grok_known_sessions_cleanup", {
+    reason,
+    count: results.length,
+    failedCount: results.filter((item) => !item.ok).length,
+    results,
+  });
+  return results;
+}
+
 async function cleanupTerafabxAutomationBrowsersOnShutdown() {
   const childPids = Array.from(activeAutomationChildProcesses).map((child) => child.pid).filter(Boolean);
   for (const child of activeAutomationChildProcesses) {
@@ -4742,7 +4768,7 @@ async function cleanupTerafabxAutomationBrowsersOnShutdown() {
     port: plan.port,
     ...(await closeTerafabxGeminiHeadlessBrowser(plan).catch((error) => ({ error: error.message }))),
   })));
-  const sessions = new Set(Array.from(terafabxActiveGrokSessions).filter((session) => !String(session).includes("-comment-prefill-")));
+  const sessions = new Set([...knownTerafabxGrokWebSessions(), ...Array.from(terafabxActiveGrokSessions)]);
   const grokResults = await Promise.all(Array.from(sessions).map(async (session) => {
     const result = await closeTerafabxGrokWebSession(session).catch((error) => ({ error: error.message }));
     return { session, ok: !result?.error, error: result?.error || null };
@@ -5024,7 +5050,10 @@ function isTerafabxReplySubmitCandidate(candidate = {}) {
   if (!candidate.withinReplyComposer) return false;
   const testid = String(candidate.testid || "").trim();
   const text = String(candidate.text || "").replace(/\s+/g, " ").trim();
-  const recognizedControl = testid === "tweetButton" || testid === "tweetButtonInline" || candidate.role === "button";
+  const composerKind = String(candidate.composerKind || "").trim();
+  const knownSubmit = testid === "tweetButton" || testid === "tweetButtonInline";
+  if (knownSubmit && ["dialog_reply", "inline_reply"].includes(composerKind)) return true;
+  const recognizedControl = knownSubmit || candidate.role === "button";
   return recognizedControl && /^(답글|Reply)$/i.test(text);
 }
 
@@ -5196,6 +5225,9 @@ async function postTerafabxReplyUnlocked(targetUrl, comment, options = {}) {
     const clickedReply = await page.eval(`(() => {
       const id = ${JSON.stringify(id)};
       const statusHrefMatches = ${terafabxStatusHrefMatches.toString()};
+      Array.from(document.querySelectorAll('[data-testid="tweetTextarea_0"], [role="textbox"][contenteditable="true"], [contenteditable="true"]'))
+        .filter((el) => el.offsetWidth && el.offsetHeight)
+        .forEach((el) => el.setAttribute('data-terafabx-preexisting-editor', '1'));
       const article = Array.from(document.querySelectorAll("article")).find((candidate) =>
         Array.from(candidate.querySelectorAll('a[href*="/status/"]')).some((a) => statusHrefMatches(a.href, id))
       ) || null;
@@ -5210,8 +5242,14 @@ async function postTerafabxReplyUnlocked(targetUrl, comment, options = {}) {
     await sleep(options.quick ? 450 : 1400);
     const focused = await page.eval(`(() => {
       const editors = Array.from(document.querySelectorAll('[data-testid="tweetTextarea_0"], [role="textbox"][contenteditable="true"], [contenteditable="true"]')).filter((el) => el.offsetWidth && el.offsetHeight);
-      const editor = editors.pop();
-      if (!editor) return false;
+      const newEditors = editors.filter((el) => el.getAttribute('data-terafabx-preexisting-editor') !== '1');
+      const editor = newEditors.find((el) => el.closest('[role="dialog"], [data-testid="sheetDialog"]'))
+        || newEditors.pop()
+        || editors.find((el) => el.closest('[role="dialog"], [data-testid="sheetDialog"]'))
+        || editors.pop();
+      if (!editor) return { ok: false };
+      document.querySelectorAll('[data-terafabx-active-reply-editor="1"]').forEach((el) => el.removeAttribute('data-terafabx-active-reply-editor'));
+      editor.setAttribute('data-terafabx-active-reply-editor', '1');
       editor.scrollIntoView({ block: "center" });
       editor.click();
       editor.focus();
@@ -5221,20 +5259,26 @@ async function postTerafabxReplyUnlocked(targetUrl, comment, options = {}) {
       selection.removeAllRanges();
       selection.addRange(range);
       document.execCommand("delete");
-      return true;
+      return {
+        ok: true,
+        inDialog: Boolean(editor.closest('[role="dialog"], [data-testid="sheetDialog"]')),
+        newEditorCount: newEditors.length,
+        editorCount: editors.length,
+      };
     })()`);
-    if (!focused) throw new Error("답글 입력창을 찾지 못했습니다.");
+    if (!focused?.ok) throw new Error("답글 입력창을 찾지 못했습니다.");
+    logEvent("terafabx_reply_editor_selected", { targetUrl, ...focused });
     await page.send("Input.insertText", { text: comment });
     await sleep(700);
     let typed = await page.eval(`(() => {
       const editors = Array.from(document.querySelectorAll('[data-testid="tweetTextarea_0"], [role="textbox"][contenteditable="true"], [contenteditable="true"]')).filter((el) => el.offsetWidth && el.offsetHeight);
-      const editor = editors.pop();
+      const editor = document.querySelector('[data-terafabx-active-reply-editor="1"]') || editors.pop();
       return editor ? (editor.innerText || editor.textContent || "") : "";
     })()`);
     if (cleanSocialText(typed) !== cleanSocialText(comment)) {
       typed = await page.eval(`((comment) => {
         const editors = Array.from(document.querySelectorAll('[data-testid="tweetTextarea_0"], [role="textbox"][contenteditable="true"], [contenteditable="true"]')).filter((el) => el.offsetWidth && el.offsetHeight);
-        const editor = editors.pop();
+        const editor = document.querySelector('[data-terafabx-active-reply-editor="1"]') || editors.pop();
         if (!editor) return "";
         editor.focus();
         const selection = window.getSelection();
@@ -5258,7 +5302,7 @@ async function postTerafabxReplyUnlocked(targetUrl, comment, options = {}) {
     }
     await page.eval(`(() => {
       const editors = Array.from(document.querySelectorAll('[data-testid="tweetTextarea_0"], [role="textbox"][contenteditable="true"], [contenteditable="true"]')).filter((el) => el.offsetWidth && el.offsetHeight);
-      const editor = editors.pop();
+      const editor = document.querySelector('[data-terafabx-active-reply-editor="1"]') || editors.pop();
       if (!editor) return false;
       editor.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: editor.innerText || editor.textContent || "" }));
       editor.dispatchEvent(new Event("change", { bubbles: true }));
@@ -5281,8 +5325,21 @@ async function postTerafabxReplyUnlocked(targetUrl, comment, options = {}) {
       }
       function findSubmitButton() {
         const editors = Array.from(document.querySelectorAll('[data-testid="tweetTextarea_0"], [role="textbox"][contenteditable="true"], [contenteditable="true"]')).filter(visible);
-        const editor = editors.pop();
-        const scope = editor?.closest('[role="dialog"], [data-testid="sheetDialog"]') || null;
+        const editor = document.querySelector('[data-terafabx-active-reply-editor="1"]') || editors.pop();
+        const dialog = editor?.closest('[role="dialog"], [data-testid="sheetDialog"]') || null;
+        let scope = dialog;
+        let composerKind = dialog ? "dialog_reply" : "";
+        if (!scope && editor) {
+          let node = editor.parentElement;
+          for (let depth = 0; node && depth < 10 && node !== document.body; depth += 1, node = node.parentElement) {
+            if (node.querySelector('[data-testid="tweetButton"], [data-testid="tweetButtonInline"]')) {
+              scope = node;
+              composerKind = "inline_reply";
+              break;
+            }
+            if (node.matches('main, [data-testid="primaryColumn"]')) break;
+          }
+        }
         if (!scope) return null;
         const isReplySubmitCandidate = ${isTerafabxReplySubmitCandidate.toString()};
         return Array.from(scope.querySelectorAll('[data-testid="tweetButton"], [data-testid="tweetButtonInline"], button, [role="button"]'))
@@ -5292,6 +5349,7 @@ async function postTerafabxReplyUnlocked(targetUrl, comment, options = {}) {
             testid: el.getAttribute("data-testid") || "",
             text: buttonText(el),
             role: el.getAttribute("role") || (el.tagName === "BUTTON" ? "button" : ""),
+            composerKind,
           }));
       }
       for (let attempt = 0; attempt < 18; attempt += 1) {
@@ -5305,6 +5363,16 @@ async function postTerafabxReplyUnlocked(targetUrl, comment, options = {}) {
       return {
         clicked: false,
         keyboardFallbackAttempted: false,
+        editor: (() => {
+          const el = document.querySelector('[data-terafabx-active-reply-editor="1"]');
+          return el ? { testid: el.getAttribute('data-testid') || '', inDialog: Boolean(el.closest('[role="dialog"], [data-testid="sheetDialog"]')) } : null;
+        })(),
+        submitCandidates: Array.from(document.querySelectorAll('[data-testid="tweetButton"], [data-testid="tweetButtonInline"]')).map((el) => ({
+          text: el.innerText || "",
+          label: el.getAttribute("aria-label") || "",
+          testid: el.getAttribute("data-testid") || "",
+          disabled: Boolean(el.disabled || el.getAttribute("aria-disabled") === "true"),
+        })),
         candidates: Array.from(document.querySelectorAll('button, [role="button"]')).map((el) => ({
           text: el.innerText || "",
           label: el.getAttribute("aria-label") || "",
@@ -5318,6 +5386,8 @@ async function postTerafabxReplyUnlocked(targetUrl, comment, options = {}) {
         targetUrl,
         weightedLength: xWeightedLength(comment),
         length: [...String(comment || "")].length,
+        editor: clickedPost.editor,
+        submitCandidates: clickedPost.submitCandidates,
         candidates: clickedPost.candidates,
       });
       if (!clickedPost.clicked) throw new Error("활성화된 답글 게시 버튼을 찾지 못했습니다.");
@@ -13507,6 +13577,12 @@ function startServer() {
   }, 2000);
 
   setTimeout(() => {
+    cleanupKnownTerafabxGrokWebSessions("startup").catch((error) => {
+      logEvent("terafabx_grok_known_sessions_cleanup_error", { reason: "startup", error: error.message });
+    });
+  }, 1000);
+
+  setTimeout(() => {
     runXScheduleMonitor({ source: "startup" }).catch((error) => {
       logEvent("x_schedule_monitor_startup_error", { error: error.message });
     });
@@ -13605,6 +13681,7 @@ module.exports = {
   recoverRecentTransientPrefillFailures,
   terafabxBrowserConcurrency,
   terafabxCommentPrefillWorkerResources,
+  knownTerafabxGrokWebSessions,
   isTerafabxGeminiWorkTab,
   ensureTerafabxGeminiHeadlessBrowser,
   cleanupTerafabxGeminiWorkTabs,

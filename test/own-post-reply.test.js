@@ -17,6 +17,7 @@ const {
   shouldUseTerafabxQuickIntent,
   terafabxBrowserConcurrency,
   terafabxCommentPrefillWorkerResources,
+  knownTerafabxGrokWebSessions,
   terafabxOwnPostReplyBatchLimit,
   normalizeFxTwitterV2Status,
   flattenFxTwitterConversationReplies,
@@ -418,9 +419,11 @@ test("quick intent submission is disabled because it cannot prove reply context 
   assert.equal(shouldUseTerafabxQuickIntent({ quick: true }, ""), false);
 });
 
-test("reply submit accepts only an explicit Reply button inside the reply composer", () => {
+test("reply submit accepts localized controls only after the reply composer kind is proven", () => {
   assert.equal(isTerafabxReplySubmitCandidate({ withinReplyComposer: true, testid: "tweetButton", text: "답글" }), true);
   assert.equal(isTerafabxReplySubmitCandidate({ withinReplyComposer: true, testid: "tweetButtonInline", text: "Reply" }), true);
+  assert.equal(isTerafabxReplySubmitCandidate({ withinReplyComposer: true, composerKind: "inline_reply", testid: "tweetButtonInline", text: "게시하기" }), true);
+  assert.equal(isTerafabxReplySubmitCandidate({ withinReplyComposer: true, composerKind: "dialog_reply", testid: "tweetButton", text: "Post" }), true);
   assert.equal(isTerafabxReplySubmitCandidate({ withinReplyComposer: false, testid: "tweetButton", text: "답글" }), false);
   assert.equal(isTerafabxReplySubmitCandidate({ withinReplyComposer: true, testid: "tweetButton", text: "게시하기" }), false);
   assert.equal(isTerafabxReplySubmitCandidate({ withinReplyComposer: true, testid: "tweetButton", text: "Post" }), false);
@@ -550,6 +553,17 @@ test("five comment prefill workers use distinct Grok sessions, Gemini ports, and
   assert.equal(new Set(workers.map((item) => item.profileDir)).size, 5);
   assert.deepEqual(workers.map((item) => item.chromePort), [9254, 9255, 9256, 9257, 9258]);
   assert.ok(workers.every((item, index) => item.grokContextSession.endsWith(`comment-prefill-${index + 1}`)));
+});
+
+test("startup cleanup covers every fixed TerafabX Grok worker session", () => {
+  const sessions = knownTerafabxGrokWebSessions();
+  assert.equal(new Set(sessions).size, sessions.length);
+  assert(sessions.includes("terafabx-grok-headless"));
+  for (let index = 1; index <= 5; index += 1) {
+    assert(sessions.includes(`terafabx-grok-headless-comment-prefill-${index}`));
+    assert(sessions.includes(`terafabx-grok-headless-own-post-reply-context-${index}`));
+  }
+  assert(sessions.includes("terafabx-grok-headless-own-post-root-context"));
 });
 
 test("Gemini worker cleanup closes only disposable work tabs", () => {
