@@ -1984,10 +1984,17 @@ function terafabxPromptContextLines(target = {}) {
       `답글 대상 댓글: ${targetText.slice(0, 1800)}`,
     ];
   }
+  const quotePostUrl = normalizeXStatusUrl(target.quotePostUrl || "");
+  const quotePostText = cleanSocialText(target.quotePostText || "");
+  const visibleMediaCount = Math.max(0, Number(target.visibleMediaCount || target.mediaCount || target.quoteMediaCount || 0));
   return [
     `원문 URL: ${target.url || ""}`,
     `원문: ${targetText.slice(0, 1800)}`,
-  ];
+    quotePostUrl ? `인용 원문 URL: ${quotePostUrl}` : null,
+    quotePostText ? `인용 원문: ${quotePostText.slice(0, 1800)}` : null,
+    visibleMediaCount > 0 ? `화면에 보이는 첨부/인용 미디어: ${visibleMediaCount}개` : null,
+    visibleMediaCount > 0 ? "첨부나 인용 미디어가 이미 보이므로 무엇인지 모르는 듯 되묻지 마라." : null,
+  ].filter(Boolean);
 }
 
 function assessTerafabxParentContextMismatch(target = {}, reply = "") {
@@ -1995,8 +2002,10 @@ function assessTerafabxParentContextMismatch(target = {}, reply = "") {
   const targetText = cleanSocialText(target.targetText || target.text || "");
   const comment = cleanSocialText(reply);
   const praisesVisibleSubject = /귀엽|기특|예쁘|멋지|착하|사랑스럽/.test(targetText);
+  const hasVisibleSubject = Math.max(0, Number(target.visibleMediaCount || target.mediaCount || target.quoteMediaCount || 0)) > 0
+    || /(?:이|그|저)\s*(?:짤|사진|영상|장면|아이|애|강아지|고양이)|(?:이거|그거|저거)/.test(targetText);
   const asksUnknownSubject = /도대체\s*(?:어떤|누구|무슨)|(?:어떤|누구|무슨)\s*.{0,14}(?:길래|인가요|일까요|거예요)/.test(comment);
-  const mismatch = Boolean(rootPostText && praisesVisibleSubject && asksUnknownSubject);
+  const mismatch = Boolean(asksUnknownSubject && ((rootPostText && praisesVisibleSubject) || hasVisibleSubject));
   return {
     ok: !mismatch,
     reason: mismatch ? "부모 원글에 보이는 대상을 모르는 듯 되묻는 문구" : null,
@@ -2887,6 +2896,11 @@ async function generateTerafabxPreparedReplyBatchWithGemini(items = [], options 
         targetText: item.target.targetText,
         rootPostUrl: item.target.rootPostUrl || null,
         rootPostText: item.target.rootPostText || null,
+        mediaCount: Number(item.target.mediaCount || 0),
+        visibleMediaCount: Number(item.target.visibleMediaCount || item.target.mediaCount || item.target.quoteMediaCount || 0),
+        quotePostUrl: item.target.quotePostUrl || null,
+        quotePostText: item.target.quotePostText || null,
+        quoteMediaCount: Number(item.target.quoteMediaCount || 0),
         comment: row.finalReply,
         grokComment: row.finalReply,
         grokContext: terafabxGrokContextForRecord(context),
@@ -3456,6 +3470,10 @@ async function discoverTerafabxCommentTargetsUnlocked(limit = 1) {
           authorVerified: metadata.authorVerified,
           authorVerificationType: metadata.authorVerificationType,
           mediaCount: metadata.mediaCount,
+          visibleMediaCount: metadata.visibleMediaCount,
+          quotePostUrl: metadata.quotePostUrl,
+          quotePostText: metadata.quotePostText,
+          quoteMediaCount: metadata.quoteMediaCount,
           collectionSource: "x-home-url+fxtwitter-v2-status",
         });
         seen.add(metadata.url);
@@ -3633,6 +3651,12 @@ function normalizeFxTwitterV2Status(status = {}) {
   const allMedia = Array.isArray(media.all) ? media.all : [];
   const photos = Array.isArray(media.photos) ? media.photos : allMedia.filter((item) => item?.type === "photo");
   const videos = Array.isArray(media.videos) ? media.videos : allMedia.filter((item) => item?.type === "video" || item?.type === "gif");
+  const quote = status.quote && typeof status.quote === "object" ? status.quote : {};
+  const quoteMedia = quote.media || {};
+  const quoteAllMedia = Array.isArray(quoteMedia.all) ? quoteMedia.all : [];
+  const quotePhotos = Array.isArray(quoteMedia.photos) ? quoteMedia.photos : quoteAllMedia.filter((item) => item?.type === "photo");
+  const quoteVideos = Array.isArray(quoteMedia.videos) ? quoteMedia.videos : quoteAllMedia.filter((item) => item?.type === "video" || item?.type === "gif");
+  const quoteMediaCount = quotePhotos.length + quoteVideos.length;
   const replyingTo = status.replying_to || {};
   const authorHandle = String(author.screen_name || parseXStatusUrl(status.url || "")?.handle || "").replace(/^@/, "");
   return {
@@ -3647,6 +3671,10 @@ function normalizeFxTwitterV2Status(status = {}) {
     imageCount: photos.length,
     videoCount: videos.length,
     mediaCount: photos.length + videos.length,
+    visibleMediaCount: photos.length + videos.length + quoteMediaCount,
+    quotePostUrl: normalizeXStatusUrl(quote.url || ""),
+    quotePostText: String(quote.text || quote.raw_text?.text || "").trim(),
+    quoteMediaCount,
     replyingTo: String(replyingTo.screen_name || status.replying_to || "").replace(/^@/, ""),
     replyingToStatus: String(replyingTo.status || status.replying_to_status || ""),
     createdAt: status.created_at || null,
@@ -6899,6 +6927,8 @@ function assessTerafabxCurrentCommentPolicy(record) {
     errors.push(`independent_judge_score_below_threshold:${Number.isFinite(finalScore) ? finalScore : "missing"}`);
   }
   for (const issue of finalJudge?.flaggedQualityIssues || []) errors.push(`gemini_quality:${issue}`);
+  const visibleSubject = assessTerafabxParentContextMismatch(record || {}, record?.comment || "");
+  if (!visibleSubject.ok) errors.push("visible_subject_unknown_question");
   if (finalJudge?.passed !== true) errors.push("independent_judge_not_passed");
   return {
     ok: errors.length === 0,

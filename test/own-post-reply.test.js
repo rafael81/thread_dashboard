@@ -279,6 +279,37 @@ test("visible-subject praise cannot be rewritten as an unknown-subject question"
   assert.equal(assessTerafabxParentContextMismatch(target, "물까지 마시면서 돕는 게 진짜 기특하죠").ok, true);
 });
 
+test("quoted media is preserved as visible context for automatic comments", () => {
+  const result = normalizeFxTwitterV2Status({
+    id: "2",
+    url: "https://x.com/example/status/2",
+    text: "너무 웃기다 이 짤이",
+    author: { screen_name: "example" },
+    media: {},
+    quote: {
+      url: "https://x.com/source/status/1",
+      text: ": me",
+      media: { photos: [{ type: "photo", url: "https://pbs.twimg.com/media/test.jpg" }] },
+    },
+  });
+
+  assert.equal(result.mediaCount, 0);
+  assert.equal(result.quoteMediaCount, 1);
+  assert.equal(result.visibleMediaCount, 1);
+  assert.equal(result.quotePostText, ": me");
+
+  const prompt = terafabxGeminiGeneratePrompt({
+    ...result,
+    targetText: result.text,
+  }, {
+    contextSummary: "인용된 사진을 보고 웃는 게시물이다.",
+    keyPoints: ["인용 사진"],
+  });
+  assert.match(prompt, /인용 원문: : me/);
+  assert.match(prompt, /화면에 보이는 첨부\/인용 미디어: 1개/);
+  assert.match(prompt, /무엇인지 모르는 듯 되묻지 마라/);
+});
+
 test("ordinary comment prompts keep the single-post context format", () => {
   const prompt = terafabxGeminiReviewPrompt({
     url: "https://x.com/example/status/1",

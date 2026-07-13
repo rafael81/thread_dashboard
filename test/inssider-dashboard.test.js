@@ -338,6 +338,29 @@ test('TerafabX current prefill policy quarantines a sub-90 independent score', (
   assert.ok(result.errors.includes('independent_judge_score_below_threshold:86'));
 });
 
+test('TerafabX current policy rejects asking what an already visible meme is', () => {
+  const result = assessTerafabxCurrentCommentPolicy({
+    source: 'prefill',
+    queuedAt: '2026-07-13T16:05:20.000Z',
+    targetText: 'ㅋㅋㅋㅋ 너무 웃기다 이 짤이',
+    comment: '대체 무슨 짤이길래 이렇게 웃겨',
+    grokContext: { summary: '인용된 짤을 보고 크게 웃는 게시물이다.', keyPoints: ['인용 짤'], rawPreview: 'grok.com' },
+    geminiReview: { finalJudge: {
+      score: 100,
+      passed: true,
+      fatalError: false,
+      qualityFlagsComplete: true,
+      genericityFlagsComplete: true,
+      sourceAnchorGrounded: true,
+      flaggedQualityIssues: [],
+      dimensions: { context: 40 },
+    } },
+  });
+
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.includes('visible_subject_unknown_question'));
+});
+
 test('TerafabX pending comments reject Grok text fallback even for legacy prefill', () => {
   const result = assessTerafabxCurrentCommentPolicy({
     at: '2026-07-12T05:00:00.000Z',
