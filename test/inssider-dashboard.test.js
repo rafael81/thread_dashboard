@@ -241,6 +241,16 @@ test('TerafabX Gemini quality prompts forbid invented personal experience', () =
   assert.match(prompt, /제공된 영상·사진을 보고 한 관찰은 직접 경험 주장과 구분/);
 });
 
+test('TerafabX Gemini quality prompts reject unsupported recurring claims and broad anchors', () => {
+  const prompt = require('../mirror_server.js').terafabxGeminiBatchFinalJudgePrompt([{
+    target: { url: 'https://x.com/example/status/1', targetText: '2026 의정부고 졸업사진, 손흥민은 진짜 본인인 줄' },
+    prepared: { comment: '의정부고 졸업사진은 매년 퀄리티가 엄청나네요', grokContext: { summary: '2026년 졸업사진', keyPoints: [] } },
+  }]);
+
+  assert.match(prompt, /특정 연도만 말하는데 댓글이 '매년'/);
+  assert.match(prompt, /인물·행동·숫자처럼 더 구별되는 핵심/);
+});
+
 test('TerafabX manual audit can disable automatic repair after final judge rejection', () => {
   const { shouldRepairTerafabxBatchFailures } = require('../mirror_server.js');
 
