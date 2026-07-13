@@ -20,6 +20,7 @@ const {
   findXScheduledEntry,
   terafabxGeminiReviewPrompt,
   terafabxGrokContextBatchPrompt,
+  normalizeTerafabxContextResult,
   parseTerafabxGrokContextBatch,
   isDiscoveryAutoScheduleSource,
   ensureComposerText,
@@ -72,6 +73,15 @@ test('TerafabX Grok context batch fails closed for a missing index', () => {
   ]), targets);
   assert.equal(parsed[0].ok, true);
   assert.equal(parsed[1].ok, false);
+});
+
+test('TerafabX Grok context survives persisted summary field on retry', () => {
+  const context = normalizeTerafabxContextResult({
+    summary: '재시도 전에 저장된 원문 문맥 요약을 그대로 복원해야 한다.',
+    keyPoints: ['원문 문맥', '재시도'],
+  });
+  assert.match(context.contextSummary, /원문 문맥 요약/);
+  assert.deepEqual(context.keyPoints, ['원문 문맥', '재시도']);
 });
 
 test('past scheduled discovery row is treated as posted on dashboard', () => {
@@ -459,11 +469,11 @@ test('Grok headless browser uses the regular Chrome identity and system Chrome b
 test('Grok final judge chunks long polling so the browser command line stays bounded', () => {
   const chunks = buildGrokBatchCommandChunks('긴 심사', 'https://x.com/i/grok', 180000);
 
-  assert.equal(chunks.length, 24);
+  assert.equal(chunks.length, 15);
   assert.equal(chunks[0][2], 'open https://x.com/i/grok');
   assert.ok(chunks.slice(1).every((commands) => commands.slice(0, 2).join(' ') === 'batch --bail'));
-  assert.ok(chunks.every((commands, index) => commands.filter((command) => command.startsWith('eval -b ')).length <= (index === 0 ? 3 : 2)));
-  assert.equal(chunks.flat().filter((command) => command.startsWith('eval -b ')).length, 49);
+  assert.ok(chunks.every((commands, index) => commands.filter((command) => command.startsWith('eval -b ')).length <= (index === 0 ? 5 : 4)));
+  assert.equal(chunks.flat().filter((command) => command.startsWith('eval -b ')).length, 61);
 });
 
 test('Grok final judge parses a done marker containing an apostrophe in the reason', () => {

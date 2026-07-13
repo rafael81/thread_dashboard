@@ -9,7 +9,7 @@ const DEFAULT_SESSION = "terafabx-grok-headless";
 const DEFAULT_TIMEOUT_MS = 180000;
 const POLL_INTERVAL_MS = 2500;
 const RESPONSE_STABLE_POLLS = 2;
-const BATCH_POLL_CHUNK_SIZE = 2;
+const BATCH_POLL_CHUNK_SIZE = 4;
 const DEBUG = process.env.TERAFABX_GROK_WEB_DEBUG === "true";
 const DEFAULT_SYSTEM_CHROME_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const DEFAULT_HUMAN_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
@@ -460,7 +460,7 @@ function buildGrokBatchCommandChunks(prompt, url, timeoutMs = DEFAULT_TIMEOUT_MS
     `wait ${randomHumanDelayMs(random, 900, 1800)}`,
   ];
   const pollMs = 3000;
-  const maxPolls = Math.max(1, Math.min(48, Math.ceil(timeoutMs / pollMs)));
+  const maxPolls = Math.max(1, Math.min(72, Math.ceil(timeoutMs / pollMs)));
   const chunks = [];
   for (let offset = 0; offset < maxPolls; offset += BATCH_POLL_CHUNK_SIZE) {
     const commands = offset === 0 ? [...initialCommands] : ["batch", "--bail"];

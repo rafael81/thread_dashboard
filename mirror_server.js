@@ -1883,7 +1883,7 @@ function normalizeTerafabxGrokResult(value) {
 function normalizeTerafabxContextResult(value) {
   const source = value && typeof value === "object" ? value : {};
   return {
-    contextSummary: cleanSocialText(source.contextSummary || source.context_summary || source.analysis || source.context || "").slice(0, 1200),
+    contextSummary: cleanSocialText(source.contextSummary || source.context_summary || source.summary || source.analysis || source.context || "").slice(0, 1200),
     keyPoints: normalizeTerafabxGrokKeyPoints(source.keyPoints || source.key_points || source.points || []),
     rawPreview: String(source.rawPreview || source.raw || "").slice(0, 1200),
   };
@@ -6631,7 +6631,7 @@ async function runTerafabxCommentPrefillQueue({ manual = false, targetCount = TE
       const batch = await analyzeTerafabxContextsWithGrok(targetChunk, {
         session: resource.grokContextSession,
         skipGrokStateSync: true,
-        timeoutMs: 90_000,
+        timeoutMs: 240_000,
       });
       return batch.map((item) => {
         if (item.ok) return { ok: true, target: item.target, grokContext: item.context, workerIndex };
@@ -13843,6 +13843,7 @@ module.exports = {
   xScheduledTimeNeedles,
   terafabxGrokContextPrompt,
   terafabxGrokContextBatchPrompt,
+  normalizeTerafabxContextResult,
   parseTerafabxGrokContextBatch,
   terafabxGeminiGeneratePrompt,
   terafabxGeminiReviewPrompt,
