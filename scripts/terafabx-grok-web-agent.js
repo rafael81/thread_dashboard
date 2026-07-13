@@ -364,28 +364,49 @@ function buildGrokSubmitEvalScript(prompt) {
       '[placeholder*="메시지" i]'
     ].flatMap((selector) => [...document.querySelectorAll(selector)])
       .find((node) => visible(node) && (node.isContentEditable || node.getAttribute('contenteditable') != null || /TEXTAREA|INPUT/.test(node.tagName) || node.getAttribute('role') === 'textbox'));
-    if (!editor) return JSON.stringify({ ok: false, stage: 'missing_editor', url: location.href, title: document.title, textPreview: (document.body?.innerText || '').slice(0, 800) });
+    if (!editor) throw new Error('TERAFABX_GROK_EDITOR_MISSING');
     window.__terafabxGrokPrompt = prompt;
     window.__terafabxGrokBaseline = readState();
     window.__terafabxGrokLastText = '';
     window.__terafabxGrokStableCount = 0;
     editor.focus();
-    if (/TEXTAREA|INPUT/.test(editor.tagName)) {
-      editor.value = '';
-      editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward', data: null }));
-    } else {
-      const selection = window.getSelection();
-      const range = document.createRange();
-      range.selectNodeContents(editor);
-      selection.removeAllRanges();
-      selection.addRange(range);
-      document.execCommand('delete', false);
-      if (clean(editor.innerText || editor.textContent || '')) editor.textContent = '';
-      editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward', data: null }));
-    }
     await sleep(800);
     editor.focus();
-    return JSON.stringify({ ok: true, stage: 'filled', url: location.href, editorTextLength: clean(editor.innerText || editor.value || '').length });
+    return JSON.stringify({ ok: true, stage: 'editor_ready', url: location.href });
+  })()`;
+}
+
+function buildGrokSendEvalScript(prompt) {
+  return `(() => {
+    const expected = ${JSON.stringify(normalizePromptEchoText(prompt))};
+    const clean = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+    const visible = (node) => {
+      if (!node) return false;
+      const rect = node.getBoundingClientRect();
+      const style = getComputedStyle(node);
+      return rect.width >= 8 && rect.height >= 8 && style.visibility !== 'hidden' && style.display !== 'none';
+    };
+    const editor = [
+      '[contenteditable][aria-label*="Grok" i]',
+      '[contenteditable="true"]',
+      '.ProseMirror',
+      '[role="textbox"]',
+      'textarea'
+    ].flatMap((selector) => [...document.querySelectorAll(selector)])
+      .find((node) => visible(node) && (node.isContentEditable || node.getAttribute('contenteditable') != null || /TEXTAREA|INPUT/.test(node.tagName) || node.getAttribute('role') === 'textbox'));
+    if (!editor) throw new Error('TERAFABX_GROK_EDITOR_MISSING_AFTER_INPUT');
+    const actual = clean(editor.innerText || editor.value || editor.textContent || '');
+    if (actual !== expected) throw new Error('TERAFABX_GROK_PROMPT_INPUT_MISMATCH');
+    const submit = [
+      'button[data-testid="chat-submit"]',
+      'button[aria-label="제출"]',
+      'button[aria-label*="Submit" i]',
+      'button[aria-label*="Send" i]'
+    ].flatMap((selector) => [...document.querySelectorAll(selector)])
+      .find((button) => visible(button) && !button.disabled);
+    if (!submit) throw new Error('TERAFABX_GROK_SUBMIT_MISSING');
+    submit.click();
+    return JSON.stringify({ ok: true, stage: 'submitted', url: location.href, promptLength: actual.length });
   })()`;
 }
 
@@ -448,9 +469,11 @@ function buildGrokBatchCommandChunks(prompt, url, timeoutMs = DEFAULT_TIMEOUT_MS
     "reload",
     `wait ${randomHumanDelayMs(random, 4200, 6800)}`,
     `eval -b ${encodeEval(buildGrokSubmitEvalScript(prompt))}`,
+    "press Control+a",
+    "press Backspace",
     `keyboard inserttext ${JSON.stringify(normalizePromptEchoText(prompt))}`,
     `wait ${randomHumanDelayMs(random, 600, 1400)}`,
-    "press Enter",
+    `eval -b ${encodeEval(buildGrokSendEvalScript(prompt))}`,
     `wait ${randomHumanDelayMs(random, 900, 1800)}`,
   ];
   const pollMs = 3000;

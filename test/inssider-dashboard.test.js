@@ -544,7 +544,7 @@ test('TerafabX comment monitor still requests prefill during quiet posting hours
   ), true);
 });
 
-test('Grok context batch uses one semantic fill and Enter submission', () => {
+test('Grok context batch validates the editor and clicks submit after one keyboard fill', () => {
   const commands = buildGrokBatchCommands('한 줄\n심사', 'https://x.com/i/grok', 60000, () => 0);
 
   assert.deepEqual(commands.slice(0, 6), [
@@ -567,11 +567,17 @@ test('Grok context batch uses one semantic fill and Enter submission', () => {
   assert.match(responseReadScript, /'\[class\*="r-bnwqim"\]\[class\*="r-11niif6"\]'/);
   assert.match(responseReadScript, /cleanPrompt = clean\(prompt\)/);
   assert.match(responseReadScript, /textFingerprint\.includes\(promptFingerprint\.slice/);
-  assert.ok(!commands.includes('press Control+a'));
+  assert.ok(commands.includes('press Control+a'));
+  assert.ok(commands.includes('press Backspace'));
   assert.equal(commands.filter((command) => command.startsWith('keyboard inserttext ')).length, 1);
   assert.ok(commands.some((command) => command.startsWith('keyboard inserttext ') && command.includes('한 줄 심사')));
   assert.ok(!commands.some((command) => command.startsWith('keyboard inserttext ') && command.includes('\\n')));
-  assert.ok(commands.includes('press Enter'));
+  assert.ok(!commands.includes('press Enter'));
+  const sendCommand = commands.find((command) => command.startsWith('eval -b ') && Buffer.from(command.slice('eval -b '.length), 'base64').toString('utf8').includes('chat-submit'));
+  assert.ok(sendCommand);
+  const sendScript = Buffer.from(sendCommand.slice('eval -b '.length), 'base64').toString('utf8');
+  assert.match(sendScript, /PROMPT_INPUT_MISMATCH/);
+  assert.match(sendScript, /submit\.click\(\)/);
   assert.ok(commands.some((command) => command.startsWith('eval -b ')));
   assert.ok(!commands.some((command) => command.startsWith('find placeholder ')));
   assert.ok(!commands.some((command) => command.includes('grok.com/')));
@@ -608,8 +614,8 @@ test('Grok final judge chunks long polling so the browser command line stays bou
   assert.equal(chunks.length, 15);
   assert.equal(chunks[0][2], 'open https://x.com/i/grok');
   assert.ok(chunks.slice(1).every((commands) => commands.slice(0, 2).join(' ') === 'batch --bail'));
-  assert.ok(chunks.every((commands, index) => commands.filter((command) => command.startsWith('eval -b ')).length <= (index === 0 ? 5 : 4)));
-  assert.equal(chunks.flat().filter((command) => command.startsWith('eval -b ')).length, 61);
+  assert.ok(chunks.every((commands, index) => commands.filter((command) => command.startsWith('eval -b ')).length <= (index === 0 ? 6 : 4)));
+  assert.equal(chunks.flat().filter((command) => command.startsWith('eval -b ')).length, 62);
 });
 
 test('Grok final judge parses a done marker containing an apostrophe in the reason', () => {
