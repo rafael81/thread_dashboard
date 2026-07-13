@@ -220,7 +220,7 @@ test('TerafabX final judge passes a natural specific reply at the quality thresh
     concision: 9,
     non_ai_style: 9,
     fatal_error: false,
-    language_error: false, awkward_korean: false, translation_tone: false, cliche: false, context_error: false,
+    language_error: false, awkward_korean: false, translation_tone: false, cliche: false, context_error: false, unsupported_claim: false,
     cross_post_reusable: false, headline_tone: false, specificity_error: false,
     source_anchor: '주말 출근자들',
     reason: '원문의 주말 출근 응원에 짧고 자연스럽게 반응함',
@@ -299,6 +299,7 @@ test('TerafabX final judge accepts a source anchor found in quoted post text', (
     translation_tone: false,
     cliche: false,
     context_error: false,
+    unsupported_claim: false,
     cross_post_reusable: false,
     headline_tone: false,
     specificity_error: false,
@@ -311,6 +312,35 @@ test('TerafabX final judge accepts a source anchor found in quoted post text', (
 
   assert.equal(result.sourceAnchorGrounded, true);
   assert.equal(result.passed, true);
+});
+
+test('TerafabX final judge rejects a concrete association absent from the source', () => {
+  const result = parseTerafabxFinalJudge(JSON.stringify({
+    context: 40,
+    naturalness: 25,
+    specificity: 15,
+    concision: 10,
+    non_ai_style: 10,
+    fatal_error: false,
+    language_error: false,
+    awkward_korean: false,
+    translation_tone: false,
+    cliche: false,
+    context_error: false,
+    unsupported_claim: true,
+    cross_post_reusable: false,
+    headline_tone: false,
+    specificity_error: false,
+    source_anchor: '민초',
+    reason: '원문에 없는 치약 맛을 연상만으로 추가함',
+  }), '치약 맛이랑 초코 맛은 완전히 다르죠', {
+    targetText: '민초 좋아해?',
+    quotePostText: '민트 좋아해?',
+  });
+
+  assert.equal(result.rawScore, 100);
+  assert.equal(result.passed, false);
+  assert.deepEqual(result.flaggedQualityIssues, ['unsupported_claim']);
 });
 
 test('TerafabX daily comment cadence targets 600 and accelerates when behind pace', () => {

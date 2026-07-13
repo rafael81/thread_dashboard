@@ -2052,6 +2052,7 @@ function terafabxGeminiReviewPrompt(target, grokInput, qualityFeedback = null) {
     "Gemini 후보가 충분히 좋으면 유지하고, 어색하거나 원문 맥락과 덜 맞으면 자연스럽게 다시 써라.",
     "규칙: 한국어 한 줄, 8~45자, 가능하면 12~30자. 길이를 늘리기보다 원문의 구체적인 장면·행동·감정 한 가지에 정확히 반응해라.",
     "짧더라도 문맥이 정확하고 자연스러우면 유지한다. 원문에 없는 정보, 범용 덕담, 요약 반복은 다시 써라.",
+    "원문·인용문·Grok의 확정적 문맥 설명에 없는 구체 명사·수치·원인·행동을 연상만으로 추가하지 마라. 예를 들어 민초라는 말만 보고 치약 맛을 끌어오는 것은 근거 없는 추가 정보다.",
     "금지: 폭력/무기/성/도박/정치/투자 표현, 조롱, 단정적 비난, 링크, 해시태그, 이모지, 후보 목록, 따옴표.",
     ...terafabxCommentQualityPromptLines(),
     "너는 이 단계에서 점수를 매기지 않는다. 수정 여부와 최종 댓글만 결정해라.",
@@ -2135,6 +2136,7 @@ function terafabxGeminiBatchGeneratePrompt(items = []) {
     "이 단계에서는 점수를 매기지 마라. 다음 단계의 독립 심사자가 별도로 평가한다.",
     "규칙: 한국어 한 줄, 8~45자, 가능하면 12~30자. 원문의 구체적인 장면·행동·감정 한 가지에 정확히 반응해라.",
     "금지: 상투적 덕담, 작성자님, 원문 요약 반복, 원문에 없는 정보, 링크, 해시태그, 이모지, 따옴표, 후보 목록.",
+    "원문·인용문·Grok의 확정적 문맥 설명에 없는 구체 명사·수치·원인·행동을 연상만으로 추가하지 마라. Grok이 '(추정)'이라고 표시한 내용도 댓글 근거로 쓰지 마라.",
     ...terafabxCommentQualityPromptLines(),
     "반드시 JSON 배열 한 줄만 출력해라. 형식: [{\"index\":0,\"final_reply\":\"댓글\",\"decision\":\"rewrite\",\"reason\":\"짧은 작성 근거\"}]",
     "",
@@ -2162,6 +2164,7 @@ function terafabxGeminiBatchFinalJudgePrompt(items = []) {
     "최종 심사 대상 댓글의 실제 문자열만 평가해라. 원문에 있는 숫자가 댓글에서 빠졌다면 그 숫자가 있다고 가정하거나 보완해서 읽지 마라.",
     "오기·오타·조사 오류·문법 오류·불완전한 종결어미·번역체를 발견하면 reason에 문제 구절을 그대로 적고 naturalness를 최대 10점으로 제한해라.",
     "상투적 덕담이나 AI식 추상 요약체를 발견하면 non_ai_style을 최대 4점으로 제한해라.",
+    "'고민이 깊으시겠습니다', '마음이 무거우시겠습니다'처럼 상담 기록 같은 격식체 추측 공감은 awkward_korean=true 또는 translation_tone=true로 판정해라.",
     "'진짜 신기하게', '딱 보이지 않나요', '계속 보게 되네요'처럼 여러 댓글에 반복될 법한 감탄 템플릿은 non_ai_style에서 크게 감점해라.",
     "Grok 분석의 대응 조언을 사실 근거로 취급하지 마라. source_anchor에는 반드시 원문 또는 부모 원글에 실제로 적힌 고유 명사·숫자·행동 구절을 원문 그대로 적어라.",
     "댓글이 같은 분야의 다른 글에도 그대로 붙을 수 있으면 cross_post_reusable=true다. 예: '폭로성 스캔들은 사실 확인이 먼저 필요합니다'처럼 일반 원칙만 말하는 문장.",
@@ -2173,8 +2176,9 @@ function terafabxGeminiBatchFinalJudgePrompt(items = []) {
     "translation_tone은 직역체·번역체·과도하게 딱딱한 표현이면 true다.",
     "cliche는 범용 덕담·추상적 감탄·다른 글에도 붙일 수 있는 AI식 요약체면 true다.",
     "context_error는 원문과 어긋나거나 이미 보이는 대상을 모르는 듯 묻거나 사실을 추측하면 true다.",
+    "unsupported_claim은 댓글이 원문·부모 원글·인용문 또는 원문 분석의 확정적 관찰에 없는 구체 명사·수치·원인·행동을 새로 만들어내면 true다. 단어에서 흔히 연상되는 소재라도 원문 근거가 없으면 true이며, 원문 분석에서 '(추정)'인 내용은 근거가 아니다.",
     "부모 원글에 대상이나 장면이 이미 드러났는데도 댓글이 누구·무엇·어떤 대상인지 모르는 듯 되물으면 대상 혼동으로 보고 fatal_error=true로 판정해라.",
-    "반드시 JSON 배열 한 줄만 출력해라. 모든 필드를 빠짐없이 포함해라. 형식: [{\"index\":0,\"context\":0,\"naturalness\":0,\"specificity\":0,\"concision\":0,\"non_ai_style\":0,\"fatal_error\":false,\"language_error\":false,\"awkward_korean\":false,\"translation_tone\":false,\"cliche\":false,\"context_error\":false,\"cross_post_reusable\":false,\"headline_tone\":false,\"specificity_error\":false,\"source_anchor\":\"원문에 실제로 있는 구절\",\"reason\":\"짧은 이유\"}]",
+    "반드시 JSON 배열 한 줄만 출력해라. 모든 필드를 빠짐없이 포함해라. 형식: [{\"index\":0,\"context\":0,\"naturalness\":0,\"specificity\":0,\"concision\":0,\"non_ai_style\":0,\"fatal_error\":false,\"language_error\":false,\"awkward_korean\":false,\"translation_tone\":false,\"cliche\":false,\"context_error\":false,\"unsupported_claim\":false,\"cross_post_reusable\":false,\"headline_tone\":false,\"specificity_error\":false,\"source_anchor\":\"원문에 실제로 있는 구절\",\"reason\":\"짧은 이유\"}]",
     "",
     blocks,
   ].join("\n");
@@ -2364,6 +2368,7 @@ function terafabxCommentQualityPromptLines() {
   return [
     "상투 표현 금지: 마음이 훈훈해지네요, 작성자님, 재충전의 시간 보내세요, 행복한 하루 보내세요, 인상적이네요, 응원합니다.",
     "대화형 반응 대신 '배려가 필요합니다', '확인이 필요합니다', '안전합니다', '해야 합니다'처럼 기사 결론·안전 표어·교훈으로 끝내지 마라.",
+    "'고민이 깊으시겠습니다', '마음이 무거우시겠습니다'처럼 상담 기록 같은 격식체 추측 공감은 쓰지 말고 실제 X 대화처럼 짧고 담백하게 말해라.",
     ...dynamicRules.map((rule) => `최근 10분 품질 피드백: ${rule}`),
   ];
 }
@@ -2379,6 +2384,7 @@ function terafabxFinalJudgePrompt(target, grokInput, finalReply) {
     "최종 심사 대상 댓글의 실제 문자열만 평가해라. 원문에 있는 숫자가 댓글에서 빠졌다면 그 숫자가 있다고 가정하거나 보완해서 읽지 마라.",
     "오기·오타·조사 오류·문법 오류·불완전한 종결어미·번역체를 발견하면 reason에 문제 구절을 그대로 적고 naturalness를 최대 10점으로 제한해라.",
     "상투적 덕담이나 AI식 추상 요약체를 발견하면 non_ai_style을 최대 4점으로 제한해라.",
+    "'고민이 깊으시겠습니다', '마음이 무거우시겠습니다'처럼 상담 기록 같은 격식체 추측 공감은 awkward_korean=true 또는 translation_tone=true로 판정해라.",
     "'진짜 신기하게', '딱 보이지 않나요', '계속 보게 되네요'처럼 여러 댓글에 반복될 법한 감탄 템플릿은 non_ai_style에서 크게 감점해라.",
     "Grok 분석의 대응 조언을 사실 근거로 취급하지 마라. source_anchor에는 반드시 원문 또는 부모 원글에 실제로 적힌 고유 명사·숫자·행동 구절을 원문 그대로 적어라.",
     "댓글이 같은 분야의 다른 글에도 그대로 붙을 수 있으면 cross_post_reusable=true다. '배려가 필요합니다', '확인이 필요합니다', '안전합니다', '해야 합니다'처럼 대화형 반응 없이 당위적 결론만 말하거나 기사 제목·표어·교훈 문장처럼 들리면 headline_tone=true다.",
@@ -2389,8 +2395,9 @@ function terafabxFinalJudgePrompt(target, grokInput, finalReply) {
     "translation_tone은 직역체·번역체·과도하게 딱딱한 표현이면 true다.",
     "cliche는 범용 덕담·추상적 감탄·다른 글에도 붙일 수 있는 AI식 요약체면 true다.",
     "context_error는 원문과 어긋나거나 이미 보이는 대상을 모르는 듯 묻거나 사실을 추측하면 true다.",
+    "unsupported_claim은 댓글이 원문·부모 원글·인용문 또는 원문 분석의 확정적 관찰에 없는 구체 명사·수치·원인·행동을 새로 만들어내면 true다. 단어에서 흔히 연상되는 소재라도 원문 근거가 없으면 true이며, 원문 분석에서 '(추정)'인 내용은 근거가 아니다.",
     "부모 원글에 대상이나 장면이 이미 드러났는데도 댓글이 누구·무엇·어떤 대상인지 모르는 듯 되물으면 대상 혼동으로 보고 fatal_error=true로 판정해라.",
-    "반드시 JSON 한 줄만 출력해라. 모든 필드를 빠짐없이 포함해라. 형식: {\"context\":0,\"naturalness\":0,\"specificity\":0,\"concision\":0,\"non_ai_style\":0,\"fatal_error\":false,\"language_error\":false,\"awkward_korean\":false,\"translation_tone\":false,\"cliche\":false,\"context_error\":false,\"cross_post_reusable\":false,\"headline_tone\":false,\"specificity_error\":false,\"source_anchor\":\"원문에 실제로 있는 구절\",\"reason\":\"짧은 이유\"}",
+    "반드시 JSON 한 줄만 출력해라. 모든 필드를 빠짐없이 포함해라. 형식: {\"context\":0,\"naturalness\":0,\"specificity\":0,\"concision\":0,\"non_ai_style\":0,\"fatal_error\":false,\"language_error\":false,\"awkward_korean\":false,\"translation_tone\":false,\"cliche\":false,\"context_error\":false,\"unsupported_claim\":false,\"cross_post_reusable\":false,\"headline_tone\":false,\"specificity_error\":false,\"source_anchor\":\"원문에 실제로 있는 구절\",\"reason\":\"짧은 이유\"}",
     "",
     ...terafabxPromptContextLines(target),
     `원문 분석: ${grok.contextSummary || "제공 없음"}`,
@@ -2409,7 +2416,7 @@ function normalizeTerafabxFinalJudgeParsed(parsed, finalReply, rawPreview = "") 
   const cliche = scoreTerafabxClichePenalty(finalReply);
   const rawScore = Object.values(dimensions).reduce((sum, value) => sum + value, 0);
   const score = rawScore;
-  const qualityFlagKeys = ["language_error", "awkward_korean", "translation_tone", "cliche", "context_error"];
+  const qualityFlagKeys = ["language_error", "awkward_korean", "translation_tone", "cliche", "context_error", "unsupported_claim"];
   const genericityFlagKeys = ["cross_post_reusable", "headline_tone", "specificity_error"];
   const qualityFlagsComplete = qualityFlagKeys.every((key) => typeof parsed[key] === "boolean");
   const genericityFlagsComplete = genericityFlagKeys.every((key) => typeof parsed[key] === "boolean") && cleanSocialText(parsed.source_anchor || "").length > 0;

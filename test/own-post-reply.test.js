@@ -347,11 +347,14 @@ test("own-post batch Gemini review keeps rewrite separate from independent scori
   assert.match(reviewPrompt, /점수를 매기지 않는다/);
   assert.match(reviewPrompt, /JSON 배열 한 줄/);
   assert.match(reviewPrompt, /index=0/);
+  assert.match(reviewPrompt, /고민이 깊으시겠습니다/);
   assert.doesNotMatch(reviewPrompt, /context 0~40/);
 
   const judgePrompt = terafabxGeminiBatchFinalJudgePrompt([{ ...item, review: { finalReply: "진짜 있으면 한번 신어보고 싶네요" } }]);
   assert.match(judgePrompt, /독립 묶음 최종 심사자/);
   assert.match(judgePrompt, /context 0~40/);
+  assert.match(judgePrompt, /unsupported_claim/);
+  assert.match(judgePrompt, /상담 기록 같은 격식체 추측 공감/);
   assert.match(judgePrompt, /최종 심사 대상 댓글: 진짜 있으면 한번 신어보고 싶네요/);
 });
 
@@ -376,7 +379,7 @@ test("own-post batch Gemini JSON parsing preserves review and final judge gates"
   assert.equal(reviewed[0].finalReply, "물 위를 걷는 느낌이라 더 신기하네요");
   assert.equal(reviewed[0].decision, "rewrite");
 
-  const judged = parseTerafabxGeminiBatchFinalJudge('[{"index":0,"context":38,"naturalness":24,"specificity":14,"concision":9,"non_ai_style":9,"fatal_error":false,"language_error":false,"awkward_korean":false,"translation_tone":false,"cliche":false,"context_error":false,"cross_post_reusable":false,"headline_tone":false,"specificity_error":false,"source_anchor":"물 위를 걷는","reason":"문맥과 자연스러움이 좋음"}]', [{ finalReply: reviewed[0].finalReply, target: { targetText: "물 위를 걷는 장면" } }]);
+  const judged = parseTerafabxGeminiBatchFinalJudge('[{"index":0,"context":38,"naturalness":24,"specificity":14,"concision":9,"non_ai_style":9,"fatal_error":false,"language_error":false,"awkward_korean":false,"translation_tone":false,"cliche":false,"context_error":false,"unsupported_claim":false,"cross_post_reusable":false,"headline_tone":false,"specificity_error":false,"source_anchor":"물 위를 걷는","reason":"문맥과 자연스러움이 좋음"}]', [{ finalReply: reviewed[0].finalReply, target: { targetText: "물 위를 걷는 장면" } }]);
   assert.equal(judged[0].score, 94);
   assert.equal(judged[0].passed, true);
 
