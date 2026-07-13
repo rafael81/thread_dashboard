@@ -48,29 +48,38 @@ http://localhost:3131/discovery
 
 LAN URL is available from another device if Windows Firewall allows port `3131`.
 
-## Runtime State 이전
+## 다른 Mac으로 이전
 
-Git does not store runtime state such as discovery DB, posted history, scheduled
-slot files, logs, downloads, or local memory. To move the current dashboard state
-to another Windows machine, export a zip from the old machine:
-
-```sh
-npm run export-runtime
-```
-
-Move the generated `thread-dashboard-runtime-*.zip` to the new clone and import:
+소스 코드는 공개 `thread_dashboard` 저장소에, DB와 운영 상태는 별도의 비공개
+`thread_dashboard_runtime` 저장소의 GitHub Release에 저장한다. 기존 Mac에서 서버를
+정상 종료한 뒤 다음 명령을 실행한다.
 
 ```sh
-npm run import-runtime -- ./thread-dashboard-runtime-YYYYMMDD-HHMMSS.zip
+npm run migrate:mac -- upload
 ```
 
-The archive includes:
+이 명령은 현재 브랜치를 `origin`에 push하고, SQLite DB를 온라인 백업한 뒤 체크섬과
+함께 비공개 런타임 저장소에 업로드한다. 커밋하지 않은 소스 변경이 있으면 안전을 위해
+중단한다.
 
-- `.data/thread-discovery.db`
-- `mirror-history.json`
-- `x-scheduled-slots.json`
+새 Mac에서는 GitHub CLI 인증 후 소스를 받고 런타임을 복원한다.
 
-It intentionally excludes `node_modules`, logs, downloaded media, and AI memory.
+```sh
+gh auth login
+gh repo clone rafael81/thread_dashboard
+cd thread_dashboard
+npm ci
+npm run migrate:mac -- restore
+```
+
+복원 전 서버는 종료되어 있어야 한다. 기존 파일이 있으면 `.migration-backups/`에 먼저
+백업된다. 아카이브에는 discovery DB, AI memory DB, 게시 이력, 예약 슬롯 및 자동화
+상태가 포함된다. Chrome 프로필·쿠키, 로그인 정보, 로그, 다운로드 미디어와
+`node_modules`는 포함하지 않는다. 새 Mac에서는 전용 Chrome 프로필로 X, Threads,
+Grok, Gemini에 다시 로그인해야 한다.
+
+로컬 파일로만 옮길 때는 `npm run export-runtime`과
+`npm run import-runtime -- <zip>`을 사용할 수 있다.
 
 ## Threads Video Downloader
 
@@ -140,9 +149,14 @@ Start Chrome manually on macOS if needed:
 
 ```sh
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  --remote-debugging-address=127.0.0.1 \
   --remote-debugging-port=9224 \
-  --user-data-dir="$HOME/.thread-x-chrome"
+  --user-data-dir="$PWD/.data/chrome-profiles/gwajeuplupi-visible-9224" \
+  --profile-directory="Profile 1"
 ```
+
+The 9224 profile is the dedicated clone of the pink `과즙루피` Chrome
+profile. Before any X action, confirm that X shows `@terafabXai`.
 
 Endpoint:
 

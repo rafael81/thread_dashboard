@@ -13,6 +13,12 @@
 
 - Required X account is `@terafabXai`. Verify the logged-in X account before any post, draft, or schedule action. If verification fails, do not post.
 - Chrome remote debugging port is `9224`; use the logged-in headed Chrome session for X/Threads automation.
+- The headed Chrome on port `9224` must use the dedicated clone of the pink
+  `과즙루피` profile (`Profile 1`) at
+  `.data/chrome-profiles/gwajeuplupi-visible-9224`. Its source profile is
+  `~/project/personal/tweet-persona/.agent-browser/chrome-profile/Profile 1`.
+  Do not substitute `Rafael` or any other Chrome profile. After every browser
+  launch or restart, confirm that X shows `@terafabXai` before resuming work.
 - Server entrypoint is `mirror_server.js`, normally served on port `3131`.
 - Android share app should send a Threads URL to the server asynchronously and return quickly. Server-side work must not block the Android share UI.
 - After any X post/draft/schedule attempt, close work tabs and clean local media download directories. User-owned tabs should be left alone.

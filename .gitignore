@@ -11,3 +11,13 @@ mirror-server.out
 mirror_server.out
 x-scheduled-slots.json
 thread-dashboard-runtime-*.zip
+thread-dashboard-runtime-*.zip.sha256
+.migration-backups/
+discovery.db
+mirror-history.json.bak-*
+x-scheduled-slots.json.bak-*
+mirror-server.log
+mirror_server.log
+*.apk
+*.apk.zip
+.gstack/

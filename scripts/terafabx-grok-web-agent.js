@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 const fs = require("fs");
+const crypto = require("crypto");
 const path = require("path");
 const { execFile } = require("child_process");
 
@@ -8,7 +9,14 @@ const DEFAULT_SESSION = "terafabx-grok-headless";
 const DEFAULT_TIMEOUT_MS = 180000;
 const POLL_INTERVAL_MS = 2500;
 const RESPONSE_STABLE_POLLS = 2;
+const BATCH_POLL_CHUNK_SIZE = 12;
 const DEBUG = process.env.TERAFABX_GROK_WEB_DEBUG === "true";
+const DEFAULT_SYSTEM_CHROME_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+const DEFAULT_HUMAN_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
+
+function agentBrowserNamespace(session) {
+  return `tg-${crypto.createHash("sha1").update(String(session || DEFAULT_SESSION)).digest("hex").slice(0, 12)}`;
+}
 
 function parseArgs(argv) {
   const out = {};
@@ -28,18 +36,33 @@ function agentBrowserInvocation(args, options = {}) {
   const bin = process.env.AGENT_BROWSER_BIN || "npx";
   const prefix = process.env.AGENT_BROWSER_BIN ? [] : ["--yes", "agent-browser"];
   const session = options.session || DEFAULT_SESSION;
+  const namespace = agentBrowserNamespace(session);
   const state = options.state || "";
   const headed = options.headed === true || options.headed === "true";
+  const userAgent = options.userAgent || process.env.TERAFABX_BROWSER_USER_AGENT || process.env.AGENT_BROWSER_USER_AGENT || DEFAULT_HUMAN_USER_AGENT;
+  const executablePath = options.executablePath
+    || process.env.TERAFABX_BROWSER_EXECUTABLE_PATH
+    || process.env.AGENT_BROWSER_EXECUTABLE_PATH
+    || (fs.existsSync(DEFAULT_SYSTEM_CHROME_PATH) ? DEFAULT_SYSTEM_CHROME_PATH : "");
   return {
     bin,
     args: [
       ...prefix,
-      "--session", session,
+      "--namespace", namespace,
+      "--session", namespace,
       "--headed", headed ? "true" : "false",
+      "--user-agent", userAgent,
+      "--args", "--lang=ko-KR,--window-size=1440,900",
+      ...(executablePath ? ["--executable-path", executablePath] : []),
       ...(state ? ["--state", state] : []),
       ...args,
     ],
   };
+}
+
+function randomHumanDelayMs(random, minMs, maxMs) {
+  const value = Math.min(0.999999999999, Math.max(0, Number(random()) || 0));
+  return minMs + Math.floor(value * (maxMs - minMs + 1));
 }
 
 function runAgentBrowser(args, options = {}) {
@@ -79,7 +102,8 @@ function closeAgentBrowserSession(session) {
   const bin = process.env.AGENT_BROWSER_BIN || "npx";
   const prefix = process.env.AGENT_BROWSER_BIN ? [] : ["--yes", "agent-browser"];
   return new Promise((resolve) => {
-    execFile(bin, [...prefix, "--session", session || DEFAULT_SESSION, "--headed", "false", "close"], {
+    const namespace = agentBrowserNamespace(session);
+    execFile(bin, [...prefix, "--namespace", namespace, "--session", namespace, "--headed", "false", "close"], {
       timeout: 15000,
       maxBuffer: 1024 * 1024,
     }, () => resolve());
@@ -124,7 +148,7 @@ function parseBatchEvalJson(raw) {
 }
 
 function parseDoneMarker(raw) {
-  const match = String(raw || "").match(/TERAFABX_GROK_DONE:([^\s"'\\]+)/);
+  const match = String(raw || "").match(/TERAFABX_GROK_DONE:([^\s"\\]+)/);
   if (!match) return null;
   try {
     return JSON.parse(decodeURIComponent(match[1]));
@@ -163,6 +187,8 @@ function buildGrokPromptEvalScript(prompt, timeoutMs) {
     const readResponseState = () => {
       const assistantMessages = [
         '[data-testid="assistant-message"]',
+        '[data-testid="primaryColumn"] [class*="r-bnwqim"][class*="r-11niif6"]',
+        '[class*="r-bnwqim"][class*="r-11niif6"]',
         '[data-testid*="assistant" i]',
         '[data-testid*="message" i]',
         '[data-message-author-role="assistant"]',
@@ -303,6 +329,8 @@ function buildGrokSubmitEvalScript(prompt) {
       const nodes = [
         '[data-message-author-role="assistant"]',
         '[data-testid="assistant-message"]',
+        '[data-testid="primaryColumn"] [class*="r-bnwqim"][class*="r-11niif6"]',
+        '[class*="r-bnwqim"][class*="r-11niif6"]',
         '[data-testid*="assistant" i]',
         'main article',
         'main [class*="response" i]',
@@ -364,30 +392,8 @@ function buildGrokSubmitEvalScript(prompt) {
       editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: prompt }));
     }
     await sleep(800);
-    const form = editor.closest('form') || editor.closest('[data-testid*="composer" i], [class*="composer" i]') || editor.parentElement;
-    const scoped = form ? [...form.querySelectorAll('button')] : [];
-    const all = [...scoped, ...document.querySelectorAll('button')].filter((button, index, arr) => arr.indexOf(button) === index);
-    const candidates = all.filter((button) => {
-      const label = clean(button.getAttribute('aria-label') || button.innerText || button.getAttribute('title') || '');
-      return visible(button)
-        && !button.disabled
-        && button.getAttribute('aria-disabled') !== 'true'
-        && !/음성|voice|받아쓰기|dictation|첨부|attach|모델|model|upgrade|업그레이드/i.test(label);
-    });
-    const submit = candidates.find((button) => /^(제출|Submit|Send)$|send message|submit prompt|send prompt|보내기|전송/i.test(clean(button.getAttribute('aria-label') || button.innerText || '')))
-      || candidates.find((button) => /arrow|paper|send|submit|전송|보내기/i.test([button.getAttribute('aria-label'), button.getAttribute('title'), button.innerText, button.innerHTML].filter(Boolean).join(' ')))
-      || scoped.filter((button) => {
-        const label = clean(button.getAttribute('aria-label') || button.innerText || button.getAttribute('title') || '');
-        return visible(button) && !button.disabled && button.getAttribute('aria-disabled') !== 'true' && !/음성|voice|받아쓰기|dictation|첨부|attach|모델|model|upgrade|업그레이드/i.test(label);
-      }).at(-1)
-      || candidates.at(-1);
-    if (!submit) return JSON.stringify({ ok: false, stage: 'missing_submit', url: location.href, editorText: clean(editor.innerText || editor.value || ''), buttons: all.map((button) => clean(button.getAttribute('aria-label') || button.innerText || '')).slice(-30) });
-    submit.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'mouse' }));
-    submit.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-    submit.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerType: 'mouse' }));
-    submit.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-    submit.click();
-    return JSON.stringify({ ok: true, stage: 'submitted', url: location.href, editorTextLength: clean(editor.innerText || editor.value || '').length, button: clean(submit.getAttribute('aria-label') || submit.innerText || submit.getAttribute('title') || '') });
+    editor.focus();
+    return JSON.stringify({ ok: true, stage: 'filled', url: location.href, editorTextLength: clean(editor.innerText || editor.value || '').length });
   })()`;
 }
 
@@ -404,6 +410,8 @@ function buildGrokReadEvalScript() {
     const nodes = [
       '[data-message-author-role="assistant"]',
       '[data-testid="assistant-message"]',
+      '[data-testid="primaryColumn"] [class*="r-bnwqim"][class*="r-11niif6"]',
+      '[class*="r-bnwqim"][class*="r-11niif6"]',
       '[data-testid*="assistant" i]',
       'main article',
       'main [class*="response" i]',
@@ -423,57 +431,83 @@ function buildGrokReadEvalScript() {
     const baseline = window.__terafabxGrokBaseline || { count: 0, text: '' };
     const isGenerating = [...document.querySelectorAll('button')].some((button) => /모델 응답 중지|Stop generating|Stop response/i.test(clean(button.getAttribute('aria-label') || button.innerText || '')));
     const looksNew = text && (nodes.length > Number(baseline.count || 0) || text !== clean(baseline.text || ''));
+    const looksComplete = text.length >= 40 && !/^(Thinking|Analyzing|생각\s*중|분석\s*중)/i.test(text);
     if (looksNew && text === window.__terafabxGrokLastText) window.__terafabxGrokStableCount = Number(window.__terafabxGrokStableCount || 0) + 1;
     else {
       window.__terafabxGrokStableCount = 0;
       window.__terafabxGrokLastText = text;
     }
-    const done = Boolean(looksNew && !isGenerating && Number(window.__terafabxGrokStableCount || 0) >= ${RESPONSE_STABLE_POLLS - 1});
+    const done = Boolean(looksNew && looksComplete && !isGenerating && Number(window.__terafabxGrokStableCount || 0) >= ${RESPONSE_STABLE_POLLS - 1});
     const payload = { ok: true, stage: 'read', done, response: done ? text : '', textPreview: text.slice(0, 500), count: nodes.length, isGenerating, stableCount: Number(window.__terafabxGrokStableCount || 0), url: location.href, title: document.title };
+    if (done) throw new Error('TERAFABX_GROK_DONE:' + encodeURIComponent(JSON.stringify({ response: text })));
     return JSON.stringify(payload);
   })()`;
 }
 
-async function runGrokPromptBatch(prompt, options, url) {
-  const timeoutMs = Number(options.timeoutMs || DEFAULT_TIMEOUT_MS);
+function buildGrokBatchCommandChunks(prompt, url, timeoutMs = DEFAULT_TIMEOUT_MS, random = Math.random) {
   const readScript = buildGrokReadEvalScript();
-  const commands = [
+  const initialCommands = [
     "batch",
     "--bail",
     `open ${url}`,
-    "wait 5000",
+    `wait ${randomHumanDelayMs(random, 4200, 6800)}`,
     `eval -b ${encodeEval(buildGrokSubmitEvalScript(prompt))}`,
+    "press Control+a",
+    `keyboard inserttext ${JSON.stringify(prompt)}`,
+    `wait ${randomHumanDelayMs(random, 600, 1400)}`,
+    "press Enter",
+    `wait ${randomHumanDelayMs(random, 900, 1800)}`,
   ];
-  const maxPolls = Math.max(1, Math.min(48, Math.ceil(timeoutMs / 5000)));
-  for (let index = 0; index < maxPolls; index += 1) {
-    commands.push("wait 5000", `eval -b ${encodeEval(readScript)}`);
+  const pollMs = 3000;
+  const maxPolls = Math.max(1, Math.min(48, Math.ceil(timeoutMs / pollMs)));
+  const chunks = [];
+  for (let offset = 0; offset < maxPolls; offset += BATCH_POLL_CHUNK_SIZE) {
+    const commands = offset === 0 ? [...initialCommands] : ["batch", "--bail"];
+    const pollCount = Math.min(BATCH_POLL_CHUNK_SIZE, maxPolls - offset);
+    for (let index = 0; index < pollCount; index += 1) {
+      commands.push(`wait ${randomHumanDelayMs(random, 2600, 4200)}`, `eval -b ${encodeEval(readScript)}`);
+    }
+    chunks.push(commands);
   }
-  let output = "";
-  try {
-    output = await runAgentBrowser(commands, options);
-  } catch (error) {
-    output = error.message || "";
+  return chunks;
+}
+
+function buildGrokBatchCommands(prompt, url, timeoutMs = DEFAULT_TIMEOUT_MS, random = Math.random) {
+  return buildGrokBatchCommandChunks(prompt, url, timeoutMs, random)[0];
+}
+
+async function runGrokPromptBatch(prompt, options, url) {
+  const timeoutMs = Number(options.timeoutMs || DEFAULT_TIMEOUT_MS);
+  const chunks = buildGrokBatchCommandChunks(prompt, url, timeoutMs);
+  let last = null;
+  for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {
+    let output = "";
+    try {
+      output = await runAgentBrowser(chunks[chunkIndex], {
+        ...options,
+        state: chunkIndex === 0 ? options.state : "",
+        timeoutMs: Math.min(timeoutMs + 60000, 90000),
+      });
+    } catch (error) {
+      output = error.message || "";
+      const markedDone = parseDoneMarker(output);
+      if (markedDone?.response) return markedDone.response;
+      throw error;
+    }
     const markedDone = parseDoneMarker(output);
     if (markedDone?.response) return markedDone.response;
-    throw error;
-  }
-  const markedDone = parseDoneMarker(output);
-  if (markedDone?.response) return markedDone.response;
-  const parsedResults = String(output || "")
-    .split(/\n/)
-    .map((line) => parseBatchEvalJson(line))
-    .filter(Boolean);
-  const failed = parsedResults.find((item) => item.ok === false);
-  if (failed) throw new Error(`Grok Web batch 실패(${failed.stage || "unknown"}): ${JSON.stringify(failed).slice(0, 1200)}`);
-  const done = parsedResults.filter((item) => item.done && item.response).at(-1);
-  if (done) return done.response;
-  const stable = parsedResults
-    .filter((item) => item.ok === true && item.textPreview && !item.isGenerating && Number(item.stableCount || 0) >= RESPONSE_STABLE_POLLS - 1)
-    .at(-1);
-  if (stable?.textPreview) return stable.textPreview;
-  const last = parsedResults.at(-1);
-  if (!last) {
-    throw new Error(`Grok Web batch 응답을 해석하지 못했습니다: ${String(output || "").slice(-1000)}`);
+    const parsedResults = String(output || "")
+      .split(/\n/)
+      .map((line) => parseBatchEvalJson(line))
+      .filter(Boolean);
+    const failed = parsedResults.find((item) => item.ok === false);
+    if (failed) throw new Error(`Grok Web batch 실패(${failed.stage || "unknown"}): ${JSON.stringify(failed).slice(0, 1200)}`);
+    const done = parsedResults.filter((item) => item.done && item.response).at(-1);
+    if (done) return done.response;
+    last = parsedResults.at(-1) || last;
+    if (!last && chunkIndex === chunks.length - 1) {
+      throw new Error(`Grok Web batch 응답을 해석하지 못했습니다: ${String(output || "").slice(-1000)}`);
+    }
   }
   throw new Error(`Grok Web 응답 대기 시간 초과: ${JSON.stringify(last).slice(0, 1200)}`);
 }
@@ -624,6 +658,8 @@ async function readGrokResponseState(options) {
     };
     const assistantMessages = [
       '[data-testid="assistant-message"]',
+      '[data-testid="primaryColumn"] [class*="r-bnwqim"][class*="r-11niif6"]',
+      '[class*="r-bnwqim"][class*="r-11niif6"]',
       '[data-testid*="assistant" i]',
       '[data-message-author-role="assistant"]',
       '[class*="assistant" i]',
@@ -701,13 +737,11 @@ async function main() {
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
   await closeAgentBrowserSession(session).catch(() => {});
   try {
-    await ensureGrokPageSelected(options, url);
-    await ensureGrokComposerReady(options);
-    const baseline = await readGrokResponseState(options).catch(() => ({}));
-    await focusAndClearGrokComposer(options);
-    await runAgentBrowser(["inserttext", prompt], { ...options, timeoutMs: 30000 });
-    await clickGrokSubmit(options);
-    const response = await waitForGrokResponse(options, baseline);
+    // Keep state restore, navigation, submit, and response polling in one CLI
+    // process. Reusing --state across separate commands restores its saved
+    // active URL (often X/Threads), while reconnecting without it can lose the
+    // restored browser context and land on about:blank.
+    const response = await runGrokPromptBatch(prompt, options, url);
     fs.writeFileSync(outPath, response);
     process.stdout.write(JSON.stringify({
       ok: true,
@@ -721,7 +755,11 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error.stack || error.message}\n`);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((error) => {
+    process.stderr.write(`${error.stack || error.message}\n`);
+    process.exit(1);
+  });
+}
+
+module.exports = { agentBrowserInvocation, buildGrokBatchCommandChunks, buildGrokBatchCommands, parseDoneMarker, randomHumanDelayMs, runGrokPromptBatch };

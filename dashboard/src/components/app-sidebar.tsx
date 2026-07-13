@@ -3,7 +3,7 @@ import {
   CheckCircle2Icon,
   CircleHelpIcon,
   CommandIcon,
-  MessageCircleIcon,
+  LinkIcon,
   SearchIcon,
   Settings2Icon,
   FileTextIcon,
@@ -14,14 +14,10 @@ import {
 import { NavMain } from "@/components/nav-main"
 import { NavSecondary } from "@/components/nav-secondary"
 import { NavUser } from "@/components/nav-user"
-import { Badge } from "@/components/ui/badge"
 import {
   Sidebar,
   SidebarContent,
   SidebarFooter,
-  SidebarGroup,
-  SidebarGroupContent,
-  SidebarGroupLabel,
   SidebarHeader,
   SidebarMenu,
   SidebarMenuButton,
@@ -32,69 +28,17 @@ const viewItems = [
   { id: "discovered", title: "발굴됨", icon: <SparklesIcon /> },
   { id: "scheduled", title: "게시예정", icon: <CalendarClockIcon /> },
   { id: "posted", title: "게시됨", icon: <CheckCircle2Icon /> },
+  { id: "coupang-performance", title: "쿠팡 실적", icon: <LinkIcon /> },
+  { id: "automation", title: "자동화", icon: <Settings2Icon /> },
   { id: "inssider-pending", title: "인싸이더 판결중", icon: <ScaleIcon /> },
   { id: "naver-blog", title: "네이버 블로그", icon: <FileTextIcon /> },
 ]
-
-type AutomationData = {
-  summary?: {
-    commentCount?: number
-    heartCount?: number
-    commentQualityScore?: number
-    commentReviewCount?: number
-    pendingCommentReviewCount?: number
-  }
-}
-
-function compact(value: unknown) {
-  return Number(value || 0).toLocaleString("ko-KR")
-}
-
-function AutomationSidebarGroup({
-  automation,
-  isActive,
-  onOpen,
-}: {
-  automation?: AutomationData
-  isActive: boolean
-  onOpen: () => void
-}) {
-  return (
-    <SidebarGroup className="group-data-[collapsible=icon]:hidden">
-      <SidebarGroupLabel>자동화</SidebarGroupLabel>
-      <SidebarGroupContent className="grid gap-2 px-2">
-        <div className="flex flex-wrap gap-1">
-          <Badge variant="secondary">{compact(automation?.summary?.commentCount)} 댓글</Badge>
-          <Badge variant="outline">검수 {compact(automation?.summary?.pendingCommentReviewCount)} / 288</Badge>
-          <Badge variant="outline">품질 {compact(automation?.summary?.commentQualityScore)}점</Badge>
-          <Badge variant="outline">{compact(automation?.summary?.heartCount)} 하트</Badge>
-        </div>
-        <SidebarMenu>
-          <SidebarMenuItem>
-            <SidebarMenuButton
-              tooltip="자동화 타임라인"
-              isActive={isActive}
-              onClick={onOpen}
-            >
-              <MessageCircleIcon />
-              <span>타임라인</span>
-              <Badge variant="secondary" className="ml-auto">
-                {compact(automation?.summary?.pendingCommentReviewCount || automation?.summary?.commentReviewCount || automation?.summary?.commentCount)}
-              </Badge>
-            </SidebarMenuButton>
-          </SidebarMenuItem>
-        </SidebarMenu>
-      </SidebarGroupContent>
-    </SidebarGroup>
-  )
-}
 
 export function AppSidebar({
   view,
   onViewChange,
   summary,
   terafabx,
-  automation,
   ...props
 }: React.ComponentProps<typeof Sidebar> & {
   view: string
@@ -104,7 +48,6 @@ export function AppSidebar({
     comment?: { enabled?: boolean }
     heart?: { enabled?: boolean }
   }
-  automation?: AutomationData
 }) {
   const navMain = viewItems.map((item) => ({
     ...item,
@@ -117,9 +60,13 @@ export function AppSidebar({
           ? summary.scheduledCount
           : item.id === "posted"
             ? summary.postedCount
-            : item.id === "inssider-pending"
-              ? summary.totalCount
-            : "운영",
+            : item.id === "coupang-performance"
+              ? "실적"
+              : item.id === "automation"
+                ? "운영"
+                : item.id === "inssider-pending"
+                  ? summary.totalCount
+                  : "운영",
     onClick: () => onViewChange(item.id),
   }))
 
@@ -160,11 +107,6 @@ export function AppSidebar({
       </SidebarHeader>
       <SidebarContent>
         <NavMain items={navMain} />
-        <AutomationSidebarGroup
-          automation={automation}
-          isActive={view === "automation"}
-          onOpen={() => onViewChange("automation")}
-        />
         <NavSecondary items={navSecondary} className="mt-auto" />
       </SidebarContent>
       <SidebarFooter>

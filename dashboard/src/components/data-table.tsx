@@ -12,6 +12,7 @@ import {
 } from "@tanstack/react-table"
 import {
   CalendarClockIcon,
+  CalendarX2Icon,
   CheckCircle2Icon,
   ChevronDownIcon,
   ChevronLeftIcon,
@@ -106,9 +107,9 @@ type DataTableProps = {
   onSaveTitle: (row: DashboardRow, text?: string) => void
   onPost: (row: DashboardRow, text?: string) => void
   onDraft: (row: DashboardRow, text?: string) => void
-  onCoupangAffiliateComment: (row: DashboardRow) => void
   onSchedule: (row: DashboardRow, text?: string, scheduledAt?: string) => void
   onAutoSchedule: (row: DashboardRow, text?: string) => void
+  onCancelSchedule: (row: DashboardRow) => void
   onRefetch: (row: DashboardRow) => void
   onDiscard: (row: DashboardRow) => void
   formatDate: (value?: string | null) => string
@@ -221,9 +222,9 @@ function ThreadSheet({
   onSaveTitle,
   onPost,
   onDraft,
-  onCoupangAffiliateComment,
   onSchedule,
   onAutoSchedule,
+  onCancelSchedule,
   onRefetch,
   onDiscard,
   formatDate,
@@ -234,6 +235,7 @@ function ThreadSheet({
   onOpenRowChange: (url: string | null) => void
 }) {
   const disabled = Boolean(busy) || !row.canPost
+  const isScheduled = row.status === "scheduled" && Boolean(row.scheduledPostAt)
   const [draftText, setDraftText] = React.useState(titleEdits[row.canonicalUrl] ?? row.textPreview ?? "")
   const [draftSchedule, setDraftSchedule] = React.useState(scheduleEdits[row.canonicalUrl] || "")
 
@@ -326,13 +328,17 @@ function ThreadSheet({
                 <RefreshCcwIcon data-icon="inline-start" />
                 재수집
               </Button>
-              <Button variant="outline" onClick={() => onDiscard(row)} disabled={Boolean(busy)}>
-                <Trash2Icon data-icon="inline-start" />
-                삭제
-              </Button>
-              <Button variant="outline" onClick={() => onCoupangAffiliateComment(row)} disabled={Boolean(busy) || row.status !== "posted"}>
-                쿠팡 댓글
-              </Button>
+              {isScheduled ? (
+                <Button variant="destructive" onClick={() => onCancelSchedule(row)} disabled={Boolean(busy)}>
+                  <CalendarX2Icon data-icon="inline-start" />
+                  예약 취소
+                </Button>
+              ) : (
+                <Button variant="outline" onClick={() => onDiscard(row)} disabled={Boolean(busy)}>
+                  <Trash2Icon data-icon="inline-start" />
+                  삭제
+                </Button>
+              )}
               {row.mediaPreviewUrl ? (
                 <Button variant="outline" asChild>
                   <a href={mediaDownloadUrl(row.mediaPreviewUrl)}>
@@ -506,9 +512,19 @@ export function DataTable(props: DataTableProps) {
                     <DropdownMenuItem onClick={() => props.onRefetch(row.original)} disabled={Boolean(busy)}>
                       재수집
                     </DropdownMenuItem>
-                    <DropdownMenuItem onClick={() => props.onDiscard(row.original)} disabled={Boolean(busy)}>
-                      삭제
-                    </DropdownMenuItem>
+                    {row.original.status === "scheduled" && row.original.scheduledPostAt ? (
+                      <DropdownMenuItem
+                        className="text-destructive focus:text-destructive"
+                        onClick={() => props.onCancelSchedule(row.original)}
+                        disabled={Boolean(busy)}
+                      >
+                        예약 취소
+                      </DropdownMenuItem>
+                    ) : (
+                      <DropdownMenuItem onClick={() => props.onDiscard(row.original)} disabled={Boolean(busy)}>
+                        삭제
+                      </DropdownMenuItem>
+                    )}
                   </DropdownMenuGroup>
                   <DropdownMenuSeparator />
                   <DropdownMenuGroup>
@@ -520,9 +536,6 @@ export function DataTable(props: DataTableProps) {
                     </DropdownMenuItem>
                     <DropdownMenuItem onClick={() => props.onAutoSchedule(row.original)} disabled={!row.original.canPost || Boolean(busy)}>
                       자동 예약
-                    </DropdownMenuItem>
-                    <DropdownMenuItem onClick={() => props.onCoupangAffiliateComment(row.original)} disabled={row.original.status !== "posted" || Boolean(busy)}>
-                      쿠팡 댓글
                     </DropdownMenuItem>
                   </DropdownMenuGroup>
                 </DropdownMenuContent>

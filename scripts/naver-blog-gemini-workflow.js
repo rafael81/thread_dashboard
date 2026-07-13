@@ -243,6 +243,16 @@ function fallbackSafeCandidates() {
     "습한 날 침구 관리 방법, 이불 눅눅함 줄이는 환기 순서",
     "여름 물병 세척 방법, 텀블러 냄새 없이 쓰는 관리 팁",
     "장마철 창문 결로 줄이는 방법, 환기와 물기 관리 체크 포인트",
+    "여름철 수건 쉰내 제거 방법, 세탁 후 냄새 없이 말리는 순서",
+    "장마철 빨래 실내 건조 방법, 꿉꿉한 냄새 줄이는 환기 팁",
+    "욕실 실리콘 곰팡이 제거 방법, 다시 생기지 않게 말리는 순서",
+    "여름철 배수구 냄새 제거 방법, 주방과 욕실 관리 체크 포인트",
+    "장마철 옷장 습기 제거 방법, 옷 냄새와 곰팡이 줄이는 순서",
+    "여름철 음식 보관 용기 세척 방법, 기름 냄새 없애는 관리 팁",
+    "에어컨 실외기 주변 정리 방법, 냉방 효율 지키는 안전 체크",
+    "여름철 베개 세탁 방법, 땀 냄새와 누런 자국 줄이는 순서",
+    "장마철 현관 습기 관리 방법, 신발장 곰팡이 줄이는 환기 팁",
+    "여름철 주방 행주 삶는 방법, 냄새와 세균 줄이는 관리 순서",
   ].map((title) => ({
     topic: title.replace(/,.+$/, ""),
     recommended_title: title,
@@ -314,51 +324,74 @@ function isHeadingLine(line) {
     || /^(.+?)(정리|방법|순서|차이|포인트|주의사항|활용하기|유지하기|선택법|체크)$/.test(text);
 }
 
+function validatePackBeforeSave(pack) {
+  const blocks = Array.isArray(pack?.blocks) ? pack.blocks : [];
+  const imageIndexes = blocks.map((block, index) => block?.type === "image" ? index : -1).filter((index) => index >= 0);
+  if (imageIndexes.length !== 4) throw new Error(`저장 전 QA 실패: 이미지 블록은 정확히 4개여야 합니다. count=${imageIndexes.length}`);
+  if (imageIndexes[0] !== 0) throw new Error(`저장 전 QA 실패: 대표 이미지는 첫 블록이어야 합니다. index=${imageIndexes[0]}`);
+  for (let i = 1; i < imageIndexes.length; i += 1) {
+    if (imageIndexes[i] - imageIndexes[i - 1] < 2) {
+      throw new Error(`저장 전 QA 실패: 이미지가 연속 배치되었습니다. indexes=${imageIndexes.join(",")}`);
+    }
+  }
+  const text = blocks.map((block) => String(block?.text || "")).join("\n");
+  if (/검색수요/.test(text)) throw new Error("저장 전 QA 실패: 내부용 검색수요 문자열이 포함됐습니다.");
+  const standaloneEmoji = text.split("\n").filter(isStandaloneEmojiLine);
+  if (standaloneEmoji.length) throw new Error(`저장 전 QA 실패: 단독 이모티콘이 포함됐습니다. ${standaloneEmoji.join(" ")}`);
+  if (blocks.at(-1)?.type !== "tags") throw new Error("저장 전 QA 실패: 태그 블록은 마지막이어야 합니다.");
+  for (const block of blocks.filter((item) => item?.type === "image")) {
+    if (!block.path || !fs.existsSync(block.path) || fs.statSync(block.path).size < 10000) {
+      throw new Error(`저장 전 QA 실패: 이미지 파일이 없거나 너무 작습니다. path=${block.path || ""}`);
+    }
+  }
+  return { imageIndexes, imageCount: imageIndexes.length };
+}
+
 function buildRichPack({ title, draftText, imagePaths, source }) {
+  if (!Array.isArray(imagePaths) || imagePaths.length !== 4) {
+    throw new Error(`pack 생성 실패: 이미지 경로는 정확히 4개여야 합니다. count=${imagePaths?.length || 0}`);
+  }
   const lines = String(draftText || "")
     .split("\n")
     .map((line) => line.trim())
     .filter((line) => line && !isStandaloneEmojiLine(line));
-  const blocks = [];
-  if (imagePaths[0]) blocks.push({ type: "image", path: imagePaths[0] });
-  blocks.push({ type: "quote", text: `${title} 핵심만 모바일에서 보기 좋게 정리했어요.` });
+  const content = [{ type: "quote", text: `${title} 핵심만 모바일에서 보기 좋게 정리했어요.` }];
   let buffer = [];
-  let headingCount = 0;
-  let nextBodyImageIndex = 1;
-  const insertNextBodyImage = () => {
-    if (imagePaths[nextBodyImageIndex]) {
-      blocks.push({ type: "image", path: imagePaths[nextBodyImageIndex] });
-      nextBodyImageIndex += 1;
-      return true;
-    }
-    return false;
-  };
   const flush = () => {
     if (buffer.length) {
-      blocks.push({ type: "center_text", text: buffer.join("\n\n") });
+      content.push({ type: "center_text", text: buffer.join("\n\n") });
       buffer = [];
     }
   };
   for (const line of lines) {
     if (isHeadingLine(line)) {
       flush();
-      blocks.push({ type: "center_heading", text: line.replace(/^#+\s*/, "") });
-      headingCount += 1;
-      if (headingCount >= 2 && headingCount % 2 === 0) {
-        insertNextBodyImage();
-      }
+      content.push({ type: "center_heading", text: line.replace(/^#+\s*/, "") });
     } else {
       buffer.push(line);
     }
   }
   flush();
-  while (imagePaths[nextBodyImageIndex]) {
-    const insertAt = Math.max(1, Math.min(blocks.length, 4 + nextBodyImageIndex * 2));
-    blocks.splice(insertAt, 0, { type: "image", path: imagePaths[nextBodyImageIndex] });
-    nextBodyImageIndex += 1;
+  if (content.length < 4) throw new Error(`pack 생성 실패: 이미지 분산 배치에 필요한 본문 블록이 부족합니다. blocks=${content.length}`);
+
+  // Insert body images around the 25/50/75% content points, in reverse order
+  // so earlier insertions do not shift later target indexes.
+  const placements = imagePaths.slice(1).map((imagePath, index) => ({
+    imagePath,
+    index: Math.max(1, Math.min(content.length - 1, Math.round(content.length * (index + 1) / 4))),
+  }));
+  for (const placement of [...placements].reverse()) {
+    content.splice(placement.index, 0, { type: "image", path: placement.imagePath });
   }
-  blocks.push({ type: "tags", text: "#생활정보 #살림팁 #생활꿀팁" });
-  return { title, source, writer: "gemini-web-only", blocks };
+
+  const pack = {
+    title,
+    source,
+    writer: "gemini-web-only",
+    blocks: [{ type: "image", path: imagePaths[0] }, ...content, { type: "tags", text: "#생활정보 #살림팁 #생활꿀팁" }],
+  };
+  validatePackBeforeSave(pack);
+  return pack;
 }
 
 async function generateAiImages({ title, runDir }) {
@@ -371,8 +404,17 @@ async function generateAiImages({ title, runDir }) {
     path.join(imageDir, `${slug}-body-2.png`),
     path.join(imageDir, `${slug}-body-3.png`),
   ];
-  const prompt = `Use GPT Image 2 / gpt-image-2 to generate four real PNG image files for a Korean Naver Blog post. Do not create HTML, SVG, screenshots, placeholders, or mock files.\n\nPost title: ${title}\n\nImage 1: representative cover image for Naver Blog, premium Korean lifestyle/blog style, clean composition, mobile-readable exact Korean title text: "${title}".\nImage 2: body image, no text, realistic high-quality Korean blog/lifestyle visual that supports the first practical section.\nImage 3: body image, no text, realistic high-quality Korean blog/lifestyle visual that supports the middle checklist section.\nImage 4: body image, no text, realistic high-quality Korean blog/lifestyle visual that supports the final summary/tips section.\n\nSave exactly these absolute PNG paths, creating parent directories if needed:\n${imagePaths.join("\n")}\n\nAfter saving, verify with file(1) or equivalent that all four are PNG images, then print only the absolute paths and a short verification.`;
-  const result = await run("codex", ["exec", prompt], { cwd: process.cwd(), timeoutMs: 900000 });
+  const approvedCoverReferences = [
+    "/Users/user/Documents/adpost/runs/update-3draft-images-20260709-100030/airfryer/images/airfryer-cleaning-cover.png",
+    "/Users/user/Documents/adpost/runs/update-3draft-images-20260709-100030/summer-bottle/images/summer-bottle-cleaning-cover.png",
+    "/Users/user/Documents/adpost/runs/update-3draft-images-20260709-100030/humid-bedding/images/humid-bedding-cover.png",
+  ].filter((filePath) => fs.existsSync(filePath));
+  const prompt = `Use GPT Image 2 / gpt-image-2 built-in image_gen to generate four real PNG image files for a Korean Naver Blog post. Do not use the REST/CLI fallback. Do not require OPENAI_API_KEY. Do not create HTML, SVG, screenshots, placeholders, mock files, or local font overlays.\n\nPost title: ${title}\n\nFirst inspect these existing approved representative covers and match their integrated image-and-typography style closely:\n${approvedCoverReferences.join("\n")}\n\nImage 1: a finished representative cover image for Naver Blog. GPT Image 2 must create the background, composition, and Korean typography together as one complete image, matching the approved references. Include the exact mobile-readable Korean title text verbatim: \"${title}\". Premium Korean lifestyle/blog style, bright realistic topic photo, large bold dark-navy Korean main phrase with a smaller supporting phrase where appropriate, natural upper-text/lower-photo composition. No outline, no drop shadow, no rounded card, no pink bar, no watermark, no extra words, and no misspelled Korean. Do not add text later with Pillow or any local renderer.\nImage 2: body image, no text, realistic high-quality Korean blog/lifestyle visual that supports the first practical section.\nImage 3: body image, no text, realistic high-quality Korean blog/lifestyle visual that supports the middle checklist section.\nImage 4: body image, no text, realistic high-quality Korean blog/lifestyle visual that supports the final summary/tips section.\n\nSave exactly these absolute PNG paths, creating parent directories if needed:\n${imagePaths.join("\n")}\n\nAfter saving, verify with file(1) or equivalent that all four are PNG images, visually inspect the cover for exact Korean title and approved-reference style, then print only the absolute paths and a short verification.`;
+  // Keep image-generation routing independent from Hermes' default reasoning model.
+  // The existing Codex OAuth image workflow works through gpt-5.5; inheriting
+  // gpt-5.6-sol routes into a local REST helper that incorrectly requires OPENAI_API_KEY.
+  const imageCodexModel = process.env.NAVER_BLOG_IMAGE_CODEX_MODEL || "gpt-5.5";
+  const result = await run("codex", ["exec", "--model", imageCodexModel, "--config", 'model_reasoning_effort="low"', prompt], { cwd: process.cwd(), timeoutMs: 900000 });
   fs.writeFileSync(path.join(runDir, "imagegen.stdout.txt"), result.stdout);
   fs.writeFileSync(path.join(runDir, "imagegen.stderr.txt"), result.stderr);
   if (result.code !== 0) throw new Error(result.stderr || result.stdout || "GPT Image 2 이미지 생성 실패");
@@ -381,6 +423,7 @@ async function generateAiImages({ title, runDir }) {
       throw new Error(`이미지 생성 파일 검증 실패: ${filePath}`);
     }
   }
+
   return imagePaths;
 }
 
@@ -521,10 +564,15 @@ async function main() {
   const explicitSaveFailure = parsedSave?.ok === false || parsedSave?.saved === false || parsedSave?.published === true;
   const hasSaveEvidence = parsedSave?.saved === true && after.titleText === title;
   const requiredImageCount = 4;
-  const imageOk = Number(after.imageCount || 0) >= requiredImageCount && Number(after.serverImageCount || 0) >= requiredImageCount && Number(after.dataImageCount || 0) === 0;
+  const imageOk = Number(after.imageCount || 0) === requiredImageCount
+    && Number(after.serverImageCount || 0) === requiredImageCount
+    && Number(after.dataImageCount || 0) === 0
+    && Number(after.imageLoadedCount || 0) === requiredImageCount
+    && Number(after.brokenImageCount || 0) === 0;
   const placeholderOk = Number(after.placeholderTextCount || 0) === 0 && after.hasPlaceholderText !== true;
-  if (explicitSaveFailure || !hasSaveEvidence || !imageOk || !placeholderOk) {
-    throw new Error(`SmartEditor 임시저장 품질 검증 실패: ${JSON.stringify({ explicitSaveFailure, hasSaveEvidence, imageOk, placeholderOk, parsedSave }).slice(0, 2000)}`);
+  const contentSafetyOk = Number(after.standaloneEmojiCount || 0) === 0 && after.hasInternalSearchDemandText !== true;
+  if (explicitSaveFailure || !hasSaveEvidence || !imageOk || !placeholderOk || !contentSafetyOk) {
+    throw new Error(`SmartEditor 임시저장 품질 검증 실패: ${JSON.stringify({ explicitSaveFailure, hasSaveEvidence, imageOk, placeholderOk, contentSafetyOk, parsedSave }).slice(0, 3000)}`);
   }
   const result = {
     ok: true,
@@ -541,6 +589,10 @@ async function main() {
       imageCount: Number(after.imageCount || 0),
       serverImageCount: Number(after.serverImageCount || 0),
       dataImageCount: Number(after.dataImageCount || 0),
+      imageLoadedCount: Number(after.imageLoadedCount || 0),
+      brokenImageCount: Number(after.brokenImageCount || 0),
+      standaloneEmojiCount: Number(after.standaloneEmojiCount || 0),
+      hasInternalSearchDemandText: after.hasInternalSearchDemandText === true,
       placeholderTextCount: Number(after.placeholderTextCount || 0),
     },
     candidate: picked ? { topic: picked.topic || picked.title || null, decision: picked.decision || null, score: candidateScore(picked) } : null,
@@ -553,7 +605,17 @@ async function main() {
   console.log(JSON.stringify(result));
 }
 
-main().catch((error) => {
-  console.error(error.stack || error.message || String(error));
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(error.stack || error.message || String(error));
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  buildRichPack,
+  validatePackBeforeSave,
+  sanitizeGeminiDraft,
+  isStandaloneEmojiLine,
+  isHeadingLine,
+};
