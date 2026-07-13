@@ -7963,7 +7963,7 @@ function terafabxGrokQuotaMonitorFinding(state = {}, evaluation = {}, options = 
   return {
     type: "grok_quota_limited",
     severity: "error",
-    error: state.lastCommentPrefillError || "Grok 사용 한도로 Prefill 생성이 일시 중지되었습니다.",
+    error: "Grok 사용 한도로 Prefill 생성이 일시 중지되었습니다.",
     retryAt: state.lastCommentPrefillQuotaRetryAt || null,
     selected: Number(state.lastCommentPrefillSelected || 0),
     failed: Number(state.lastCommentPrefillFailed || 0),
