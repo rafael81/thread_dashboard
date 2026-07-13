@@ -125,7 +125,7 @@ const lines = [
   `- 범용성·근거 게이트 격리: ${genericityRejected.length}개`,
   `- 수동 개별 감사 격리: ${manualAuditRejected.length}개`,
   `- 근거 없는 구체 주장 격리: ${unsupportedClaimRejected.length}개`,
-  `- 최근 개별 감사: ${Number(audit.checkedCount || 0)}개 검사 / ${Number(audit.failedCount || 0)}개 탈락`,
+  `- 최근 자동 감사: ${Number(audit.checkedCount || 0)}개 검사 / ${auditPostedLegacyUnverifiableCount}개 레거시 미검증 / ${auditPostedQualityFailedCount + auditPendingFailedCount}개 확정 품질 탈락`,
   `- 현재 대기 Prefill 감사: ${auditPendingCount}개 검사 / ${auditPendingFailedCount}개 탈락`,
   `- 현재 대기 Prefill 독립심사 점수: 최저 ${auditPendingMinScore ?? "없음"}점 / 평균 ${auditPendingAverageScore ?? "없음"}점`,
   `- 이미 게시된 Prefill 자동 감사: ${auditPostedCount}개 검사 / ${auditPostedLegacyUnverifiableCount}개 레거시 스키마 미검증 / ${auditPostedQualityFailedCount}개 확정 품질 탈락`,
