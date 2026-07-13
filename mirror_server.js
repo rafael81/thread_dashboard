@@ -2173,6 +2173,7 @@ function terafabxGeminiBatchFinalJudgePrompt(items = []) {
     "'마음에 와닿네요', '도움이 되면 좋겠네요', '미리 저장해 둡니다'처럼 대상만 바꿔 반복 가능한 참여 유도형 종결은 cliche 또는 cross_post_reusable 여부를 엄격히 판정해라.",
     "댓글 작성자가 실제로 먹어 봤다·가 봤다·겪었다는 근거가 없는데 '나도', '~해봤는데', '~더라'처럼 직접 경험을 꾸며내면 unsupported_claim=true로 판정해라. 제공된 영상·사진을 보고 한 관찰은 직접 경험 주장과 구분한다.",
     "원문이 한 번의 사건이나 특정 연도만 말하는데 댓글이 '매년', '항상', '원래', '늘'처럼 반복되는 사실로 확대하면 unsupported_claim=true로 판정해라.",
+    "원문에 범죄·불법·위법·사기라는 법적 분류가 없는데 댓글이 행동을 새로 '범죄', '불법', '사기'로 단정하거나 '범죄나 다름없다'고 결론 내리면 unsupported_claim=true로 판정해라.",
     "Grok 분석의 대응 조언을 사실 근거로 취급하지 마라. source_anchor에는 반드시 원문 또는 부모 원글에 실제로 적힌 고유 명사·숫자·행동 구절을 원문 그대로 적어라.",
     "댓글이 같은 분야의 다른 글에도 그대로 붙을 수 있으면 cross_post_reusable=true다. 예: '폭로성 스캔들은 사실 확인이 먼저 필요합니다'처럼 일반 원칙만 말하는 문장.",
     "'배려가 필요합니다', '확인이 필요합니다', '안전합니다', '해야 합니다'처럼 대화형 반응 없이 당위적 결론만 말하거나 기사 제목·안전 표어·교훈 문장처럼 들리면 headline_tone=true다.",
@@ -2378,6 +2379,7 @@ function terafabxCommentQualityPromptLines() {
     "'마음에 와닿네요', '도움이 되면 좋겠네요', '미리 저장해 둡니다'처럼 대상만 바꿔 반복 가능한 참여 유도형 종결은 그대로 두지 말고, 원문의 구체 장면에 반응하는 실제 구어체인지 엄격히 판단해라.",
     "댓글 작성자가 실제로 먹어 봤다·가 봤다·겪었다는 근거가 없으면 '나도', '~해봤는데', '~더라'처럼 직접 경험을 꾸며내지 마라. 제공된 영상·사진을 보고 한 관찰은 가능하다.",
     "원문이 한 번의 사건이나 특정 연도만 말하면 '매년', '항상', '원래', '늘'처럼 반복되는 사실로 확대하지 마라. 원문의 가장 구별되는 인물·행동·숫자를 우선 짚어라.",
+    "원문에 법적 분류가 없으면 행동을 범죄·불법·위법·사기로 새로 단정하지 마라.",
     "대화형 반응 대신 '배려가 필요합니다', '확인이 필요합니다', '안전합니다', '해야 합니다'처럼 기사 결론·안전 표어·교훈으로 끝내지 마라.",
     "'고민이 깊으시겠습니다', '마음이 무거우시겠습니다'처럼 상담 기록 같은 격식체 추측 공감은 쓰지 말고 실제 X 대화처럼 짧고 담백하게 말해라.",
     ...dynamicRules.map((rule) => `최근 10분 품질 피드백: ${rule}`),
@@ -2400,6 +2402,7 @@ function terafabxFinalJudgePrompt(target, grokInput, finalReply) {
     "'마음에 와닿네요', '도움이 되면 좋겠네요', '미리 저장해 둡니다'처럼 대상만 바꿔 반복 가능한 참여 유도형 종결은 cliche 또는 cross_post_reusable 여부를 엄격히 판정해라.",
     "댓글 작성자가 실제로 먹어 봤다·가 봤다·겪었다는 근거가 없는데 '나도', '~해봤는데', '~더라'처럼 직접 경험을 꾸며내면 unsupported_claim=true로 판정해라. 제공된 영상·사진을 보고 한 관찰은 직접 경험 주장과 구분한다.",
     "원문이 한 번의 사건이나 특정 연도만 말하는데 댓글이 '매년', '항상', '원래', '늘'처럼 반복되는 사실로 확대하면 unsupported_claim=true로 판정해라.",
+    "원문에 범죄·불법·위법·사기라는 법적 분류가 없는데 댓글이 행동을 새로 '범죄', '불법', '사기'로 단정하거나 '범죄나 다름없다'고 결론 내리면 unsupported_claim=true로 판정해라.",
     "Grok 분석의 대응 조언을 사실 근거로 취급하지 마라. source_anchor에는 반드시 원문 또는 부모 원글에 실제로 적힌 고유 명사·숫자·행동 구절을 원문 그대로 적어라.",
     "댓글이 같은 분야의 다른 글에도 그대로 붙을 수 있으면 cross_post_reusable=true다. '배려가 필요합니다', '확인이 필요합니다', '안전합니다', '해야 합니다'처럼 대화형 반응 없이 당위적 결론만 말하거나 기사 제목·표어·교훈 문장처럼 들리면 headline_tone=true다.",
     "댓글이 source_anchor의 구체적인 대상을 실제로 언급하거나 명확히 가리키지 않으면 specificity_error=true다.",
@@ -7047,6 +7050,10 @@ function assessTerafabxCurrentCommentPolicy(record) {
   const commentCurrencyClaims = commentText.match(currencyAmountPattern) || [];
   const sourceCurrencyClaims = sourceText.match(currencyAmountPattern) || [];
   if (sourceText && commentCurrencyClaims.length && !sourceCurrencyClaims.length) errors.push("unsupported_currency_unit_expansion");
+  const legalClassificationPattern = /(?:범죄(?:나\s*다름없|행위|자)?|불법|위법|범법|사기)/gu;
+  const commentLegalClaims = commentText.match(legalClassificationPattern) || [];
+  const sourceLegalClaims = sourceText.match(legalClassificationPattern) || [];
+  if (sourceText && commentLegalClaims.length && !sourceLegalClaims.length) errors.push("unsupported_legal_classification");
   if (finalJudge?.passed !== true) errors.push("independent_judge_not_passed");
   return {
     ok: errors.length === 0,

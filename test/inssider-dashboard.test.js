@@ -417,6 +417,31 @@ test('TerafabX current policy rejects a currency unit invented from a bare numbe
   assert.ok(result.errors.includes('unsupported_currency_unit_expansion'));
 });
 
+test('TerafabX current policy rejects a legal classification absent from the source', () => {
+  const result = assessTerafabxCurrentCommentPolicy({
+    source: 'prefill',
+    queuedAt: '2026-07-13T16:38:51.152Z',
+    targetText: 'Man filming women with Meta glasses while flirting gets confronted',
+    comment: '동의 없이 안경으로 몰래 찍는 건 범죄나 다름없죠',
+    grokContext: { summary: '스마트 안경 촬영 장면' },
+    geminiReview: {
+      finalJudge: {
+        score: 100,
+        dimensions: { context: 40 },
+        passed: true,
+        fatalError: false,
+        qualityFlagsComplete: true,
+        genericityFlagsComplete: true,
+        sourceAnchorGrounded: true,
+        flaggedQualityIssues: [],
+      },
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.includes('unsupported_legal_classification'));
+});
+
 test('TerafabX daily comment cadence targets 600 and accelerates when behind pace', () => {
   const now = new Date('2026-07-11T00:18:00.000Z'); // 09:18 KST
   const commentHistory = Array.from({ length: 45 }, (_, index) => ({
