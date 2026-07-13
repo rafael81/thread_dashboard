@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 
 const {
   cleanThreadText,
+  assessTerafabxLanguageQuality,
   assessXScheduledEntry,
   assessTerafabxCurrentCommentPolicy,
   dashboardDiscoveryRow,
@@ -206,6 +207,14 @@ test('TerafabX final judge lets structured Gemini cliche flags override a perfec
   assert.equal(repeatedResult.rawScore, 100);
   assert.equal(repeatedResult.score, 100);
   assert.equal(repeatedResult.passed, false);
+});
+
+test('TerafabX language gate rejects redundant expression and face nouns', () => {
+  assert.deepEqual(
+    assessTerafabxLanguageQuality('사슴 표정이 정말 황당하다는 얼굴이네요').errors,
+    ['redundant_expression_face_nouns'],
+  );
+  assert.equal(assessTerafabxLanguageQuality('사슴 표정이 진짜 당황한 것 같아요').ok, true);
 });
 
 test('TerafabX Gemini rewrite prompt does not ask the rewriting model to score itself', () => {

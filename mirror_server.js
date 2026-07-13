@@ -2182,6 +2182,7 @@ function terafabxGeminiBatchFinalJudgePrompt(items = []) {
     "fatal_error는 대상 혼동, 원문과 반대되는 말, 사실 날조, 민감·금지 표현이 있을 때 true다.",
     "language_error는 오기·오타·맞춤법·조사·문법·불완전한 종결어미가 있으면 true다.",
     "awkward_korean은 뜻은 통하지만 한국어 구어체로 어색하거나 명사 연결이 부자연스러우면 true다.",
+    "'표정이 황당하다는 얼굴'처럼 표정·얼굴을 같은 의미로 중복한 문장은 awkward_korean=true로 판정해라.",
     "translation_tone은 직역체·번역체·과도하게 딱딱한 표현이면 true다.",
     "cliche는 범용 덕담·추상적 감탄·다른 글에도 붙일 수 있는 AI식 요약체면 true다.",
     "context_error는 원문과 어긋나거나 이미 보이는 대상을 모르는 듯 묻거나 사실을 추측하면 true다.",
@@ -2316,6 +2317,9 @@ function assessTerafabxLanguageQuality(reply) {
   const text = cleanSocialText(reply);
   const errors = [];
   if (/^년\s*전(?:이나|에도|부터|과|보다|\s)/.test(text)) errors.push("missing_leading_year_number");
+  if (/표정이\s*.{0,14}(?:하다는|같다는|같은|라는)?\s*얼굴(?:이|이네|이네요|처럼)/.test(text)) {
+    errors.push("redundant_expression_face_nouns");
+  }
   return {
     ok: errors.length === 0,
     errors: [...new Set(errors)],
@@ -2382,6 +2386,7 @@ function terafabxCommentQualityPromptLines() {
     "원문에 법적 분류가 없으면 행동을 범죄·불법·위법·사기로 새로 단정하지 마라.",
     "대화형 반응 대신 '배려가 필요합니다', '확인이 필요합니다', '안전합니다', '해야 합니다'처럼 기사 결론·안전 표어·교훈으로 끝내지 마라.",
     "'고민이 깊으시겠습니다', '마음이 무거우시겠습니다'처럼 상담 기록 같은 격식체 추측 공감은 쓰지 말고 실제 X 대화처럼 짧고 담백하게 말해라.",
+    "'표정이 황당하다는 얼굴'처럼 표정·얼굴을 같은 의미로 중복하지 말고 하나의 자연스러운 구어체로 쓰라.",
     ...dynamicRules.map((rule) => `최근 10분 품질 피드백: ${rule}`),
   ];
 }
@@ -2410,6 +2415,7 @@ function terafabxFinalJudgePrompt(target, grokInput, finalReply) {
     "fatal_error는 대상 혼동, 원문과 반대되는 말, 사실 날조, 민감·금지 표현이 있을 때 true다.",
     "language_error는 오기·오타·맞춤법·조사·문법·불완전한 종결어미가 있으면 true다.",
     "awkward_korean은 뜻은 통하지만 한국어 구어체로 어색하거나 명사 연결이 부자연스러우면 true다.",
+    "'표정이 황당하다는 얼굴'처럼 표정·얼굴을 같은 의미로 중복한 문장은 awkward_korean=true로 판정해라.",
     "translation_tone은 직역체·번역체·과도하게 딱딱한 표현이면 true다.",
     "cliche는 범용 덕담·추상적 감탄·다른 글에도 붙일 수 있는 AI식 요약체면 true다.",
     "context_error는 원문과 어긋나거나 이미 보이는 대상을 모르는 듯 묻거나 사실을 추측하면 true다.",
