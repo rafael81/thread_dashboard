@@ -1886,6 +1886,28 @@ function parseTerafabxGrokContext(raw) {
   });
 }
 
+function parseTerafabxGrokContextBatch(raw, targets = []) {
+  const expected = Array.isArray(targets) ? targets : [];
+  const rows = parseTerafabxJsonCollection(raw, ["items", "contexts", "results"]);
+  const byIndex = new Map();
+  for (const row of rows) {
+    const index = Number(row?.index);
+    if (!Number.isInteger(index) || index < 0 || index >= expected.length || byIndex.has(index)) continue;
+    byIndex.set(index, normalizeTerafabxContextResult({
+      contextSummary: row.context_summary || row.contextSummary || row.analysis || row.context,
+      keyPoints: row.key_points || row.keyPoints || row.points,
+      rawPreview: String(raw || "").slice(0, 1200),
+    }));
+  }
+  return expected.map((target, index) => {
+    const context = byIndex.get(index);
+    if (!context || !hasDetailedTerafabxGrokContext(context)) {
+      return { ok: false, target, index, error: "Grok 묶음 문맥 분석 JSON이 비어 있거나 부족합니다." };
+    }
+    return { ok: true, target, index, context };
+  });
+}
+
 function isTerafabxGrokNonJsonLimitText(raw) {
   const text = String(raw || "").trim();
   return !text.startsWith("{")
@@ -4599,6 +4621,27 @@ function terafabxGrokContextPrompt(target, extraRule = "", actor = "Grok") {
   ].filter(Boolean).join("\n");
 }
 
+function terafabxGrokContextBatchPrompt(targets = [], extraRule = "", actor = "Grok") {
+  const selected = (Array.isArray(targets) ? targets : []).slice(0, 10);
+  const blocks = selected.map((target, index) => [
+    `### index=${index}`,
+    ...terafabxPromptContextLines(target).map((line) => `- ${line}`),
+  ].join("\n")).join("\n\n");
+  return [
+    "너는 X 계정 @terafabXai(과즙루피)의 한국어 답글 문맥 분석기다.",
+    "아래 여러 원문 또는 부모글-댓글 대화를 index별로 서로 독립적으로 자세히 해석하되, 공개 답글 후보는 절대 작성하지 마라.",
+    "context_summary: 원문 주제, 인용/답글 구조, 감정/상황, 안전하게 반응할 포인트를 2~4문장으로 써라.",
+    "key_points: 댓글 생성·검수자가 참고할 핵심 소재와 관찰 포인트 2~5개를 써라.",
+    `${actor}이 확신할 수 없는 내용은 context_summary에서 추정이라고 표시해라.`,
+    "reply, comment, final_reply 같은 댓글 필드는 출력하지 마라.",
+    "모든 index를 빠짐없이 한 번씩 포함하고 서로 내용을 섞지 마라.",
+    "반드시 JSON 배열 한 줄만 출력해라. 형식: [{\"index\":0,\"context_summary\":\"원문 이해\",\"key_points\":[\"포인트1\",\"포인트2\"]}]",
+    extraRule,
+    "",
+    blocks,
+  ].filter(Boolean).join("\n");
+}
+
 function terafabxGeminiGeneratePrompt(target, contextInput, extraRule = "") {
   const context = normalizeTerafabxContextResult(contextInput);
   const keyPoints = context.keyPoints.length
@@ -4836,6 +4879,62 @@ async function analyzeTerafabxContextWithGrok(target, options = {}) {
     }
   }
   throw new Error("Grok 상세 문맥 분석 생성 실패");
+}
+
+async function analyzeTerafabxContextsWithGrok(targets, options = {}) {
+  const selected = (Array.isArray(targets) ? targets : []).slice(0, 10);
+  if (!selected.length) return [];
+  const provider = TERAFABX_GROK_PROVIDER === "cli" ? "cli" : "web";
+  logEvent("terafabx_grok_context_batch_start", {
+    provider,
+    count: selected.length,
+    targetUrls: selected.map((target) => target.url),
+  });
+  const timeoutMs = Number(options.timeoutMs || 90_000);
+  try {
+    const prompt = terafabxGrokContextBatchPrompt(selected, "", "Grok");
+    const raw = provider === "web"
+      ? await runGrokWebAgent(prompt, {
+        attempt: 1,
+        targetId: `${selected[0]?.targetId || "batch"}-context-batch-${selected.length}`,
+        targetUrl: selected[0]?.url,
+        timeoutMs: options.timeoutMs ? timeoutMs : Math.max(timeoutMs, TERAFABX_GROK_WEB_TIMEOUT_MS),
+        session: options.session,
+        skipStateSync: Boolean(options.skipGrokStateSync),
+      })
+      : await runGrokCli(prompt, timeoutMs);
+    if (isTerafabxGrokNonJsonLimitText(raw)) {
+      const error = new Error("Grok 묶음 문맥 응답이 JSON이 아닌 limit 문구입니다.");
+      error.code = "TERAFABX_GROK_CONTEXT_LIMIT_TEXT";
+      logEvent("terafabx_grok_context_non_json_limit_text", {
+        provider,
+        attempt: 1,
+        targetUrl: selected[0]?.url,
+        batchCount: selected.length,
+        preview: String(raw || "").slice(0, 240),
+      });
+      throw error;
+    }
+    const parsed = parseTerafabxGrokContextBatch(raw, selected);
+    const passed = parsed.filter((item) => item.ok).length;
+    logEvent("terafabx_grok_context_batch_ok", {
+      provider,
+      count: selected.length,
+      passed,
+      failed: selected.length - passed,
+    });
+    return parsed.map((item) => item.ok
+      ? { ...item, context: { ...item.context, provider: `${provider}-context-batch` } }
+      : item);
+  } catch (error) {
+    logEvent("terafabx_grok_context_batch_failed", {
+      provider,
+      count: selected.length,
+      targetUrls: selected.map((target) => target.url),
+      error: error.message,
+    });
+    return selected.map((target, index) => ({ ok: false, target, index, error: error.message }));
+  }
 }
 
 async function generateTerafabxReplyWithGrok(target, options = {}) {
@@ -6407,21 +6506,28 @@ async function runTerafabxCommentPrefillQueue({ manual = false, targetCount = TE
     workerResources = await prepareTerafabxCommentPrefillWorkers(workerCount);
     const targets = await discoverTerafabxCommentTargets(missing);
     const selected = targets.slice(0, missing);
-    const contextResults = await runFixedWorkerPool(selected, workerCount, async (targetItem, workerIndex) => {
-      try {
-        const resource = workerResources[workerIndex];
-        const grokContext = await analyzeTerafabxContextWithGrok(targetItem, {
-          session: resource.grokContextSession,
-          skipGrokStateSync: true,
-          timeoutMs: 60_000,
-          maxAttempts: 1,
+    const targetChunks = [];
+    for (let offset = 0; offset < selected.length; offset += 10) targetChunks.push(selected.slice(offset, offset + 10));
+    const chunkWorkerCount = Math.max(1, Math.min(workerCount, targetChunks.length));
+    const contextChunks = await runFixedWorkerPool(targetChunks, chunkWorkerCount, async (targetChunk, workerIndex) => {
+      const resource = workerResources[workerIndex];
+      const batch = await analyzeTerafabxContextsWithGrok(targetChunk, {
+        session: resource.grokContextSession,
+        skipGrokStateSync: true,
+        timeoutMs: 90_000,
+      });
+      return batch.map((item) => {
+        if (item.ok) return { ok: true, target: item.target, grokContext: item.context, workerIndex };
+        logEvent("terafabx_comment_prefill_item_error", {
+          targetUrl: item.target?.url,
+          error: item.error,
+          workerIndex,
+          stage: "grok_context_batch",
         });
-        return { ok: true, target: targetItem, grokContext, workerIndex };
-      } catch (error) {
-        logEvent("terafabx_comment_prefill_item_error", { targetUrl: targetItem.url, error: error.message, workerIndex, stage: "grok_context" });
-        return { ok: false, targetUrl: targetItem.url, error: error.message, workerIndex, stage: "grok_context" };
-      }
+        return { ok: false, targetUrl: item.target?.url, error: item.error, workerIndex, stage: "grok_context_batch" };
+      });
     });
+    const contextResults = contextChunks.flat();
     const results = contextResults.filter((item) => !item.ok);
     const ready = contextResults.filter((item) => item.ok);
     for (let offset = 0; offset < ready.length; offset += 5) {
@@ -13412,6 +13518,8 @@ module.exports = {
   findXScheduledEntry,
   xScheduledTimeNeedles,
   terafabxGrokContextPrompt,
+  terafabxGrokContextBatchPrompt,
+  parseTerafabxGrokContextBatch,
   terafabxGeminiGeneratePrompt,
   terafabxGeminiReviewPrompt,
   terafabxGeminiBatchReviewPrompt,

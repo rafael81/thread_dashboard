@@ -19,6 +19,8 @@ const {
   shouldAutoRecoverXScheduledAnomaly,
   findXScheduledEntry,
   terafabxGeminiReviewPrompt,
+  terafabxGrokContextBatchPrompt,
+  parseTerafabxGrokContextBatch,
   isDiscoveryAutoScheduleSource,
   ensureComposerText,
   mergeDiscoveryRowsWithMirrorHistory,
@@ -36,6 +38,40 @@ const { agentBrowserInvocation, buildGrokBatchCommandChunks, buildGrokBatchComma
 test('sharp runtime dependency is importable', async () => {
   const sharp = await import('sharp');
   assert.equal(typeof sharp.default, 'function');
+});
+
+test('TerafabX Grok context batch keeps target indexes isolated', () => {
+  const targets = [
+    { url: 'https://x.com/a/status/1', targetText: '의정부고 졸업사진에서 손흥민 닮은 학생' },
+    { url: 'https://x.com/b/status/2', targetText: '댓글 백 개도 어렵다는 이야기' },
+  ];
+  const prompt = terafabxGrokContextBatchPrompt(targets);
+  assert.match(prompt, /### index=0/);
+  assert.match(prompt, /### index=1/);
+  assert.match(prompt, /서로 내용을 섞지 마라/);
+
+  const parsed = parseTerafabxGrokContextBatch(JSON.stringify([
+    { index: 1, context_summary: '댓글을 백 개 작성하기도 어렵다며 다른 이용자들의 작성 방식을 궁금해하는 가벼운 하소연이다.', key_points: ['백 개 작성', '가벼운 하소연'] },
+    { index: 0, context_summary: '의정부고 졸업사진 속 손흥민 닮은 학생을 보고 놀라는 유머 글이다.', key_points: ['의정부고 졸업사진', '손흥민 닮은 학생'] },
+  ]), targets);
+
+  assert.equal(parsed.length, 2);
+  assert.equal(parsed[0].ok, true);
+  assert.match(parsed[0].context.contextSummary, /손흥민/);
+  assert.equal(parsed[1].ok, true);
+  assert.match(parsed[1].context.contextSummary, /백 개/);
+});
+
+test('TerafabX Grok context batch fails closed for a missing index', () => {
+  const targets = [
+    { url: 'https://x.com/a/status/1', targetText: '첫 글' },
+    { url: 'https://x.com/b/status/2', targetText: '둘째 글' },
+  ];
+  const parsed = parseTerafabxGrokContextBatch(JSON.stringify([
+    { index: 0, context_summary: '첫 번째 글의 주제와 감정 및 안전하게 반응할 지점을 충분히 자세히 분석한 결과다.', key_points: ['첫 글'] },
+  ]), targets);
+  assert.equal(parsed[0].ok, true);
+  assert.equal(parsed[1].ok, false);
 });
 
 test('past scheduled discovery row is treated as posted on dashboard', () => {
