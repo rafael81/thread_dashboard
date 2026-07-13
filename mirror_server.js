@@ -3258,6 +3258,71 @@ async function closeXDialogs(page) {
   })()`).catch(() => false);
 }
 
+function xPageReadyState(snapshot = {}, mode = "page") {
+  const bodyText = String(snapshot.bodyText || "").trim();
+  const articleCount = Number(snapshot.articleCount || 0);
+  const scheduleMarkerCount = Number(snapshot.scheduleMarkerCount || 0);
+  const accountVisible = Boolean(String(snapshot.accountText || "").trim() || String(snapshot.profileHref || "").trim());
+  const loginVisible = /로그인|가입하기|Log in|Sign up/i.test(bodyText);
+  const errorVisible = /문제가 발생했습니다|다시 시도|Something went wrong|Try reloading/i.test(bodyText);
+  const contentReady = mode === "home"
+    ? articleCount > 0
+    : mode === "schedule"
+      ? scheduleMarkerCount > 0 || /예약 게시물이 없습니다|예약된 게시물이 없습니다|No scheduled posts/i.test(bodyText)
+      : accountVisible;
+  const ready = contentReady && !loginVisible && !errorVisible;
+  return {
+    ready,
+    blank: !bodyText && articleCount === 0 && !accountVisible,
+    loginVisible,
+    errorVisible,
+    articleCount,
+    scheduleMarkerCount,
+    bodyLength: bodyText.length,
+  };
+}
+
+async function readXPageReadySnapshot(page) {
+  return page.evalFast(`(() => ({
+    url: location.href,
+    title: document.title,
+    bodyText: (document.body?.innerText || "").slice(0, 2000),
+    articleCount: document.querySelectorAll("article").length,
+    scheduleMarkerCount: Array.from(document.querySelectorAll('[role="button"]')).filter((el) => /전송 예정|scheduled for|will send on/i.test(el.innerText || el.textContent || "")).length,
+    accountText: document.querySelector('[data-testid="SideNav_AccountSwitcher_Button"]')?.innerText || "",
+    profileHref: document.querySelector('[data-testid="AppTabBar_Profile_Link"]')?.href || "",
+  }))()`, 8000);
+}
+
+async function waitForXPageReady(page, mode, options = {}) {
+  const attempts = Math.max(1, Number(options.attempts || 20));
+  const intervalMs = Math.max(100, Number(options.intervalMs || 1000));
+  const allowReload = options.allowReload !== false;
+  let reloaded = false;
+  let snapshot = null;
+  let assessment = null;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    snapshot = await readXPageReadySnapshot(page).catch(() => null);
+    assessment = xPageReadyState(snapshot || {}, mode);
+    if (assessment.ready) return { snapshot, assessment, reloaded };
+    if (assessment.loginVisible) throw new Error(`X ${mode} 로그인 화면으로 이동했습니다.`);
+    if (allowReload && !reloaded && attempt >= Math.min(5, Math.floor(attempts / 3)) && (assessment.blank || assessment.errorVisible)) {
+      reloaded = true;
+      await page.send("Page.reload", { ignoreCache: true }, 12000).catch(() => null);
+      logEvent("x_page_blank_reload", { mode, url: snapshot?.url || null, blank: assessment.blank, errorVisible: assessment.errorVisible });
+    }
+    await sleep(intervalMs);
+  }
+  throw new Error(`X ${mode} 로딩 실패: ${JSON.stringify({
+    url: snapshot?.url || null,
+    title: snapshot?.title || null,
+    blank: assessment?.blank,
+    articleCount: assessment?.articleCount || 0,
+    bodyLength: assessment?.bodyLength || 0,
+    reloaded,
+  })}`);
+}
+
 const TERAFABX_REPLY_RESTRICTED_RE = /(일부 계정만 답글|답글을 쓸 수 있습니다|답글을 달 수 없습니다|답글 권한|Who can reply|Only people|Replies are disabled|can reply)/i;
 
 async function discoverTerafabxCommentTargetsUnlocked(limit = 1) {
@@ -3269,11 +3334,17 @@ async function discoverTerafabxCommentTargetsUnlocked(limit = 1) {
     ...pendingTerafabxCommentPosts(state).map((item) => item.targetUrl),
   ].filter(Boolean).map((url) => String(url).split("?")[0]));
   logEvent("terafabx_comment_target_discovery_start", { seenCount: seen.size });
-  const page = await getTerafabxCommentXHeadlessPage("https://x.com/home");
+  const page = await getTerafabxCommentXHeadlessPage(`https://x.com/${REQUIRED_X_HANDLE}`);
   try {
     await closeXDialogs(page);
     await verifyXAccount(page);
     await page.navigate("https://x.com/home", 8000);
+    const homeReady = await waitForXPageReady(page, "home", { attempts: 25, intervalMs: 1000, allowReload: true });
+    logEvent("terafabx_comment_home_ready", {
+      articleCount: homeReady.assessment.articleCount,
+      bodyLength: homeReady.assessment.bodyLength,
+      reloaded: homeReady.reloaded,
+    });
     for (let i = 0; i < 4; i++) {
       await page.send("Input.dispatchMouseEvent", { type: "mouseWheel", x: 500, y: 700, deltaX: 0, deltaY: 650 }).catch(() => {});
       await sleep(900);
@@ -8166,15 +8237,13 @@ function downloadFile(url, file) {
 
 async function verifyXAccount(page) {
   let accountState = null;
-  const verifyUrls = [
-    "https://x.com/home",
-    "https://x.com/i/flow/login",
-    "https://x.com/intent/post?text=",
-    `https://x.com/${REQUIRED_X_HANDLE}`,
-  ];
+  const currentUrl = await page.evalFast("location.href", 5000).catch(() => "");
+  const verifyUrls = currentUrl && currentUrl !== "about:blank"
+    ? [currentUrl, `https://x.com/${REQUIRED_X_HANDLE}`]
+    : [`https://x.com/${REQUIRED_X_HANDLE}`];
   for (const url of verifyUrls) {
-    await page.navigate(url, 15000).catch(() => {});
-    for (let attempt = 0; attempt < 24; attempt += 1) {
+    if (url !== currentUrl) await page.navigate(url, 5000).catch(() => {});
+    for (let attempt = 0; attempt < 12; attempt += 1) {
       accountState = await page.eval(`(() => {
         const button = document.querySelector('[data-testid="SideNav_AccountSwitcher_Button"]');
         const profileLink = document.querySelector('[data-testid="AppTabBar_Profile_Link"]');
@@ -8208,8 +8277,9 @@ async function verifyXAccount(page) {
         }
         return;
       }
-      if (!accountState.bodyText && attempt === 7) {
-        await page.navigate(accountState.url || url, 15000).catch(() => {});
+      if (!accountState.bodyText && attempt === 4) {
+        await page.send("Page.reload", { ignoreCache: true }, 12000).catch(() => null);
+        logEvent("x_account_verify_blank_reload", { required: REQUIRED_X_HANDLE, url: accountState.url || url });
       }
       await sleep(1000);
     }
@@ -8423,6 +8493,7 @@ function shouldAutoRecoverXScheduledAnomaly(item, actualCount, expectedCount, no
 
 async function readXScheduledEntries(page) {
   await page.navigate("https://x.com/compose/post/unsent/scheduled", 5000);
+  await waitForXPageReady(page, "schedule", { attempts: 20, intervalMs: 750, allowReload: true });
   const entries = new Map();
   for (let pass = 0; pass < 8; pass += 1) {
     const batch = await page.eval(`(() => {
@@ -8659,7 +8730,7 @@ async function verifyScheduledPostSubmission(page, expected) {
 
 async function postToX(threadPost, mediaFiles, options = {}) {
   return withMirrorChromeLock(options.schedule ? "mirror_schedule" : "mirror_post", async () => {
-    const page = await newPage("https://x.com/home");
+    const page = await newPage(`https://x.com/${REQUIRED_X_HANDLE}`);
     try {
       await verifyXAccount(page);
       await page.navigate("https://x.com/compose/post", 5000);
@@ -8787,7 +8858,7 @@ async function saveComposeAsXDraft(page) {
 
 async function createXDraft(threadPost, mediaFiles) {
   return withMirrorChromeLock("mirror_draft", async () => {
-    const page = await newPage("https://x.com/home");
+    const page = await newPage(`https://x.com/${REQUIRED_X_HANDLE}`);
     try {
       await verifyXAccount(page);
       await page.navigate("https://x.com/compose/post", 5000);
@@ -9651,7 +9722,7 @@ async function cancelDiscoveryScheduledPost(canonicalUrl) {
   `).run(url);
   try {
     const verification = await withMirrorChromeLock("dashboard_schedule_cancel", async () => {
-      const page = await newPage("https://x.com/home");
+      const page = await newPage(`https://x.com/${REQUIRED_X_HANDLE}`);
       try {
         await verifyXAccount(page);
         return await deleteXScheduledEntry(page, scheduledAt);
@@ -12897,7 +12968,7 @@ async function confirmExistingXScheduledPost(canonicalUrl, scheduledAtValue) {
     throw new Error("확인할 미래 예약 시각이 올바르지 않습니다.");
   }
   const verification = await withTerafabxLock("x_schedule_existing_confirm", async () => {
-    const page = await newPage("https://x.com/home");
+    const page = await newPage(`https://x.com/${REQUIRED_X_HANDLE}`);
     try {
       await verifyXAccount(page);
       const entries = await readXScheduledEntries(page);
@@ -12953,7 +13024,7 @@ async function runXScheduleMonitor(options = {}) {
   try {
     return await withTerafabxLock("x_schedule_monitor", async () => {
       const expectedRows = await futureScheduledDiscoveryRows();
-      const page = await newPage("https://x.com/home");
+      const page = await newPage(`https://x.com/${REQUIRED_X_HANDLE}`);
       try {
         await verifyXAccount(page);
         let actualEntries = await readXScheduledEntries(page);
@@ -13189,6 +13260,7 @@ module.exports = {
   isTerafabxReplyReviewScoreQualified,
   isTerafabxGrokNonJsonLimitText,
   withTerafabxBrowserSetupCleanup,
+  xPageReadyState,
   randomTerafabxOwnPostReplyDelayMs,
   runFixedWorkerPool,
   shouldUseTerafabxQuickIntent,

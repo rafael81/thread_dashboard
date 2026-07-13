@@ -41,8 +41,21 @@ const {
   isTerafabxReplySubmissionUncertain,
   terafabxPendingCommentFailureDisposition,
   withTerafabxBrowserSetupCleanup,
+  xPageReadyState,
   terafabxGeminiPriorityValue,
 } = require("../mirror_server");
+
+test("X home readiness rejects blank and error pages", () => {
+  assert.equal(xPageReadyState({ bodyText: "", articleCount: 0 }, "home").ready, false);
+  assert.equal(xPageReadyState({ bodyText: "Something went wrong", articleCount: 2 }, "home").ready, false);
+  assert.equal(xPageReadyState({ bodyText: "홈 타임라인", articleCount: 1 }, "home").ready, true);
+});
+
+test("X schedule readiness distinguishes loaded empty state from a blank shell", () => {
+  assert.equal(xPageReadyState({ bodyText: "탐색 홈 알림", scheduleMarkerCount: 0 }, "schedule").ready, false);
+  assert.equal(xPageReadyState({ bodyText: "예약 게시물이 없습니다", scheduleMarkerCount: 0 }, "schedule").ready, true);
+  assert.equal(xPageReadyState({ bodyText: "7월 14일 전송 예정", scheduleMarkerCount: 1 }, "schedule").ready, true);
+});
 
 const rootUrl = "https://x.com/terafabXai/status/100";
 
