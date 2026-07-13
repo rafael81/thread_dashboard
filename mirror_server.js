@@ -8019,14 +8019,16 @@ function auditTerafabxPrefillQuality(state = loadTerafabxState(), options = {}) 
     if (seen.has(key)) return [];
     seen.add(key);
     const policy = assessTerafabxCurrentCommentPolicy(record);
+    const status = record.status || (record.posted ? "posted" : "pending");
     return [{
       key,
       targetUrl: normalizeXStatusUrl(record.targetUrl || ""),
       comment: cleanSocialText(record.comment || ""),
       source: record.source,
-      status: record.status || (record.posted ? "posted" : "pending"),
+      status,
+      createdAt: record.queuedAt || record.at || null,
       queuedAt: record.queuedAt || null,
-      postedAt: record.postedAt || record.at || null,
+      postedAt: status === "posted" ? (record.postedAt || record.at || null) : null,
       replyUrl: record.replyUrl || null,
       score: Number.isFinite(Number(record.geminiReview?.finalJudge?.score)) ? Number(record.geminiReview.finalJudge.score) : null,
       sourceAnchor: record.geminiReview?.finalJudge?.sourceAnchor || null,

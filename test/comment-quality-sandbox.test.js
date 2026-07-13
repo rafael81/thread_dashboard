@@ -113,5 +113,11 @@ test("prefill audit checks every queued and posted item with the genericity gate
   assert.equal(audit.postedFailedCount, 1);
   assert.equal(audit.postedLegacyUnverifiableCount, 1);
   assert.equal(audit.postedQualityFailedCount, 0);
+  const pendingItem = audit.items.find((item) => item.status === "pending");
+  const postedItem = audit.items.find((item) => item.status === "posted");
+  assert.equal(pendingItem.createdAt, "2026-07-13T13:30:00.000Z");
+  assert.equal(pendingItem.postedAt, null);
+  assert.equal(postedItem.createdAt, "2026-07-13T13:20:00.000Z");
+  assert.equal(postedItem.postedAt, "2026-07-13T13:21:00.000Z");
   assert.ok(audit.items.find((item) => !item.ok).errors.includes("genericity_quality_flags_missing"));
 });
