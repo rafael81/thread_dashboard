@@ -69,6 +69,39 @@ function exportRuntime(output) {
   return parsed.output;
 }
 
+function exportWithDashboardPaused(output) {
+  if (process.platform !== "darwin" || typeof process.getuid !== "function") {
+    return exportRuntime(output);
+  }
+
+  const label = "com.terafabx.mirror-server";
+  const domain = `gui/${process.getuid()}`;
+  const service = `${domain}/${label}`;
+  const plist = path.join(os.homedir(), "Library", "LaunchAgents", `${label}.plist`);
+  const loaded = fs.existsSync(plist) && run("launchctl", ["print", service], { allowFailure: true }).status === 0;
+  if (!loaded) return exportRuntime(output);
+
+  run("launchctl", ["bootout", service]);
+  let exported;
+  let exportError = null;
+  try {
+    exported = exportRuntime(output);
+  } catch (error) {
+    exportError = error;
+  }
+
+  const bootstrap = run("launchctl", ["bootstrap", domain, plist], { allowFailure: true });
+  const kickstart = bootstrap.status === 0
+    ? run("launchctl", ["kickstart", "-k", service], { allowFailure: true })
+    : bootstrap;
+  if (bootstrap.status !== 0 || kickstart.status !== 0) {
+    const original = exportError ? ` Export also failed: ${exportError.message}` : "";
+    throw new Error(`Dashboard LaunchAgent restart failed: ${bootstrap.stderr || kickstart.stderr || "unknown error"}.${original}`);
+  }
+  if (exportError) throw exportError;
+  return exported;
+}
+
 function upload() {
   ensureGhAuth();
   const source = syncSource();
@@ -76,7 +109,7 @@ function upload() {
   ensurePrivateRuntimeRepo(repo);
   const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..+$/, "").replace("T", "-");
   const archive = path.join(root, `thread-dashboard-runtime-${stamp}.zip`);
-  exportRuntime(archive);
+  exportWithDashboardPaused(archive);
   const checksumPath = `${archive}.sha256`;
   fs.writeFileSync(checksumPath, `${sha256(archive)}  ${path.basename(archive)}\n`);
   const tag = `runtime-${stamp}`;

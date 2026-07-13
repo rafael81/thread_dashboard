@@ -51,8 +51,8 @@ LAN URL is available from another device if Windows Firewall allows port `3131`.
 ## 다른 Mac으로 이전
 
 소스 코드는 공개 `thread_dashboard` 저장소에, DB와 운영 상태는 별도의 비공개
-`thread_dashboard_runtime` 저장소의 GitHub Release에 저장한다. 기존 Mac에서 서버를
-정상 종료한 뒤 다음 명령을 실행한다.
+`thread_dashboard_runtime` 저장소의 GitHub Release에 저장한다. 기존 Mac에서 다음
+명령을 실행한다.
 
 ```sh
 npm run migrate:mac -- upload
@@ -60,7 +60,9 @@ npm run migrate:mac -- upload
 
 이 명령은 현재 브랜치를 `origin`에 push하고, SQLite DB를 온라인 백업한 뒤 체크섬과
 함께 비공개 런타임 저장소에 업로드한다. 커밋하지 않은 소스 변경이 있으면 안전을 위해
-중단한다.
+중단한다. `com.terafabx.mirror-server` LaunchAgent가 실행 중이면 DB 스냅샷 동안만
+자동으로 정지하고 성공·실패 여부와 관계없이 다시 기동한다. 서버를 직접 실행한
+환경에서는 업로드 전에 서버를 종료해야 한다.
 
 새 Mac에서는 GitHub CLI 인증 후 소스를 받고 런타임을 복원한다.
 
