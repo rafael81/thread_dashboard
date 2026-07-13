@@ -2008,7 +2008,7 @@ function terafabxPromptContextLines(target = {}) {
     if (!rootPostText) throw new Error("부모 원글 문맥이 비어 있어 대댓글을 생성하지 않습니다.");
     return [
       "대댓글 문맥 규칙: 부모 원글과 답글 대상 댓글을 하나의 대화로 함께 해석해라.",
-      "대상 댓글이 주어·장면을 생략하면 부모 원글에서 상속하고, 이미 보이는 대상을 누구·무엇·어떤 대상인지 모르는 듯 되묻지 마라.",
+      "대상 댓글이 주어·장면을 생략하면 부모 원글에서 상속하고, 이미 보이는 대상을 누구·무엇·어떤 대상인지 모르는 듯 되묻지 마라. 단, 대상 댓글 작성자가 직접 물은 내용을 함께 궁금해하는 맞장구는 가능하다.",
       `부모 원글 URL: ${rootPostUrl}`,
       `부모 원글: ${rootPostText.slice(0, 1800)}`,
       `답글 대상 댓글 URL: ${target.url || ""}`,
@@ -2024,7 +2024,7 @@ function terafabxPromptContextLines(target = {}) {
     quotePostUrl ? `인용 원문 URL: ${quotePostUrl}` : null,
     quotePostText ? `인용 원문: ${quotePostText.slice(0, 1800)}` : null,
     visibleMediaCount > 0 ? `화면에 보이는 첨부/인용 미디어: ${visibleMediaCount}개` : null,
-    visibleMediaCount > 0 ? "첨부나 인용 미디어가 이미 보이므로 무엇인지 모르는 듯 되묻지 마라." : null,
+    visibleMediaCount > 0 ? "첨부나 인용 미디어가 이미 보이므로 무엇인지 모르는 듯 되묻지 마라. 단, 원문 작성자가 직접 물은 내용을 함께 궁금해하는 맞장구는 가능하다." : null,
   ].filter(Boolean);
 }
 
@@ -2036,7 +2036,8 @@ function assessTerafabxParentContextMismatch(target = {}, reply = "") {
   const hasVisibleSubject = Math.max(0, Number(target.visibleMediaCount || target.mediaCount || target.quoteMediaCount || 0)) > 0
     || /(?:이|그|저)\s*(?:짤|사진|영상|장면|아이|애|강아지|고양이)|(?:이거|그거|저거)/.test(targetText);
   const asksUnknownSubject = /도대체\s*(?:어떤|누구|무슨)|(?:어떤|누구|무슨)\s*.{0,14}(?:길래|인가요|일까요|거예요)|(?:무엇이|뭐가|뭔지).{0,14}(?:궁금|나올지|보일지)/.test(comment);
-  const mismatch = Boolean(asksUnknownSubject && ((rootPostText && praisesVisibleSubject) || hasVisibleSubject));
+  const targetAsksSameUnknown = /(?:뭐|뭔|무엇|어떤|누구|무슨|어떻게).{0,24}(?:궁금|인가|일까|거야|건데|하는|함)|(?:궁금|어떻게\s*하)/.test(targetText);
+  const mismatch = Boolean(asksUnknownSubject && !targetAsksSameUnknown && ((rootPostText && praisesVisibleSubject) || hasVisibleSubject));
   return {
     ok: !mismatch,
     reason: mismatch ? "부모 원글에 보이는 대상을 모르는 듯 되묻는 문구" : null,
@@ -2184,7 +2185,7 @@ function terafabxGeminiBatchFinalJudgePrompt(items = []) {
     "cliche는 범용 덕담·추상적 감탄·다른 글에도 붙일 수 있는 AI식 요약체면 true다.",
     "context_error는 원문과 어긋나거나 이미 보이는 대상을 모르는 듯 묻거나 사실을 추측하면 true다.",
     "unsupported_claim은 댓글이 원문·부모 원글·인용문 또는 원문 분석의 확정적 관찰에 없는 구체 명사·수치·원인·행동을 새로 만들어내면 true다. 단어에서 흔히 연상되는 소재라도 원문 근거가 없으면 true이며, 원문 분석에서 '(추정)'인 내용은 근거가 아니다. 원문에 숫자만 있고 통화 단위가 없는데 '60'을 '육십만 원'처럼 단위까지 확장하면 반드시 unsupported_claim=true다.",
-    "부모 원글에 대상이나 장면이 이미 드러났는데도 댓글이 누구·무엇·어떤 대상인지 모르는 듯 되물으면 대상 혼동으로 보고 fatal_error=true로 판정해라.",
+    "부모 원글에 대상이나 장면이 이미 드러났는데도 댓글이 누구·무엇·어떤 대상인지 모르는 듯 되물으면 대상 혼동으로 보고 fatal_error=true로 판정해라. 단, 원문 작성자가 직접 물은 내용을 댓글도 함께 궁금해하는 맞장구는 대상 혼동이 아니다.",
     "반드시 JSON 배열 한 줄만 출력해라. 모든 필드를 빠짐없이 포함해라. 형식: [{\"index\":0,\"context\":0,\"naturalness\":0,\"specificity\":0,\"concision\":0,\"non_ai_style\":0,\"fatal_error\":false,\"language_error\":false,\"awkward_korean\":false,\"translation_tone\":false,\"cliche\":false,\"context_error\":false,\"unsupported_claim\":false,\"cross_post_reusable\":false,\"headline_tone\":false,\"specificity_error\":false,\"source_anchor\":\"원문에 실제로 있는 구절\",\"reason\":\"짧은 이유\"}]",
     "",
     blocks,
@@ -2410,7 +2411,7 @@ function terafabxFinalJudgePrompt(target, grokInput, finalReply) {
     "cliche는 범용 덕담·추상적 감탄·다른 글에도 붙일 수 있는 AI식 요약체면 true다.",
     "context_error는 원문과 어긋나거나 이미 보이는 대상을 모르는 듯 묻거나 사실을 추측하면 true다.",
     "unsupported_claim은 댓글이 원문·부모 원글·인용문 또는 원문 분석의 확정적 관찰에 없는 구체 명사·수치·원인·행동을 새로 만들어내면 true다. 단어에서 흔히 연상되는 소재라도 원문 근거가 없으면 true이며, 원문 분석에서 '(추정)'인 내용은 근거가 아니다. 원문에 숫자만 있고 통화 단위가 없는데 '60'을 '육십만 원'처럼 단위까지 확장하면 반드시 unsupported_claim=true다.",
-    "부모 원글에 대상이나 장면이 이미 드러났는데도 댓글이 누구·무엇·어떤 대상인지 모르는 듯 되물으면 대상 혼동으로 보고 fatal_error=true로 판정해라.",
+    "부모 원글에 대상이나 장면이 이미 드러났는데도 댓글이 누구·무엇·어떤 대상인지 모르는 듯 되물으면 대상 혼동으로 보고 fatal_error=true로 판정해라. 단, 원문 작성자가 직접 물은 내용을 댓글도 함께 궁금해하는 맞장구는 대상 혼동이 아니다.",
     "반드시 JSON 한 줄만 출력해라. 모든 필드를 빠짐없이 포함해라. 형식: {\"context\":0,\"naturalness\":0,\"specificity\":0,\"concision\":0,\"non_ai_style\":0,\"fatal_error\":false,\"language_error\":false,\"awkward_korean\":false,\"translation_tone\":false,\"cliche\":false,\"context_error\":false,\"unsupported_claim\":false,\"cross_post_reusable\":false,\"headline_tone\":false,\"specificity_error\":false,\"source_anchor\":\"원문에 실제로 있는 구절\",\"reason\":\"짧은 이유\"}",
     "",
     ...terafabxPromptContextLines(target),

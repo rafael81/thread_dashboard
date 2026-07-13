@@ -279,6 +279,14 @@ test("visible-subject praise cannot be rewritten as an unknown-subject question"
   assert.equal(assessTerafabxParentContextMismatch(target, "물까지 마시면서 돕는 게 진짜 기특하죠").ok, true);
 });
 
+test("a reply may echo a question that the source author explicitly asked", () => {
+  const target = {
+    targetText: "남부대공 포즈 해달라는 게 웃기네 그거 어떻게 하는 건데",
+    visibleMediaCount: 1,
+  };
+  assert.equal(assessTerafabxParentContextMismatch(target, "남부대공 포즈가 뭔지 나도 진짜 궁금하다").ok, true);
+});
+
 test("quoted media is preserved as visible context for automatic comments", () => {
   const result = normalizeFxTwitterV2Status({
     id: "2",
