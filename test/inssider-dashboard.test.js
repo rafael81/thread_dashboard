@@ -566,10 +566,11 @@ test('Grok context batch uses one semantic fill and Enter submission', () => {
   const responseReadScript = Buffer.from(responseReadCommand.slice('eval -b '.length), 'base64').toString('utf8');
   assert.match(responseReadScript, /'\[class\*="r-bnwqim"\]\[class\*="r-11niif6"\]'/);
   assert.match(responseReadScript, /cleanPrompt = clean\(prompt\)/);
-  assert.match(responseReadScript, /text\.includes\(cleanPrompt\.slice/);
+  assert.match(responseReadScript, /textFingerprint\.includes\(promptFingerprint\.slice/);
   assert.ok(!commands.includes('press Control+a'));
   assert.equal(commands.filter((command) => command.startsWith('keyboard inserttext ')).length, 1);
-  assert.ok(commands.some((command) => command.startsWith('keyboard inserttext ') && command.includes('한 줄\\n심사')));
+  assert.ok(commands.some((command) => command.startsWith('keyboard inserttext ') && command.includes('한 줄 심사')));
+  assert.ok(!commands.some((command) => command.startsWith('keyboard inserttext ') && command.includes('\\n')));
   assert.ok(commands.includes('press Enter'));
   assert.ok(commands.some((command) => command.startsWith('eval -b ')));
   assert.ok(!commands.some((command) => command.startsWith('find placeholder ')));
@@ -580,6 +581,7 @@ test('Grok prompt echo detection handles whitespace normalization and duplicatio
   const prompt = '너는 X 원문 문맥 분석기다.\n반드시 JSON 배열만 반환한다.\n원문 URL 10개를 분석한다.';
 
   assert.equal(isGrokPromptEcho(`  ${prompt.replace(/\n/g, '   ')}  ${prompt}`, prompt), true);
+  assert.equal(isGrokPromptEcho(prompt.replace(/\n/g, 'n'), prompt), true);
   assert.equal(isGrokPromptEcho('[{"index":0,"summary":"고양이가 빠르게 달려온다"}]', prompt), false);
 });
 

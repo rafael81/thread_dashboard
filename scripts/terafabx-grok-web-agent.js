@@ -326,6 +326,7 @@ function buildGrokSubmitEvalScript(prompt) {
     };
     const clean = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
     const cleanPrompt = clean(prompt);
+    const promptFingerprint = cleanPrompt.replace(/\\s+/g, '').replace(/n/g, '');
     const readState = () => {
       const nodes = [
         '[data-message-author-role="assistant"]',
@@ -343,7 +344,8 @@ function buildGrokSubmitEvalScript(prompt) {
           const text = clean(node.innerText || node.textContent || '');
           if (text.length < 20) return false;
           if (node.closest('form, aside, nav')) return false;
-          if (cleanPrompt && text.includes(cleanPrompt.slice(0, Math.min(cleanPrompt.length, 120)))) return false;
+          const textFingerprint = text.replace(/\\s+/g, '').replace(/n/g, '');
+          if (promptFingerprint && textFingerprint.includes(promptFingerprint.slice(0, Math.min(promptFingerprint.length, 120)))) return false;
           return !/^(Grok|History|Today|New chat|새 채팅)$/i.test(text);
         });
       const last = nodes.at(-1);
@@ -398,6 +400,7 @@ function buildGrokReadEvalScript() {
     };
     const clean = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
     const cleanPrompt = clean(prompt);
+    const promptFingerprint = cleanPrompt.replace(/\\s+/g, '').replace(/n/g, '');
     const nodes = [
       '[data-message-author-role="assistant"]',
       '[data-testid="assistant-message"]',
@@ -414,7 +417,8 @@ function buildGrokReadEvalScript() {
         const text = clean(node.innerText || node.textContent || '');
         if (text.length < 20) return false;
         if (node.closest('form, aside, nav')) return false;
-        if (cleanPrompt && text.includes(cleanPrompt.slice(0, Math.min(cleanPrompt.length, 120)))) return false;
+        const textFingerprint = text.replace(/\\s+/g, '').replace(/n/g, '');
+        if (promptFingerprint && textFingerprint.includes(promptFingerprint.slice(0, Math.min(promptFingerprint.length, 120)))) return false;
         return !/^(Grok|History|Today|New chat|새 채팅)$/i.test(text);
       });
     const last = nodes.at(-1);
@@ -444,7 +448,7 @@ function buildGrokBatchCommandChunks(prompt, url, timeoutMs = DEFAULT_TIMEOUT_MS
     "reload",
     `wait ${randomHumanDelayMs(random, 4200, 6800)}`,
     `eval -b ${encodeEval(buildGrokSubmitEvalScript(prompt))}`,
-    `keyboard inserttext ${JSON.stringify(prompt)}`,
+    `keyboard inserttext ${JSON.stringify(normalizePromptEchoText(prompt))}`,
     `wait ${randomHumanDelayMs(random, 600, 1400)}`,
     "press Enter",
     `wait ${randomHumanDelayMs(random, 900, 1800)}`,
@@ -475,8 +479,10 @@ function isGrokPromptEcho(response, prompt) {
   const text = normalizePromptEchoText(response);
   const source = normalizePromptEchoText(prompt);
   if (!text || source.length < 40) return false;
-  const prefix = source.slice(0, Math.min(source.length, 160));
-  return text.includes(prefix);
+  const textFingerprint = text.replace(/\s+/g, '').replace(/n/g, '');
+  const sourceFingerprint = source.replace(/\s+/g, '').replace(/n/g, '');
+  const prefix = sourceFingerprint.slice(0, Math.min(sourceFingerprint.length, 160));
+  return textFingerprint.includes(prefix);
 }
 
 function acceptGrokResponse(response, prompt) {
