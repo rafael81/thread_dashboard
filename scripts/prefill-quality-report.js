@@ -127,7 +127,9 @@ const lines = [
   `- 근거 없는 구체 주장 격리: ${unsupportedClaimRejected.length}개`,
   `- 최근 자동 감사: ${Number(audit.checkedCount || 0)}개 검사 / ${auditPostedLegacyUnverifiableCount}개 레거시 미검증 / ${auditPostedQualityFailedCount + auditPendingFailedCount}개 확정 품질 탈락`,
   `- 현재 대기 Prefill 감사: ${auditPendingCount}개 검사 / ${auditPendingFailedCount}개 탈락`,
-  `- 현재 대기 Prefill 독립심사 점수: 최저 ${auditPendingMinScore ?? "없음"}점 / 평균 ${auditPendingAverageScore ?? "없음"}점`,
+  auditPendingScores.length
+    ? `- 현재 대기 Prefill 독립심사 점수: 최저 ${auditPendingMinScore}점 / 평균 ${auditPendingAverageScore}점`
+    : "- 현재 대기 Prefill 독립심사 점수: 해당 없음",
   `- 이미 게시된 Prefill 자동 감사: ${auditPostedCount}개 검사 / ${auditPostedLegacyUnverifiableCount}개 레거시 스키마 미검증 / ${auditPostedQualityFailedCount}개 확정 품질 탈락`,
   `- 생성 완료 이벤트: ${eventCount("terafabx_comment_prefill_queued")}회`,
   `- 품질 격리: ${eventCount("terafabx_comment_monitor_prefill_quality_quarantined")}회 / ${eventSum("terafabx_comment_monitor_prefill_quality_quarantined")}개`,
