@@ -24,7 +24,6 @@ const {
   terafabxGeminiReviewPrompt,
   terafabxGeminiBatchFinalJudgePrompt,
   TERAFABX_GROK_CONTEXT_MODE,
-  terafabxGrokLightweightContextPrompt,
   terafabxGrokContextBatchPrompt,
   normalizeTerafabxContextResult,
   parseTerafabxGrokContextBatch,
@@ -52,10 +51,11 @@ test('TerafabX Grok context batch keeps target indexes isolated', () => {
     { url: 'https://x.com/a/status/1', targetText: '의정부고 졸업사진에서 손흥민 닮은 학생' },
     { url: 'https://x.com/b/status/2', targetText: '댓글 백 개도 어렵다는 이야기' },
   ];
-  const prompt = terafabxGrokContextBatchPrompt(targets);
+  const prompt = terafabxGrokContextBatchPrompt(targets, '', 'Grok', 'gctx-12345678-1234-1234-1234-123456789abc');
   assert.match(prompt, /### index=0/);
   assert.match(prompt, /### index=1/);
   assert.match(prompt, /서로 내용을 섞지 마라/);
+  assert.match(prompt, /gctx-12345678-1234-1234-1234-123456789abc/);
 
   const parsed = parseTerafabxGrokContextBatch(JSON.stringify([
     { index: 1, context_summary: '댓글을 백 개 작성하기도 어렵다며 다른 이용자들의 작성 방식을 궁금해하는 가벼운 하소연이다.', key_points: ['백 개 작성', '가벼운 하소연'] },
@@ -67,19 +67,6 @@ test('TerafabX Grok context batch keeps target indexes isolated', () => {
   assert.match(parsed[0].context.contextSummary, /손흥민/);
   assert.equal(parsed[1].ok, true);
   assert.match(parsed[1].context.contextSummary, /백 개/);
-});
-
-test('TerafabX Grok Prefill uses a lightweight single-item prompt', () => {
-  const target = { url: 'https://x.com/a/status/1', targetText: '길에서 우연히 만난 고양이가 사람을 졸졸 따라온다.' };
-  const prompt = terafabxGrokLightweightContextPrompt(target, '', 'gctx-12345678-1234-1234-1234-123456789abc');
-  const batchPrompt = terafabxGrokContextBatchPrompt([target, target]);
-
-  assert.match(prompt, /X 글 1개/);
-  assert.match(prompt, /댓글은 작성하지 마/);
-  assert.match(prompt, /context_summary/);
-  assert.match(prompt, /gctx-12345678-1234-1234-1234-123456789abc/);
-  assert.doesNotMatch(prompt, /### index=/);
-  assert.ok(prompt.length < batchPrompt.length);
 });
 
 test('TerafabX Grok context batch fails closed for a missing index', () => {
