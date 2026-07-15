@@ -451,17 +451,6 @@ export function DataTable(props: DataTableProps) {
         ),
       },
       {
-        id: "signals",
-        header: "신호",
-        cell: ({ row }) => (
-          <div className="flex flex-wrap gap-1">
-            <Badge variant="outline">훅 {row.original.criteria?.shortHook ? "Y" : "N"}</Badge>
-            <Badge variant="outline">미디어 {row.original.criteria?.strongMedia ? "Y" : "N"}</Badge>
-            <Badge variant="outline">논쟁 {row.original.criteria?.controversy ? "Y" : "N"}</Badge>
-          </div>
-        ),
-      },
-      {
         id: "time",
         header: "시간",
         cell: ({ row }) => (
