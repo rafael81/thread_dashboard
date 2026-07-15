@@ -4,6 +4,7 @@ import {
   CircleHelpIcon,
   CommandIcon,
   LinkIcon,
+  CircleDollarSignIcon,
   SearchIcon,
   Settings2Icon,
   FileTextIcon,
@@ -29,6 +30,7 @@ const viewItems = [
   { id: "scheduled", title: "게시예정", icon: <CalendarClockIcon /> },
   { id: "posted", title: "게시됨", icon: <CheckCircle2Icon /> },
   { id: "coupang-performance", title: "쿠팡 실적", icon: <LinkIcon /> },
+  { id: "naver-adpost", title: "애드포스트 수익", icon: <CircleDollarSignIcon /> },
   { id: "automation", title: "자동화", icon: <Settings2Icon /> },
   { id: "inssider-pending", title: "인싸이더 판결중", icon: <ScaleIcon /> },
   { id: "naver-blog", title: "네이버 블로그", icon: <FileTextIcon /> },
@@ -62,6 +64,8 @@ export function AppSidebar({
             ? summary.postedCount
             : item.id === "coupang-performance"
               ? "실적"
+              : item.id === "naver-adpost"
+                ? "수익"
               : item.id === "automation"
                 ? "운영"
                 : item.id === "inssider-pending"

@@ -133,6 +133,7 @@ const NAVER_BLOG_PROFILE_DIR = process.env.NAVER_BLOG_PROFILE_DIR || path.join(_
 const NAVER_BLOG_ADPOST_ROOT = process.env.NAVER_BLOG_ADPOST_ROOT || "/Users/user/Documents/adpost";
 const NAVER_BLOG_INTERVAL_MS = Number(process.env.NAVER_BLOG_INTERVAL_MS || 60 * 1000);
 const NAVER_BLOG_DEFAULT_SCHEDULE = ["08:00", "15:00", "21:00"];
+const NAVER_ADPOST_MAIN_URL = "https://adpost.naver.com/main";
 const INSSIDER_BASE_URL = "https://inssider.kr";
 const INSSIDER_PENDING_CATEGORIES = [
   { code: "003011", name: "[연애·결혼] 누구잘못?" },
@@ -156,6 +157,7 @@ const FXTWITTER_API_BASE = process.env.FXTWITTER_API_BASE || "https://api.fxtwit
 
 let naverBlogSchedulerBusy = false;
 let naverBlogManualBusy = false;
+let naverAdpostRevenueCache = null;
 
 let busy = false;
 let autoScheduleAllocationTail = Promise.resolve();
@@ -6611,6 +6613,124 @@ async function getCoupangPerformanceData(options = {}) {
     rows,
     fetchedAt: new Date().toISOString(),
   };
+}
+
+function defaultNaverAdpostReportRange() {
+  const end = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const start = new Date(end.getTime() - 29 * 24 * 60 * 60 * 1000);
+  return { startDate: formatCoupangDate(start), endDate: formatCoupangDate(end) };
+}
+
+function normalizeNaverAdpostRevenueRows(rows = []) {
+  const byDate = new Map();
+  for (const source of Array.isArray(rows) ? rows : []) {
+    const date = parseCoupangDate(source?.date);
+    if (!date) continue;
+    const current = byDate.get(date) || {
+      date,
+      impressionCount: 0,
+      clickCount: 0,
+      revenueAmount: 0,
+      mediaNames: new Set(),
+    };
+    current.impressionCount += Number(source.impressionCount || 0);
+    current.clickCount += Number(source.clickCount || 0);
+    current.revenueAmount += Number(source.revenueAmount || 0);
+    if (source.mediaName) current.mediaNames.add(String(source.mediaName));
+    byDate.set(date, current);
+  }
+  return Array.from(byDate.values()).map((row) => ({
+    date: row.date,
+    impressionCount: row.impressionCount,
+    clickCount: row.clickCount,
+    revenueAmount: row.revenueAmount,
+    ctr: row.impressionCount > 0 ? row.clickCount / row.impressionCount : 0,
+    mediaNames: Array.from(row.mediaNames),
+  })).sort((a, b) => a.date.localeCompare(b.date));
+}
+
+async function getNaverAdpostRevenueData(options = {}) {
+  const defaults = defaultNaverAdpostReportRange();
+  const startDate = parseCoupangDate(options.startDate) || defaults.startDate;
+  const endDate = parseCoupangDate(options.endDate) || defaults.endDate;
+  if (startDate > endDate) throw new Error("애드포스트 조회 시작일은 종료일보다 늦을 수 없습니다.");
+  const cacheKey = `${startDate}:${endDate}`;
+  if (!options.force && naverAdpostRevenueCache?.key === cacheKey && naverAdpostRevenueCache.expiresAt > Date.now()) {
+    return { ...naverAdpostRevenueCache.value, cached: true };
+  }
+  await ensureNaverBlogBrowser();
+  const page = await newPageForPort(NAVER_BLOG_CHROME_PORT, "about:blank");
+  try {
+    await page.navigate(NAVER_ADPOST_MAIN_URL, 4500);
+    const raw = await page.eval(`(async () => {
+      const getJson = async (url) => {
+        const response = await fetch(url, { credentials: "include", cache: "no-store" });
+        const text = await response.text();
+        let data = null;
+        try { data = JSON.parse(text); } catch {}
+        if (!response.ok) throw new Error("HTTP " + response.status + " " + text.slice(0, 200));
+        return data;
+      };
+      const login = await getJson("/api/logins");
+      if (!login?.isLoggedIn || !login?.publisherId) throw new Error("네이버 애드포스트 로그인이 필요합니다.");
+      const publisherId = Number(login.publisherId);
+      const query = "startDate=${startDate}&endDate=${endDate}&publisherId=" + publisherId + "&clipRequired=true";
+      const [revenue, balance, recentPayments] = await Promise.all([
+        getJson("/api/report/revenue?" + query),
+        getJson("/api/dashboards/revenue/" + publisherId),
+        getJson("/api/revenue/payment/recent"),
+      ]);
+      return {
+        account: { naverId: login.naverId || "", nickName: login.nickName || "", status: login.status || "" },
+        revenue,
+        balance,
+        recentPayments,
+      };
+    })()`);
+    const rows = normalizeNaverAdpostRevenueRows(raw?.revenue || []);
+    const totals = rows.reduce((acc, row) => {
+      acc.impressionCount += row.impressionCount;
+      acc.clickCount += row.clickCount;
+      acc.revenueAmount += row.revenueAmount;
+      return acc;
+    }, { impressionCount: 0, clickCount: 0, revenueAmount: 0 });
+    totals.ctr = totals.impressionCount > 0 ? totals.clickCount / totals.impressionCount : 0;
+    const latest = rows.slice().reverse().find((row) => row.impressionCount || row.clickCount || row.revenueAmount) || rows.at(-1) || null;
+    const result = {
+      ok: true,
+      startDate,
+      endDate,
+      currency: "KRW",
+      account: raw?.account || {},
+      balance: {
+        current: Number(raw?.balance?.currentPoint || 0),
+        remaining: Number(raw?.balance?.remainPoint || 0),
+        paidThisYear: Number(raw?.balance?.yearCashPaidAmount || 0)
+          + Number(raw?.balance?.yearNaverPayPaidAmount || 0)
+          + Number(raw?.balance?.yearHappyBeanPaidAmount || 0),
+      },
+      totals,
+      latest,
+      rows,
+      recentPayments: Array.isArray(raw?.recentPayments) ? raw.recentPayments.slice(0, 5) : [],
+      sourceUrl: NAVER_ADPOST_MAIN_URL,
+      fetchedAt: new Date().toISOString(),
+    };
+    logEvent("naver_adpost_revenue_loaded", {
+      startDate,
+      endDate,
+      rowCount: rows.length,
+      revenueAmount: totals.revenueAmount,
+    });
+    naverAdpostRevenueCache = {
+      key: cacheKey,
+      value: result,
+      expiresAt: Date.now() + 5 * 60 * 1000,
+    };
+    return result;
+  } finally {
+    await page.close().catch(() => {});
+  }
 }
 
 async function postTerafabxAffiliateComment(payload = {}) {
@@ -13133,6 +13253,21 @@ const server = http.createServer(async (req, res) => {
     }
     return;
   }
+  if (req.method === "GET" && req.url.startsWith("/api/naver-adpost/revenue")) {
+    try {
+      const parsedUrl = new URL(req.url, "http://localhost");
+      const result = await getNaverAdpostRevenueData({
+        startDate: parsedUrl.searchParams.get("startDate") || "",
+        endDate: parsedUrl.searchParams.get("endDate") || "",
+        force: parsedUrl.searchParams.get("refresh") === "1",
+      });
+      json(res, 200, result);
+    } catch (error) {
+      logEvent("naver_adpost_revenue_api_error", { error: error.message });
+      json(res, 500, { ok: false, error: error.message });
+    }
+    return;
+  }
   if (req.method === "GET" && req.url.startsWith("/discovery")) {
     try {
       if (fs.existsSync(DASHBOARD_INDEX_PATH)) {
@@ -14102,6 +14237,7 @@ module.exports = {
   terafabxGrokContextPrompt,
   terafabxGrokContextBatchPrompt,
   normalizeTerafabxContextResult,
+  normalizeNaverAdpostRevenueRows,
   parseTerafabxGrokContextBatch,
   terafabxGeminiGeneratePrompt,
   terafabxGeminiReviewPrompt,

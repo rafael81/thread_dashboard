@@ -15,7 +15,8 @@ import {
   TrendingDownIcon,
   TrendingUpIcon,
   UserPlusIcon,
-  FileTextIcon
+  FileTextIcon,
+  CircleDollarSignIcon,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -658,6 +659,129 @@ function CoupangPerformance({ data, loading, range, onRangeChange, onPreset, onR
   );
 }
 
+function NaverAdpostRevenue({ data, loading, range, onRangeChange, onPreset, onReload, busy, error }) {
+  const adpost = data?.adpost || {};
+  const totals = adpost.totals || {};
+  const balance = adpost.balance || {};
+  const rows = (adpost.rows || []).slice().reverse();
+  const today = kstDateInput();
+
+  return (
+    <div className="grid gap-4">
+      {error ? (
+        <Alert variant="destructive">
+          <AlertTitle>애드포스트 수익 조회 실패</AlertTitle>
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      ) : null}
+      <div className="grid grid-cols-2 gap-3 @5xl/main:grid-cols-4">
+        <Card className="@container/card bg-gradient-to-t from-primary/5 to-card shadow-xs">
+          <CardHeader>
+            <CardDescription>현재 잔액</CardDescription>
+            <CardTitle className="text-2xl font-semibold tabular-nums @[250px]/card:text-3xl">
+              {loading ? "-" : won(balance.current)}
+            </CardTitle>
+          </CardHeader>
+          <CardFooter className="text-sm text-muted-foreground">전환 가능 금액</CardFooter>
+        </Card>
+        <Card className="@container/card bg-gradient-to-t from-primary/5 to-card shadow-xs">
+          <CardHeader>
+            <CardDescription>선택 기간 수익</CardDescription>
+            <CardTitle className="text-2xl font-semibold tabular-nums @[250px]/card:text-3xl">
+              {loading ? "-" : won(totals.revenueAmount)}
+            </CardTitle>
+          </CardHeader>
+          <CardFooter className="text-sm text-muted-foreground">
+            {formatCoupangDate(adpost.startDate)} ~ {formatCoupangDate(adpost.endDate)}
+          </CardFooter>
+        </Card>
+        <Card className="@container/card bg-gradient-to-t from-primary/5 to-card shadow-xs">
+          <CardHeader>
+            <CardDescription>광고 노출</CardDescription>
+            <CardTitle className="text-2xl font-semibold tabular-nums @[250px]/card:text-3xl">
+              {loading ? "-" : compact(totals.impressionCount)}
+            </CardTitle>
+          </CardHeader>
+          <CardFooter className="text-sm text-muted-foreground">선택 기간 누적</CardFooter>
+        </Card>
+        <Card className="@container/card bg-gradient-to-t from-primary/5 to-card shadow-xs">
+          <CardHeader>
+            <CardDescription>클릭 · CTR</CardDescription>
+            <CardTitle className="text-2xl font-semibold tabular-nums @[250px]/card:text-3xl">
+              {loading ? "-" : `${compact(totals.clickCount)} · ${percent(totals.ctr)}`}
+            </CardTitle>
+          </CardHeader>
+          <CardFooter className="text-sm text-muted-foreground">광고 반응</CardFooter>
+        </Card>
+      </div>
+
+      <Card id="naver-adpost-revenue">
+        <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <CardTitle className="flex items-center gap-2">
+              <CircleDollarSignIcon className="size-5" />
+              네이버 애드포스트 수익
+            </CardTitle>
+            <CardDescription>
+              {adpost.ok === false
+                ? adpost.error
+                : `${adpost.account?.nickName || adpost.account?.naverId || "네이버"} · 최근 갱신 ${formatDate(adpost.fetchedAt)}`}
+            </CardDescription>
+          </div>
+          <div className="flex gap-2">
+            <Button variant="outline" size="sm" asChild>
+              <a href="https://adpost.naver.com/report/revenue" target="_blank" rel="noreferrer">
+                <ExternalLinkIcon data-icon="inline-start" />
+                애드포스트 열기
+              </a>
+            </Button>
+            <Button variant="outline" size="sm" disabled={busy || loading} onClick={onReload}>
+              {busy ? <Loader2Icon data-icon="inline-start" className="animate-spin" /> : <RefreshCcwIcon data-icon="inline-start" />}
+              새로고침
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent className="grid gap-4">
+          <div className="grid gap-3 rounded-lg border p-3">
+            <div className="flex flex-wrap gap-2">
+              <Button size="sm" variant={range.preset === "today" ? "default" : "outline"} disabled={busy || loading} onClick={() => onPreset("today")}>오늘</Button>
+              <Button size="sm" variant={range.preset === "7d" ? "default" : "outline"} disabled={busy || loading} onClick={() => onPreset("7d")}>최근 7일</Button>
+              <Button size="sm" variant={range.preset === "30d" ? "default" : "outline"} disabled={busy || loading} onClick={() => onPreset("30d")}>최근 30일</Button>
+              <Button size="sm" variant={range.preset === "month" ? "default" : "outline"} disabled={busy || loading} onClick={() => onPreset("month")}>이번 달</Button>
+            </div>
+            <div className="grid gap-2 sm:grid-cols-[minmax(0,180px)_minmax(0,180px)_auto]">
+              <Input type="date" max={range.endDate || today} value={range.startDate} onChange={(event) => onRangeChange({ ...range, startDate: event.target.value, preset: "custom" })} />
+              <Input type="date" min={range.startDate} max={today} value={range.endDate} onChange={(event) => onRangeChange({ ...range, endDate: event.target.value, preset: "custom" })} />
+              <Button variant="outline" disabled={busy || loading} onClick={onReload}>적용</Button>
+            </div>
+          </div>
+
+          <div className="overflow-hidden rounded-lg border">
+            <div className="grid grid-cols-[1fr_88px_72px_72px_92px] gap-2 bg-muted px-3 py-2 text-xs font-medium text-muted-foreground">
+              <span>일자</span>
+              <span className="text-right">노출</span>
+              <span className="text-right">클릭</span>
+              <span className="text-right">CTR</span>
+              <span className="text-right">수익</span>
+            </div>
+            {rows.length ? rows.map((row) => (
+              <div key={row.date} className="grid grid-cols-[1fr_88px_72px_72px_92px] gap-2 border-t px-3 py-2 text-sm">
+                <span className="tabular-nums">{formatCoupangDate(row.date)}</span>
+                <span className="text-right tabular-nums">{compact(row.impressionCount)}</span>
+                <span className="text-right tabular-nums">{compact(row.clickCount)}</span>
+                <span className="text-right tabular-nums">{percent(row.ctr)}</span>
+                <span className="text-right font-medium tabular-nums">{won(row.revenueAmount)}</span>
+              </div>
+            )) : (
+              <div className="border-t px-3 py-4 text-sm text-muted-foreground">선택 기간의 수익 데이터가 없습니다.</div>
+            )}
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
 function OwnPostReplyControl({
   value,
   onChange,
@@ -1141,12 +1265,13 @@ function Dashboard() {
   const [ownPostReplyResult, setOwnPostReplyResult] = useState(null);
   const [ownPostReplyError, setOwnPostReplyError] = useState("");
   const [coupangRange, setCoupangRange] = useState(defaultCoupangRange);
+  const [adpostRange, setAdpostRange] = useState(defaultCoupangRange);
   const [autoRefresh, setAutoRefresh] = useState(localStorage.getItem("threadDashboard.autoRefreshEnabled") !== "false");
   const [error, setError] = useState("");
   const [automationDate, setAutomationDate] = useState(() => formatKstDateKey());
   const [automationSort, setAutomationSort] = useState("desc");
 
-  async function load(nextView = view) {
+  async function load(nextView = view, options = {}) {
     setError("");
     const result = nextView === "naver-blog"
       ? await api("/api/naver-blog/ops")
@@ -1154,6 +1279,8 @@ function Dashboard() {
         ? await api("/api/inssider/pending")
         : nextView === "coupang-performance"
           ? { ok: true, coupang: await api(`/api/coupang/performance?startDate=${compactCoupangDate(coupangRange.startDate)}&endDate=${compactCoupangDate(coupangRange.endDate)}`) }
+          : nextView === "naver-adpost"
+            ? { ok: true, adpost: await api(`/api/naver-adpost/revenue?startDate=${compactCoupangDate(adpostRange.startDate)}&endDate=${compactCoupangDate(adpostRange.endDate)}${options.force ? "&refresh=1" : ""}`) }
           : await api(`/api/discovery/dashboard?view=${encodeURIComponent(nextView)}`);
     setData(result);
     setTitleEdits((current) => Object.fromEntries((result.rows || []).map((row) => [
@@ -1173,7 +1300,7 @@ function Dashboard() {
     } else if (view === "inssider-pending") {
       url.pathname = "/inssider-pending";
       url.searchParams.delete("view");
-    } else if (view === "coupang-performance") {
+    } else if (view === "coupang-performance" || view === "naver-adpost") {
       url.pathname = "/discovery";
       url.searchParams.set("view", view);
     } else {
@@ -1186,7 +1313,7 @@ function Dashboard() {
       setError(err.message);
       setLoading(false);
     });
-  }, [view, coupangRange.startDate, coupangRange.endDate]);
+  }, [view, coupangRange.startDate, coupangRange.endDate, adpostRange.startDate, adpostRange.endDate]);
 
   useEffect(() => {
     if (!autoRefresh) return undefined;
@@ -1367,6 +1494,18 @@ function Dashboard() {
     setCoupangRange(next);
   }
 
+  function setAdpostPreset(preset) {
+    const today = kstDateInput();
+    const next = preset === "today"
+      ? { startDate: today, endDate: today, preset }
+      : preset === "7d"
+        ? { startDate: kstDateInput(-6), endDate: today, preset }
+        : preset === "30d"
+          ? { startDate: kstDateInput(-29), endDate: today, preset }
+          : { startDate: `${today.slice(0, 7)}-01`, endDate: today, preset: "month" };
+    setAdpostRange(next);
+  }
+
   const controlsBusy = Boolean(busy);
   const discoveryTable = loading ? (
     <div className="px-4 lg:px-6">
@@ -1476,8 +1615,8 @@ function Dashboard() {
         />
         <SidebarInset>
           <SiteHeader
-            title={view === "naver-blog" ? "네이버 블로그 운영" : view === "inssider-pending" ? "인싸이더 판결중" : view === "automation" ? "자동화 타임라인" : view === "coupang-performance" ? "쿠팡 파트너스 실적" : "Threads 발굴 대시보드"}
-            subtitle={view === "naver-blog" ? "Gemini Web 전용 작성 · 자체 스케줄러 · 전용 Chrome 프로필" : view === "inssider-pending" ? "연애·결혼 / 직장·사회 카테고리의 진행 중인 판결글" : view === "automation" ? "자동댓글 기록 · 날짜별 필터 · 작성 시간 정렬" : view === "coupang-performance" ? "쿠팡 파트너스 월간 실적과 최근 일자별 수수료" : "좋아요 1000+ · 미디어 포함 · X 수동 검토/예약 워크플로우"}
+            title={view === "naver-blog" ? "네이버 블로그 운영" : view === "inssider-pending" ? "인싸이더 판결중" : view === "automation" ? "자동화 타임라인" : view === "coupang-performance" ? "쿠팡 파트너스 실적" : view === "naver-adpost" ? "네이버 애드포스트 수익" : "Threads 발굴 대시보드"}
+            subtitle={view === "naver-blog" ? "Gemini Web 전용 작성 · 자체 스케줄러 · 전용 Chrome 프로필" : view === "inssider-pending" ? "연애·결혼 / 직장·사회 카테고리의 진행 중인 판결글" : view === "automation" ? "자동댓글 기록 · 날짜별 필터 · 작성 시간 정렬" : view === "coupang-performance" ? "쿠팡 파트너스 월간 실적과 최근 일자별 수수료" : view === "naver-adpost" ? "현재 잔액 · 기간별 수익 · 노출과 클릭 현황" : "좋아요 1000+ · 미디어 포함 · X 수동 검토/예약 워크플로우"}
             autoRefresh={autoRefresh}
             busy={controlsBusy}
             onRefresh={() => runAction("refresh-data", () => load(view), "새로고침 완료")}
@@ -1520,6 +1659,19 @@ function Dashboard() {
                     onPreset={setCoupangPreset}
                     busy={busy === "coupang-performance-refresh"}
                     onReload={() => runAction("coupang-performance-refresh", () => load(view), "쿠팡 실적 새로고침 완료")}
+                  />
+                </div>
+              ) : view === "naver-adpost" ? (
+                <div className="px-4 lg:px-6">
+                  <NaverAdpostRevenue
+                    data={data}
+                    loading={loading}
+                    range={adpostRange}
+                    onRangeChange={setAdpostRange}
+                    onPreset={setAdpostPreset}
+                    busy={busy === "naver-adpost-refresh"}
+                    error={error}
+                    onReload={() => runAction("naver-adpost-refresh", () => load(view, { force: true }), "애드포스트 수익 새로고침 완료")}
                   />
                 </div>
               ) : (
