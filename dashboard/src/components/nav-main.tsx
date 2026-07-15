@@ -34,7 +34,7 @@ export function NavMain({
             >
               <a href="#add-url">
                 <CirclePlusIcon />
-                <span>Threads URL 추가</span>
+                <span>URL 추가</span>
               </a>
             </SidebarMenuButton>
             <Button

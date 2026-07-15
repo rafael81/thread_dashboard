@@ -39,7 +39,7 @@ const {
   xWeightedLength,
   xScheduledTimeNeedles,
 } = require('../mirror_server.js');
-const { DEFAULT_GROK_URL, agentBrowserInvocation, buildGrokBatchCommandChunks, buildGrokBatchCommands, isGrokPromptEcho, parseDoneMarker } = require('../scripts/terafabx-grok-web-agent.js');
+const { DEFAULT_GROK_URL, agentBrowserInvocation, buildGrokBatchCommandChunks, buildGrokBatchCommands, isGrokPromptEcho, namespaceProcessIds, parseDoneMarker } = require('../scripts/terafabx-grok-web-agent.js');
 
 test('sharp runtime dependency is importable', async () => {
   const sharp = await import('sharp');
@@ -473,6 +473,7 @@ test('TerafabX daily comment cadence targets 600 and accelerates when behind pac
 test('TerafabX pending comments must satisfy the new short context-first policy', () => {
   const accepted = assessTerafabxCurrentCommentPolicy({
     comment: '종각역 안내판은 외국인 눈엔 더 복잡해 보이겠네요',
+    grokContext: { summary: 'Grok이 종각역 안내판 원문의 내용과 반응 지점을 충분히 분석했다.', keyPoints: ['종각역 안내판의 복잡함'], rawPreview: 'grok-json', provider: 'web-context' },
     geminiReview: { finalJudge: { passed: true, fatalError: false, qualityFlagsComplete: true, flaggedQualityIssues: [], dimensions: { context: 36 } } },
   });
   const stale = assessTerafabxCurrentCommentPolicy({
@@ -755,6 +756,10 @@ test('Grok headless browser uses the regular Chrome identity and system Chrome b
   assert.doesNotMatch(invocation.args[userAgentIndex + 1], /HeadlessChrome|Chrome for Testing/);
   assert.equal(invocation.args[executableIndex + 1], '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome');
   assert.ok(invocation.args.includes('--lang=ko-KR,--window-size=1440,900'));
+});
+
+test('Grok namespace cleanup de-duplicates only valid daemon process ids', () => {
+  assert.deepEqual(namespaceProcessIds('2871\n2884\n2871\ninvalid\n0\n'), [2871, 2884]);
 });
 
 test('Grok final judge chunks long polling so the browser command line stays bounded', () => {

@@ -9,6 +9,7 @@ const DEFAULT_SESSION = "terafabx-grok-headless";
 const DEFAULT_TIMEOUT_MS = 180000;
 const POLL_INTERVAL_MS = 2500;
 const RESPONSE_STABLE_POLLS = 2;
+const INITIAL_BATCH_POLL_CHUNK_SIZE = 4;
 const BATCH_POLL_CHUNK_SIZE = 4;
 const DEBUG = process.env.TERAFABX_GROK_WEB_DEBUG === "true";
 const DEFAULT_SYSTEM_CHROME_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
@@ -101,13 +102,56 @@ function runAgentBrowser(args, options = {}) {
 function closeAgentBrowserSession(session) {
   const bin = process.env.AGENT_BROWSER_BIN || "npx";
   const prefix = process.env.AGENT_BROWSER_BIN ? [] : ["--yes", "agent-browser"];
+  const namespace = agentBrowserNamespace(session);
   return new Promise((resolve) => {
-    const namespace = agentBrowserNamespace(session);
     execFile(bin, [...prefix, "--namespace", namespace, "--session", namespace, "--headed", "false", "close"], {
       timeout: 15000,
       maxBuffer: 1024 * 1024,
     }, () => resolve());
+  }).then(async () => {
+    // The close command can return just before its daemon exits. Give it a
+    // short grace period so forced cleanup cannot race the next runner.
+    await sleep(1500);
+    await forceCleanupAgentBrowserNamespace(namespace);
   });
+}
+
+function namespaceProcessIds(raw) {
+  return Array.from(new Set(String(raw || "")
+    .split(/\s+/)
+    .map((value) => Number(value))
+    .filter((pid) => Number.isInteger(pid) && pid > 1 && pid !== process.pid)));
+}
+
+function namespaceRuntimeDir(namespace) {
+  return path.join(process.env.HOME || "", ".agent-browser", "namespaces", namespace, "run");
+}
+
+function listNamespaceProcessIds(namespace) {
+  const runtimeDir = namespaceRuntimeDir(namespace);
+  if (!runtimeDir || !fs.existsSync(runtimeDir)) return Promise.resolve([]);
+  return new Promise((resolve) => {
+    execFile("lsof", ["-t", "+D", runtimeDir], {
+      timeout: 5000,
+      maxBuffer: 256 * 1024,
+    }, (_error, stdout = "") => resolve(namespaceProcessIds(stdout)));
+  });
+}
+
+async function forceCleanupAgentBrowserNamespace(namespace) {
+  let pids = await listNamespaceProcessIds(namespace);
+  for (const pid of pids) {
+    try { process.kill(pid, "SIGTERM"); } catch {}
+  }
+  if (pids.length) await sleep(500);
+  pids = await listNamespaceProcessIds(namespace);
+  for (const pid of pids) {
+    try { process.kill(pid, "SIGKILL"); } catch {}
+  }
+  const runtimeDir = namespaceRuntimeDir(namespace);
+  for (const suffix of ["sock", "pid", "engine", "stream", "version"]) {
+    try { fs.rmSync(path.join(runtimeDir, `${namespace}.${suffix}`), { force: true }); } catch {}
+  }
 }
 
 function sleep(ms) {
@@ -410,9 +454,15 @@ function buildGrokSendEvalScript(prompt) {
   })()`;
 }
 
-function buildGrokReadEvalScript() {
+function buildGrokReadEvalScript(expectedPrompt = "") {
   return `(() => {
-    const prompt = window.__terafabxGrokPrompt || '';
+    if (location.protocol === 'chrome-error:') {
+      return JSON.stringify({ ok: false, stage: 'chrome_error', url: location.href, title: document.title });
+    }
+    // Grok navigates from / to /c/... after submit, which clears window
+    // variables. Embed the prompt so user-message nodes remain excludable
+    // across that navigation.
+    const prompt = ${JSON.stringify(expectedPrompt)} || window.__terafabxGrokPrompt || '';
     const visible = (node) => {
       if (!node) return false;
       const rect = node.getBoundingClientRect();
@@ -456,6 +506,12 @@ function buildGrokReadEvalScript() {
     const isGenerating = [...document.querySelectorAll('button')].some((button) => /모델 응답 중지|Stop generating|Stop response/i.test(clean(button.getAttribute('aria-label') || button.innerText || '')));
     const looksNew = text && (nodes.length > Number(baseline.count || 0) || text !== clean(baseline.text || ''));
     const looksComplete = text.length >= 40 && !/^(Thinking|Analyzing|생각\s*중|분석\s*중)/i.test(text);
+    const jsonCandidate = text.replace(/^\x60\x60\x60(?:json)?\s*/i, '').replace(/\s*\x60\x60\x60$/, '').trim();
+    let looksJsonComplete = false;
+    try {
+      const parsed = JSON.parse(jsonCandidate);
+      looksJsonComplete = Boolean(parsed && typeof parsed === 'object');
+    } catch {}
     if (looksNew && text === window.__terafabxGrokLastText) window.__terafabxGrokStableCount = Number(window.__terafabxGrokStableCount || 0) + 1;
     else {
       window.__terafabxGrokStableCount = 0;
@@ -469,7 +525,7 @@ function buildGrokReadEvalScript() {
 }
 
 function buildGrokBatchCommandChunks(prompt, url, timeoutMs = DEFAULT_TIMEOUT_MS, random = Math.random) {
-  const readScript = buildGrokReadEvalScript();
+  const readScript = buildGrokReadEvalScript(prompt);
   const initialCommands = [
     "batch",
     "--bail",
@@ -488,13 +544,15 @@ function buildGrokBatchCommandChunks(prompt, url, timeoutMs = DEFAULT_TIMEOUT_MS
   const pollMs = 3000;
   const maxPolls = Math.max(1, Math.min(72, Math.ceil(timeoutMs / pollMs)));
   const chunks = [];
-  for (let offset = 0; offset < maxPolls; offset += BATCH_POLL_CHUNK_SIZE) {
+  for (let offset = 0; offset < maxPolls;) {
     const commands = offset === 0 ? [...initialCommands] : ["batch", "--bail"];
-    const pollCount = Math.min(BATCH_POLL_CHUNK_SIZE, maxPolls - offset);
+    const chunkSize = offset === 0 ? INITIAL_BATCH_POLL_CHUNK_SIZE : BATCH_POLL_CHUNK_SIZE;
+    const pollCount = Math.min(chunkSize, maxPolls - offset);
     for (let index = 0; index < pollCount; index += 1) {
       commands.push(`wait ${randomHumanDelayMs(random, 2600, 4200)}`, `eval -b ${encodeEval(readScript)}`);
     }
     chunks.push(commands);
+    offset += pollCount;
   }
   return chunks;
 }
@@ -804,10 +862,14 @@ async function main() {
 }
 
 if (require.main === module) {
+  process.once("SIGTERM", () => {
+    process.stderr.write(`[grok_runner_signal] pid=${process.pid} signal=SIGTERM\n`);
+    process.exit(143);
+  });
   main().catch((error) => {
     process.stderr.write(`${error.stack || error.message}\n`);
     process.exit(1);
   });
 }
 
-module.exports = { DEFAULT_GROK_URL, agentBrowserInvocation, buildGrokBatchCommandChunks, buildGrokBatchCommands, isGrokPromptEcho, parseDoneMarker, randomHumanDelayMs, runGrokPromptBatch };
+module.exports = { DEFAULT_GROK_URL, agentBrowserInvocation, buildGrokBatchCommandChunks, buildGrokBatchCommands, isGrokPromptEcho, namespaceProcessIds, parseDoneMarker, randomHumanDelayMs, runGrokPromptBatch };

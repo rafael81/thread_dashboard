@@ -4,6 +4,7 @@
   "description": "Threads discovery dashboard and Threads-to-X mirror server.",
   "main": "index.js",
   "scripts": {
+    "start": "node scripts/start-mirror-server.js",
     "build:dashboard": "vite build --config dashboard/vite.config.js",
     "export-runtime": "node scripts/export-runtime-state.js",
     "import-runtime": "node scripts/import-runtime-state.js",
@@ -11,7 +12,7 @@
     "memory": "node scripts/ai-memory.js",
     "report:prefill": "node scripts/prefill-quality-report.js",
     "audit:prefill": "node scripts/audit-terafabx-prefill-gemini.js",
-    "mirror-server": "node mirror_server.js",
+    "mirror-server": "node scripts/start-mirror-server.js",
     "test": "node --test"
   },
   "keywords": [],

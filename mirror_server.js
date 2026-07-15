@@ -60,6 +60,10 @@ const TERAFABX_IMAGE_ONLY_REPLY_EMOJI = process.env.TERAFABX_IMAGE_ONLY_REPLY_EM
 const TERAFABX_OWN_POST_REPLY_DELAY_MIN_MS = Number(process.env.TERAFABX_OWN_POST_REPLY_DELAY_MIN_MS || 10_000);
 const TERAFABX_OWN_POST_REPLY_DELAY_MAX_MS = Number(process.env.TERAFABX_OWN_POST_REPLY_DELAY_MAX_MS || 20_000);
 const TERAFABX_OWN_POST_REPLY_GEMINI_PORT_BASE = Number(process.env.TERAFABX_OWN_POST_REPLY_GEMINI_PORT_BASE || 9264);
+const TERAFABX_TODAY_POST_REPLY_INTERVAL_MS = Number(process.env.TERAFABX_TODAY_POST_REPLY_INTERVAL_MS || 10 * 60 * 1000);
+const TERAFABX_TODAY_POST_REPLY_MAX_SCROLLS = Number(process.env.TERAFABX_TODAY_POST_REPLY_MAX_SCROLLS || 36);
+const TERAFABX_TODAY_POST_REPLY_GEMINI_PORT_BASE = Number(process.env.TERAFABX_TODAY_POST_REPLY_GEMINI_PORT_BASE || 9274);
+const TERAFABX_TODAY_POST_REPLY_GROK_SESSION = process.env.TERAFABX_TODAY_POST_REPLY_GROK_SESSION || "terafabx-grok-today-post-reply";
 const DISCOVERY_MIN_VIRAL_SCORE = Number(process.env.DISCOVERY_MIN_VIRAL_SCORE || 3);
 const DISCOVERY_MAX_SCROLLS = Number(process.env.DISCOVERY_MAX_SCROLLS || 20);
 const GROK_BIN = process.env.GROK_BIN || "/Users/user/.local/bin/grok";
@@ -97,8 +101,12 @@ const TERAFABX_VERIFIED_REVIEW_X_PROFILE_DIR = process.env.TERAFABX_VERIFIED_REV
 const TERAFABX_COMMENT_X_CHROME_PORT = Number(process.env.TERAFABX_COMMENT_X_CHROME_PORT || 9236);
 const TERAFABX_COMMENT_X_PROFILE_DIR = process.env.TERAFABX_COMMENT_X_PROFILE_DIR || path.join(__dirname, ".data", "chrome-profiles", "terafabx-comment-x");
 const TERAFABX_COMMENT_X_LOCK_PATH = process.env.TERAFABX_COMMENT_X_LOCK_PATH || path.join(os.tmpdir(), `terafabx-comment-x${TERAFABX_COMMENT_X_CHROME_PORT}.lock`);
-const TERAFABX_COMMENT_PREFILL_TARGET = Number(process.env.TERAFABX_COMMENT_PREFILL_TARGET || 200);
-const TERAFABX_COMMENT_PREFILL_CONCURRENCY = Number(process.env.TERAFABX_COMMENT_PREFILL_CONCURRENCY || TERAFABX_BROWSER_CONCURRENCY_CAP);
+const TERAFABX_COMMENT_PREFILL_TARGET_RAW = String(process.env.TERAFABX_COMMENT_PREFILL_TARGET || "unlimited").trim();
+const TERAFABX_COMMENT_PREFILL_UNLIMITED = /^(?:unlimited|infinity|inf|0)$/i.test(TERAFABX_COMMENT_PREFILL_TARGET_RAW);
+const TERAFABX_COMMENT_PREFILL_TARGET = TERAFABX_COMMENT_PREFILL_UNLIMITED
+  ? null
+  : Math.max(1, Number(TERAFABX_COMMENT_PREFILL_TARGET_RAW) || 200);
+const TERAFABX_COMMENT_PREFILL_CONCURRENCY = Number(process.env.TERAFABX_COMMENT_PREFILL_CONCURRENCY || 1);
 const TERAFABX_COMMENT_PREFILL_GEMINI_PORT_BASE = Number(process.env.TERAFABX_COMMENT_PREFILL_GEMINI_PORT_BASE || 9254);
 const TERAFABX_PENDING_COMMENT_MAX_ATTEMPTS = Number(process.env.TERAFABX_PENDING_COMMENT_MAX_ATTEMPTS || 3);
 const TERAFABX_PENDING_COMMENT_TRANSIENT_MAX_ATTEMPTS = Number(process.env.TERAFABX_PENDING_COMMENT_TRANSIENT_MAX_ATTEMPTS || 12);
@@ -166,10 +174,22 @@ let discoveryDbPromise = null;
 let terafabxBusy = false;
 let terafabxOwnPostReplyBusy = false;
 let terafabxOwnPostReplySchedulerBusy = false;
+let terafabxTodayPostReplyBusy = false;
 let terafabxCommentPrefillBusy = false;
 let terafabxCommentPrefillLastStartedAt = 0;
 let terafabxCommentPrefillDeferredTimer = null;
 let terafabxCommentPrefillDeferredAt = 0;
+let terafabxCommentPrefillRuntime = {
+  status: "idle",
+  stage: "idle",
+  lastStartedAt: null,
+  lastFinishedAt: null,
+  lastError: null,
+  requested: 0,
+  selected: 0,
+  queued: 0,
+  failed: 0,
+};
 let terafabxSchedulerBusy = false;
 let terafabxCommentSchedulerBusy = false;
 let terafabxSchedulerStartedAt = null;
@@ -1036,6 +1056,7 @@ function removeScheduledReplyItem(canonicalUrl) {
 function loadTerafabxState() {
   const defaults = {
     commentEnabled: false,
+    commentPrefillOnly: false,
     heartEnabled: false,
     followEnabled: false,
     verifiedCommentReviewEnabled: false,
@@ -1094,6 +1115,13 @@ function loadTerafabxState() {
     lastOwnPostReplyError: null,
     lastOwnPostReplyTarget: null,
     lastOwnPostReplyUrl: null,
+    todayPostReplyEnabled: false,
+    todayPostReplyManualRequested: false,
+    todayPostReplyLastRunAt: null,
+    todayPostReplyLastStatus: "idle",
+    todayPostReplyLastError: null,
+    todayPostReplyLastCompletedDate: null,
+    todayPostReplyLastSummary: null,
   };
   return { ...defaults, ...readJsonFile(TERAFABX_STATE_PATH, defaults) };
 }
@@ -1307,6 +1335,21 @@ function upsertTerafabxCommentReview(record) {
   return { record: next, queue: saveTerafabxCommentReviewQueue(rows.slice(0, TERAFABX_VERIFIED_REVIEW_TARGET_COUNT * 2)) };
 }
 
+function terafabxPendingCommentPolicyFailure(item = {}) {
+  const contextSafety = assessTerafabxGrokContextSafety({
+    targetText: item.targetText,
+    rootPostText: item.rootPostText,
+  }, item.grokContext);
+  if (!contextSafety.ok) {
+    return { reason: contextSafety.reason || "unsafe_grok_context", errors: [] };
+  }
+  const policy = assessTerafabxCurrentCommentPolicy(item);
+  if (!policy.ok) {
+    return { reason: "current_comment_policy", errors: policy.errors || [] };
+  }
+  return null;
+}
+
 function pendingTerafabxCommentPosts(state = loadTerafabxState()) {
   const postedTargets = new Set((state.commentHistory || [])
     .map((item) => normalizeXStatusUrl(item.targetUrl || ""))
@@ -1315,7 +1358,8 @@ function pendingTerafabxCommentPosts(state = loadTerafabxState()) {
     ? state.pendingCommentPosts.filter((item) => {
       if (!item || item.status === "posted") return false;
       const targetUrl = normalizeXStatusUrl(item.targetUrl || "");
-      return !postedTargets.has(targetUrl);
+      if (postedTargets.has(targetUrl)) return false;
+      return !terafabxPendingCommentPolicyFailure(item);
     })
     : [];
 }
@@ -1324,6 +1368,18 @@ function enqueueTerafabxPendingCommentPost(record, options = {}) {
   const previous = loadTerafabxState();
   const pending = pendingTerafabxCommentPosts(previous);
   const targetUrl = normalizeXStatusUrl(record.targetUrl || "");
+  const contextSafety = assessTerafabxGrokContextSafety({
+    targetText: record.targetText,
+    rootPostText: record.rootPostText,
+  }, record.grokContext);
+  if (!contextSafety.ok) {
+    logEvent("terafabx_comment_pending_enqueue_skipped", {
+      targetUrl,
+      reason: contextSafety.reason,
+      source: options.source || record.source || "",
+    });
+    return { ...record, targetUrl, skipped: true, reason: contextSafety.reason };
+  }
   const alreadyPosted = (previous.commentHistory || []).some((item) => normalizeXStatusUrl(item.targetUrl || "") === targetUrl);
   if (alreadyPosted) {
     logEvent("terafabx_comment_pending_enqueue_skipped", { targetUrl, reason: "already_posted", source: options.source || record.source || "" });
@@ -1339,7 +1395,7 @@ function enqueueTerafabxPendingCommentPost(record, options = {}) {
   };
   const seenTargets = Array.from(new Set([targetUrl, ...(previous.seenTargets || [])])).slice(0, 500);
   const update = {
-    pendingCommentPosts: [item, ...filtered].slice(0, 300),
+    pendingCommentPosts: [item, ...filtered],
     seenTargets,
   };
   if (options.updateLastRun !== false) {
@@ -1909,7 +1965,7 @@ function normalizeTerafabxGrokResult(value) {
     || "";
   return {
     reply: validateTerafabxReply(stripTerafabxListPrefix(replyRaw)),
-    contextSummary: cleanSocialText(source.contextSummary || source.context_summary || source.analysis || source.context || "").slice(0, 1200),
+    contextSummary: cleanSocialText(source.contextSummary || source.context_summary || source.summary || source.analysis || source.context || "").slice(0, 1200),
     keyPoints: normalizeTerafabxGrokKeyPoints(source.keyPoints || source.key_points || source.points || []),
     rawPreview: String(source.rawPreview || source.raw || "").slice(0, 1200),
   };
@@ -1921,6 +1977,7 @@ function normalizeTerafabxContextResult(value) {
     contextSummary: cleanSocialText(source.contextSummary || source.context_summary || source.summary || source.analysis || source.context || "").slice(0, 1200),
     keyPoints: normalizeTerafabxGrokKeyPoints(source.keyPoints || source.key_points || source.points || []),
     rawPreview: String(source.rawPreview || source.raw || "").slice(0, 1200),
+    provider: String(source.provider || ""),
   };
 }
 
@@ -1958,8 +2015,31 @@ function parseTerafabxGrokContextBatch(raw, targets = []) {
 
 function isTerafabxGrokNonJsonLimitText(raw) {
   const text = String(raw || "").trim();
-  return !text.startsWith("{")
-    && /you['’]?ve\s+reached|limit\s+of\s+\d+\s+grok|questions?\s+per\s+\d+\s+hours?/i.test(text);
+  return /you['’]?ve\s+reached|limit\s+of\s+\d+\s+grok|questions?\s+per\s+\d+\s+hours?|주간\s*한도에\s*도달했습니다|\d{1,2}월\s*\d{1,2}일에\s*초기화됩니다|quota_limit/i.test(text);
+}
+
+function parseTerafabxGrokQuotaResetAt(raw, now = new Date()) {
+  const match = String(raw || "").match(/(\d{1,2})월\s*(\d{1,2})일에\s*초기화/);
+  if (!match) return new Date(now.getTime() + 6 * 60 * 60 * 1000).toISOString();
+  const kstYear = Number(new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Seoul", year: "numeric" }).format(now));
+  const month = String(Number(match[1])).padStart(2, "0");
+  const day = String(Number(match[2])).padStart(2, "0");
+  let resetAt = new Date(`${kstYear}-${month}-${day}T00:00:00+09:00`);
+  if (resetAt.getTime() <= now.getTime()) resetAt = new Date(`${kstYear + 1}-${month}-${day}T00:00:00+09:00`);
+  return resetAt.toISOString();
+}
+
+function terafabxGrokIndividualBackoffUntil(nowMs = Date.now(), durationMs = 10 * 60 * 1000) {
+  return new Date(Number(nowMs) + Math.max(60_000, Number(durationMs || 0))).toISOString();
+}
+
+function activeTerafabxGrokQuotaBlocker(state = loadTerafabxState(), now = Date.now()) {
+  const until = Date.parse(state.grokQuotaBackoffUntil || "");
+  if (!Number.isFinite(until) || until <= now) return null;
+  return {
+    until: new Date(until).toISOString(),
+    message: state.grokQuotaMessage || `Grok 주간 사용량 제한으로 ${new Date(until).toISOString()}까지 문맥 생성을 중단합니다.`,
+  };
 }
 
 function terafabxGrokContextForRecord(value) {
@@ -1968,12 +2048,30 @@ function terafabxGrokContextForRecord(value) {
     summary: grok.contextSummary,
     keyPoints: grok.keyPoints,
     rawPreview: grok.rawPreview,
+    provider: String(value?.provider || ""),
   };
 }
 
 function hasDetailedTerafabxGrokContext(value) {
   const grok = normalizeTerafabxContextResult(value);
   return grok.contextSummary.length >= 30 && grok.keyPoints.length >= 1;
+}
+
+function isConfirmedTerafabxGrokContext(value) {
+  const provider = String(value?.provider || "");
+  return hasDetailedTerafabxGrokContext(value)
+    && /^(?:web|cli)-context$/.test(provider)
+    && !isTerafabxGrokContextFallback(value)
+    && value?.rawPreview !== "local-root-context-fallback";
+}
+
+function assertConfirmedTerafabxGrokContext(value) {
+  if (!isConfirmedTerafabxGrokContext(value)) {
+    const error = new Error("Grok 상세 문맥 분석 성공 기록이 없어 댓글·대댓글을 게시하지 않습니다.");
+    error.code = "TERAFABX_GROK_CONTEXT_REQUIRED";
+    throw error;
+  }
+  return value;
 }
 
 function isTerafabxGrokContextFallback(value) {
@@ -2312,7 +2410,7 @@ const TERAFABX_CLICHE_PENALTIES = [
   { pattern: /작성자님(?:도|께서|의)?/i, points: 12, label: "작성자님 호칭" },
   { pattern: /재충전의 시간 보내세요|행복한 하루 보내세요|좋은 일만 가득/i, points: 12, label: "정형화된 덕담" },
   { pattern: /인상적이네요|응원합니다|따뜻한 글 감사합니다/i, points: 8, label: "범용 자동댓글 표현" },
-  { pattern: /진짜\s*신기하게|딱\s*보이지\s*않나요|계속\s*보게\s*되네요|완전\s*신세계(?:네요)?|신박해서\s*계속/i, points: 16, label: "반복 감탄 자동댓글" },
+  { pattern: /진짜\s*신기하게|딱\s*보이지\s*않나요|계속\s*보게\s*되네요|웃음이\s*터지네요|완전\s*신세계(?:네요)?|신박해서\s*계속/i, points: 16, label: "반복 감탄 자동댓글" },
   { pattern: /실용적인\s*팁이네요|효율성은\s*대단하네요|현실이\s*씁쓸하네요/i, points: 18, label: "추상적 AI 요약체" },
   { pattern: /힘들어도\s*힘내세요/i, points: 18, label: "문맥 없는 상투적 응원" },
 ];
@@ -2323,6 +2421,15 @@ function assessTerafabxLanguageQuality(reply) {
   if (/^년\s*전(?:이나|에도|부터|과|보다|\s)/.test(text)) errors.push("missing_leading_year_number");
   if (/표정이\s*.{0,14}(?:하다는|같다는|같은|라는)?\s*얼굴(?:이|이네|이네요|처럼)/.test(text)) {
     errors.push("redundant_expression_face_nouns");
+  }
+  if (/(?:간이|간도)\s*(?:엄청\s*|너무\s*)?부었|제정신이\s*아니|정신\s*나갔/i.test(text)) {
+    errors.push("tone_escalation_insult");
+  }
+  if (/놀라(?:게|키|서|고|는|운).{0,18}놀라|웃(?:기|겨|긴|고|음).{0,18}웃(?:기|겨|긴|고|음)/i.test(text)) {
+    errors.push("repeated_reaction_stem");
+  }
+  if (/(?:먹어|가|써|해|겪어|사|보)봤(?:는데|더니|어요|어|고)|(?:했|였|맛이었|보이)더라고요|(?:것\s*같|듯하)더라|더라고(?:요)?(?:[.!?~ㅋㅎ]*)$|안\s*따라\s*했(?:는데|더니|어요)?|볼\s*때마다/i.test(text)) {
+    errors.push("fabricated_personal_experience");
   }
   return {
     ok: errors.length === 0,
@@ -2364,7 +2471,7 @@ function deriveTerafabxCommentQualityFeedback(commentHistory = [], options = {})
   if (clicheCounts.has("작성자님 호칭")) rules.push("'작성자님' 호칭을 쓰지 않는다.");
   if (clicheCounts.has("정형화된 덕담")) rules.push("'재충전의 시간 보내세요', '행복한 하루 보내세요' 같은 끝인사를 쓰지 않는다.");
   if (clicheCounts.has("범용 자동댓글 표현")) rules.push("'인상적이네요', '응원합니다', '따뜻한 글 감사합니다' 같은 어느 글에나 붙는 표현을 쓰지 않는다.");
-  if (clicheCounts.has("반복 감탄 자동댓글")) rules.push("'진짜 신기하게', '딱 보이지 않나요', '계속 보게 되네요'처럼 반복되는 감탄 템플릿을 쓰지 않는다.");
+  if (clicheCounts.has("반복 감탄 자동댓글")) rules.push("'진짜 신기하게', '딱 보이지 않나요', '계속 보게 되네요', '웃음이 터지네요'처럼 반복되는 감탄 템플릿을 쓰지 않는다.");
   if (averageIndependentScore !== null && averageIndependentScore < 90) {
     rules.push("독립 심사 평균이 낮으므로 원문 고유 명사나 행동 한 가지를 짚고, 요약 반복 대신 짧은 개인 반응을 쓴다.");
   }
@@ -2384,6 +2491,9 @@ function terafabxCommentQualityPromptLines() {
   const dynamicRules = Array.isArray(feedback.rules) ? feedback.rules.slice(0, 5) : [];
   return [
     "상투 표현 금지: 마음이 훈훈해지네요, 작성자님, 재충전의 시간 보내세요, 행복한 하루 보내세요, 인상적이네요, 응원합니다.",
+    "원문이 가벼운 놀람·호기심이면 '간이 부었다', '제정신이 아니다', '정신 나갔다'처럼 사람을 비난하는 표현으로 감정 강도를 높이지 않는다.",
+    "한 댓글 안에서 '놀라게 해서 놀랐다', '웃겨서 웃었다'처럼 같은 반응 어근을 반복하지 않는다.",
+    "'진짜 신기하게', '계속 보게 되네요', '웃음이 터지네요'처럼 다른 글에도 반복해서 붙일 수 있는 감탄 템플릿을 쓰지 않는다.",
     "'마음에 와닿네요', '도움이 되면 좋겠네요', '미리 저장해 둡니다'처럼 대상만 바꿔 반복 가능한 참여 유도형 종결은 그대로 두지 말고, 원문의 구체 장면에 반응하는 실제 구어체인지 엄격히 판단해라.",
     "댓글 작성자가 실제로 먹어 봤다·가 봤다·겪었다는 근거가 없으면 '나도', '~해봤는데', '~더라'처럼 직접 경험을 꾸며내지 마라. 제공된 영상·사진을 보고 한 관찰은 가능하다.",
     "원문이 한 번의 사건이나 특정 연도만 말하면 '매년', '항상', '원래', '늘'처럼 반복되는 사실로 확대하지 마라. 원문의 가장 구별되는 인물·행동·숫자를 우선 짚어라.",
@@ -2513,6 +2623,19 @@ function parseTerafabxGeminiBatchFinalJudge(raw, judgedItems = []) {
   });
 }
 
+function resolveTerafabxGeminiScriptPath() {
+  const candidates = [
+    process.env.TERAFABX_GEMINI_SCRIPT_PATH,
+    path.join(NAVER_BLOG_ADPOST_ROOT, "scripts", "gemini_custom_prompt.js"),
+    path.join(__dirname, "scripts", "gemini_custom_prompt.js"),
+  ].filter(Boolean).map((item) => path.resolve(item));
+  return candidates.find((item) => fs.existsSync(item)) || candidates.at(-1);
+}
+
+function terafabxGeminiScriptCwd(scriptPath) {
+  return path.dirname(path.dirname(path.resolve(scriptPath)));
+}
+
 async function judgeTerafabxReplyWithGeminiHeadless(target, grokInput, finalReply, options = {}) {
   const prompt = terafabxFinalJudgePrompt(target, grokInput, finalReply);
   const judgeId = `terafabx-gemini-final-judge-${new Date().toISOString().replace(/[:.]/g, "-")}-${target.targetId || "target"}`;
@@ -2526,10 +2649,10 @@ async function judgeTerafabxReplyWithGeminiHeadless(target, grokInput, finalRepl
   logEvent("terafabx_gemini_final_judge_start", { targetUrl: target.url, finalReply, port: chromePort, runDir });
   try {
     await ensureTerafabxGeminiHeadlessBrowser({ port: chromePort, profileDir });
-    const scriptPath = path.join(NAVER_BLOG_ADPOST_ROOT, "scripts", "gemini_custom_prompt.js");
+    const scriptPath = resolveTerafabxGeminiScriptPath();
     if (!fs.existsSync(scriptPath)) throw new Error(`Gemini Web 스크립트가 없습니다: ${scriptPath}`);
     const result = await runTerafabxGeminiScript(scriptPath, ["--prompt", promptPath, "--out", outPath, "--cdp", `http://127.0.0.1:${chromePort}`, "--min-length", "6"], {
-      cwd: NAVER_BLOG_ADPOST_ROOT,
+      cwd: terafabxGeminiScriptCwd(scriptPath),
       timeoutMs: Number(options.finalJudgeTimeoutMs || 240000),
       chromePort,
       profileDir,
@@ -2678,26 +2801,48 @@ function terafabxCommentPrefillWorkerResources(workerIndex) {
   };
 }
 
+function terafabxTodayPostReplyWorkerResources(workerIndex) {
+  const index = Math.max(0, Number(workerIndex || 0));
+  return {
+    workerIndex: index,
+    grokContextSession: `${TERAFABX_TODAY_POST_REPLY_GROK_SESSION}-context-${index + 1}`,
+    chromePort: TERAFABX_TODAY_POST_REPLY_GEMINI_PORT_BASE + index,
+    profileDir: `${TERAFABX_GEMINI_PROFILE_DIR}-today-post-reply-${index + 1}`,
+  };
+}
+
+function terafabxOwnPostReplyWorkerResources(workerIndex) {
+  const index = Math.max(0, Number(workerIndex || 0));
+  return {
+    workerIndex: index,
+    grokContextSession: `${TERAFABX_GROK_WEB_SESSION}-own-post-reply-context-${index + 1}`,
+    chromePort: TERAFABX_OWN_POST_REPLY_GEMINI_PORT_BASE + index,
+    profileDir: terafabxOwnPostReplyGeminiProfileDir(index),
+  };
+}
+
 async function prepareTerafabxCommentPrefillWorkers(workerCount) {
   const resources = Array.from({ length: Math.max(0, Number(workerCount || 0)) }, (_, index) => (
     terafabxCommentPrefillWorkerResources(index)
   ));
   await syncTerafabxGrokWebState();
-  const profiles = resources.map((resource) => ({
-    ...resource,
-    ...seedTerafabxGeminiProfileFromTemplate(resource.profileDir),
-  }));
-  const invalidProfiles = profiles.filter((item) => !terafabxGeminiProfileLooksSeeded(item.profileDir));
-  if (invalidProfiles.length) {
-    throw new Error(`Gemini worker 프로필 준비 실패: ${invalidProfiles.map((item) => item.workerIndex + 1).join(", ")}`);
-  }
+  const profiles = resources.map((resource) => {
+    const seed = seedTerafabxGeminiProfileFromTemplate(resource.profileDir);
+    // Gemini Web currently supports the signed-out flow. A missing cookie
+    // template must not block prefill; Chrome will initialize an isolated
+    // worker profile on first launch.
+    fs.mkdirSync(resource.profileDir, { recursive: true });
+    return { ...resource, ...seed, profileReady: true };
+  });
   logEvent("terafabx_comment_prefill_workers_ready", {
     count: resources.length,
-    workers: resources.map((item) => ({
+    workers: profiles.map((item) => ({
       workerIndex: item.workerIndex,
       grokContextSession: item.grokContextSession,
       chromePort: item.chromePort,
       profileDir: item.profileDir,
+      profileSeeded: item.seeded === true,
+      profileSeedReason: item.reason || null,
     })),
   });
   return resources;
@@ -2866,10 +3011,10 @@ async function reviewTerafabxReplyWithGemini(target, grokInput, options = {}) {
   let browser = null;
   try {
     browser = await ensureTerafabxGeminiHeadlessBrowser({ port: chromePort, profileDir });
-    const scriptPath = path.join(NAVER_BLOG_ADPOST_ROOT, "scripts", "gemini_custom_prompt.js");
+    const scriptPath = resolveTerafabxGeminiScriptPath();
     if (!fs.existsSync(scriptPath)) throw new Error(`Gemini Web 스크립트가 없습니다: ${scriptPath}`);
     const result = await runTerafabxGeminiScript(scriptPath, ["--prompt", promptPath, "--out", outPath, "--cdp", `http://127.0.0.1:${chromePort}`, "--min-length", "6"], {
-      cwd: NAVER_BLOG_ADPOST_ROOT,
+      cwd: terafabxGeminiScriptCwd(scriptPath),
       timeoutMs: 240000,
       chromePort,
       profileDir,
@@ -2891,7 +3036,7 @@ async function reviewTerafabxReplyWithGemini(target, grokInput, options = {}) {
       fs.writeFileSync(repairPromptPath, terafabxGeminiReviewPrompt(target, repairGrok, repairFeedback));
       logEvent("terafabx_gemini_quality_rewrite_start", { targetUrl: target.url, repairFeedback, runDir });
       const repairRun = await runTerafabxGeminiScript(scriptPath, ["--prompt", repairPromptPath, "--out", repairOutPath, "--cdp", `http://127.0.0.1:${chromePort}`, "--min-length", "6"], {
-        cwd: NAVER_BLOG_ADPOST_ROOT,
+        cwd: terafabxGeminiScriptCwd(scriptPath),
         timeoutMs: 240000,
         chromePort,
         profileDir,
@@ -2928,13 +3073,13 @@ async function generateTerafabxPreparedReplyBatchWithGemini(items = [], options 
   const outPath = path.join(runDir, "gemini-batch-generate.txt");
   const chromePort = Number(options.chromePort || TERAFABX_COMMENT_PREFILL_GEMINI_PORT_BASE);
   const profileDir = options.profileDir || `${TERAFABX_GEMINI_PROFILE_DIR}-comment-prefill-1`;
-  const scriptPath = path.join(NAVER_BLOG_ADPOST_ROOT, "scripts", "gemini_custom_prompt.js");
+  const scriptPath = resolveTerafabxGeminiScriptPath();
   const timeoutMs = Math.max(120_000, Number(options.timeoutMs || 300_000));
   fs.writeFileSync(promptPath, terafabxGeminiBatchGeneratePrompt(inputs));
   logEvent("terafabx_gemini_batch_generate_start", { count: inputs.length, chromePort, runDir });
   await ensureTerafabxGeminiHeadlessBrowser({ port: chromePort, profileDir });
   const run = await runTerafabxGeminiScript(scriptPath, ["--prompt", promptPath, "--out", outPath, "--cdp", `http://127.0.0.1:${chromePort}`, "--min-length", "20"], {
-    cwd: NAVER_BLOG_ADPOST_ROOT,
+    cwd: terafabxGeminiScriptCwd(scriptPath),
     timeoutMs,
     chromePort,
     profileDir,
@@ -3005,7 +3150,7 @@ async function reviewTerafabxPreparedReplyBatchWithGemini(items = [], options = 
   const chromePort = Number(options.chromePort || TERAFABX_GEMINI_CHROME_PORT);
   const profileDir = options.profileDir || TERAFABX_GEMINI_PROFILE_DIR;
   const timeoutMs = Math.max(120_000, Number(options.timeoutMs || TERAFABX_OWN_POST_REPLY_BATCH_REVIEW_TIMEOUT_MS));
-  const scriptPath = path.join(NAVER_BLOG_ADPOST_ROOT, "scripts", "gemini_custom_prompt.js");
+  const scriptPath = resolveTerafabxGeminiScriptPath();
   if (!fs.existsSync(scriptPath)) throw new Error(`Gemini Web 스크립트가 없습니다: ${scriptPath}`);
   if (!options.skipReview) fs.writeFileSync(reviewPromptPath, terafabxGeminiBatchReviewPrompt(inputs));
   logEvent("terafabx_gemini_batch_review_start", {
@@ -3027,7 +3172,7 @@ async function reviewTerafabxPreparedReplyBatchWithGemini(items = [], options = 
       }));
     } else {
       const reviewRun = await runTerafabxGeminiScript(scriptPath, ["--prompt", reviewPromptPath, "--out", reviewOutPath, "--cdp", `http://127.0.0.1:${chromePort}`, "--min-length", "20"], {
-        cwd: NAVER_BLOG_ADPOST_ROOT,
+        cwd: terafabxGeminiScriptCwd(scriptPath),
         timeoutMs,
         chromePort,
         profileDir,
@@ -3058,7 +3203,7 @@ async function reviewTerafabxPreparedReplyBatchWithGemini(items = [], options = 
     let judgeRun;
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       judgeRun = await runTerafabxGeminiScript(scriptPath, ["--prompt", judgePromptPath, "--out", judgeOutPath, "--cdp", `http://127.0.0.1:${chromePort}`, "--min-length", "20"], {
-        cwd: NAVER_BLOG_ADPOST_ROOT,
+        cwd: terafabxGeminiScriptCwd(scriptPath),
         timeoutMs,
         chromePort,
         profileDir,
@@ -3224,10 +3369,10 @@ async function generateTerafabxReplyWithGeminiFallback(target, options = {}) {
   let browser = null;
   try {
     browser = await ensureTerafabxGeminiHeadlessBrowser({ port: chromePort, profileDir });
-    const scriptPath = path.join(NAVER_BLOG_ADPOST_ROOT, "scripts", "gemini_custom_prompt.js");
+    const scriptPath = resolveTerafabxGeminiScriptPath();
     if (!fs.existsSync(scriptPath)) throw new Error(`Gemini Web 스크립트가 없습니다: ${scriptPath}`);
     const result = await runTerafabxGeminiScript(scriptPath, ["--prompt", promptPath, "--out", outPath, "--cdp", `http://127.0.0.1:${chromePort}`, "--min-length", "30"], {
-      cwd: NAVER_BLOG_ADPOST_ROOT,
+      cwd: terafabxGeminiScriptCwd(scriptPath),
       timeoutMs: 240000,
       chromePort,
       profileDir,
@@ -3263,7 +3408,7 @@ async function generateTerafabxReplyWithGeminiFallback(target, options = {}) {
   }
 }
 
-async function getExistingXPage(url = "https://x.com/home") {
+async function getExistingXPage(url = `https://x.com/${REQUIRED_X_HANDLE}`) {
   const tab = await requestJson("PUT", `/json/new?${encodeURIComponent(url)}`);
   const page = new CdpPage(tab, CHROME_PORT);
   await page.open();
@@ -3359,7 +3504,7 @@ async function withTerafabxBrowserSetupCleanup(setup, cleanup, onError = null) {
   }
 }
 
-async function getVerifiedReviewXHeadlessPage(url = "https://x.com/home") {
+async function getVerifiedReviewXHeadlessPage(url = `https://x.com/${REQUIRED_X_HANDLE}`) {
   let page = null;
   return withTerafabxBrowserSetupCleanup(async () => {
     await ensureTerafabxVerifiedReviewXHeadlessBrowser();
@@ -3375,7 +3520,7 @@ async function getVerifiedReviewXHeadlessPage(url = "https://x.com/home") {
   });
 }
 
-async function getTerafabxCommentXHeadlessPage(url = "https://x.com/home") {
+async function getTerafabxCommentXHeadlessPage(url = `https://x.com/${REQUIRED_X_HANDLE}`) {
   logEvent("terafabx_comment_x_headless_open_start", { port: TERAFABX_COMMENT_X_CHROME_PORT, url });
   let page = null;
   return withTerafabxBrowserSetupCleanup(async () => {
@@ -3383,6 +3528,7 @@ async function getTerafabxCommentXHeadlessPage(url = "https://x.com/home") {
     logEvent("terafabx_comment_x_headless_browser_ready", { port: TERAFABX_COMMENT_X_CHROME_PORT, url });
     page = await newPageForPort(TERAFABX_COMMENT_X_CHROME_PORT, "about:blank");
     logEvent("terafabx_comment_x_headless_page_opened", { port: TERAFABX_COMMENT_X_CHROME_PORT, url, tabId: page.tab.id });
+    await page.send("Page.bringToFront", {}, 3000).catch(() => null);
     await copyXCookiesToPage(page);
     logEvent("terafabx_comment_x_headless_cookies_ready", { port: TERAFABX_COMMENT_X_CHROME_PORT, url, tabId: page.tab.id });
     await page.navigate(url, 2500);
@@ -3512,8 +3658,7 @@ async function discoverTerafabxCommentTargetsUnlocked(limit = 1) {
         };
       }).filter((item) => item.url);
     })()`);
-    const banned = /(crypto|airdrop|카지노|도박|정치|대통령|국회|살인|사망|참사|재난|전쟁|섹스|성관계|야동|미성년|중학생|초등|아동|성폭|강간|자살|폭행|칼|총|마약|투자권유|코인|비트코인|에어드랍)/i;
-    const candidates = articles.filter((item) => !item.replyCtx && !item.replyRestricted && !item.promoted && item.url && !item.url.includes("/terafabXai/status/") && !seen.has(item.url) && !banned.test(item.text));
+    const candidates = articles.filter((item) => !item.replyCtx && !item.replyRestricted && !item.promoted && item.url && !item.url.includes("/terafabXai/status/") && !seen.has(item.url) && !TERAFABX_COMMENT_TARGET_BANNED_RE.test(item.text));
     logEvent("terafabx_comment_target_candidates", { articleCount: articles.length, candidateCount: candidates.length, limit: targetLimit });
     const selected = [];
     for (const candidate of candidates.slice(0, 12)) {
@@ -3526,6 +3671,10 @@ async function discoverTerafabxCommentTargetsUnlocked(limit = 1) {
         }
         if (TERAFABX_COMMENT_TARGET_BANNED_RE.test(metadata.text)) {
           logEvent("terafabx_comment_target_skip", { url: candidate.url, reason: "api_banned_context", textPreview: metadata.text.slice(0, 180) });
+          continue;
+        }
+        if (terafabxAdCommentReason({ text: metadata.text })) {
+          logEvent("terafabx_comment_target_skip", { url: candidate.url, reason: "api_promotional_context", textPreview: metadata.text.slice(0, 180) });
           continue;
         }
         logEvent("terafabx_comment_target_selected_api", { url: metadata.url, targetId: metadata.id, textPreview: metadata.text.slice(0, 180), verified: metadata.authorVerified });
@@ -3587,7 +3736,36 @@ async function discoverTerafabxCommentTarget() {
   return targets[0];
 }
 
-const TERAFABX_COMMENT_TARGET_BANNED_RE = /(crypto|airdrop|staking|token|on-?chain|binance|exchange|wallet|blockchain|finance|financial|market|profit|loss|leverage|futures|\blong\b|\bshort\b|\binvest(?:ment|ing)?\b|\bfunding\b|\bfundrais(?:e|ing)\b|\brwa\b|\bnft\b|\bdefi\b|\bweb3\b|bullish|bearish|candle|slap|hit|fight|assault|violence|weapon|gun|war|death|killed|shoot|cruel|카지노|도박|정치|대통령|국회|살인|사망|참사|재난|전쟁|섹스|성관계|야동|미성년|중학생|초등|아동|성폭|강간|자살|폭행|폭력|잔인|때리|뺨|칼|총|포탄|마약|투자|주식|주가|양봉|음봉|장대양봉|상한가|하한가|매수|매도|매매|포지션|손실|수익|차트|트레이딩|금융|거래소|거래|암호화폐|코인|비트코인|에어드랍|에어드롭|토큰|스테이킹|온체인|블록체인|지갑|바이낸스)/i;
+const TERAFABX_COMMENT_TARGET_BANNED_RE = /(crypto|airdrop|staking|token|on-?chain|binance|exchange|wallet|blockchain|finance|financial|market|profit|loss|leverage|futures|fraud|scam|\blong\b|\bshort\b|\binvest(?:ment|ing)?\b|\bfunding\b|\bfundrais(?:e|ing)\b|\brwa\b|\bnft\b|\bdefi\b|\bweb3\b|bullish|bearish|candle|slap|hit|fight|assault|violence|weapon|gun|war|death|killed|shoot|cruel|카지노|도박|가챠|전자담배|전담\s*가게|정치|대통령|국회|살인|사망|참사|재난|화재|산불|방화|전쟁|섹스|성관계|야동|임신|결혼|출산|자녀|나이\s*차|가족\s*시나리오|연애|미성년|중학생|고등학생|고교|청소년|초등|아동|성폭|강간|자살|폭행|폭력|잔인|때리|뺨|칼|총|포탄|마약|독성|독거미|사고\s*위험|부상\s*위험|극심한\s*고통|다치|위험\s*행동|위험성|스턴트|고속\s*차량|아찔|사기|스캠|바가지|기만|속임|좃|좆|씨발|시발|개새끼|병신|ㅅㅂ|ㅈㄴ|수술|양악|성형|질병|진단|치료|병원|장애|중안부|인중|팔자\s*주름|얼굴\s*윤곽|뷰티|체형|몸매|복부\s*라인|볼륨\s*체형|투자|주식|주가|양봉|음봉|장대양봉|상한가|하한가|매수|매도|매매|포지션|손실|수익|차트|트레이딩|금융|거래소|거래|암호화폐|코인|비트코인|에어드랍|에어드롭|토큰|스테이킹|온체인|블록체인|지갑|바이낸스)/i;
+
+function assessTerafabxGrokContextSafety(target = {}, contextInput = {}) {
+  const context = normalizeTerafabxContextResult(contextInput);
+  if (!isConfirmedTerafabxGrokContext(context)) {
+    return { ok: false, reason: "grok_context_unconfirmed" };
+  }
+  if (/(?:영상|비디오).{0,30}(?:직접\s*확인(?:이)?\s*(?:불가|어렵)|정확한.{0,15}(?:장면|내용).{0,15}(?:불가|알\s*수\s*없))/i.test(context.contextSummary)) {
+    return { ok: false, reason: "grok_context_insufficient" };
+  }
+  const combined = cleanSocialText([
+    target.targetText,
+    target.rootPostText,
+    context.contextSummary,
+    ...context.keyPoints,
+  ].filter(Boolean).join("\n"));
+  if (TERAFABX_COMMENT_TARGET_BANNED_RE.test(combined)) {
+    return { ok: false, reason: "sensitive_grok_context" };
+  }
+  if (/(공개\s*저격|저격하|욕설|신체\s*비하|외모\s*비하|몸매\s*비하|체중.{0,12}지적|인신공격|지속\s*공격|조롱하|harass(?:ment|ing)?|body\s*sham(?:e|ing))/i.test(combined)) {
+    return { ok: false, reason: "harassment_grok_context" };
+  }
+  if (/(?:답글|댓글|리플).{0,16}\b(?:[1-9]\d{1,}|백|천)\s*개.{0,10}(?:도전|달기|작성)|(?:[1-9]\d{1,}|백|천)\s*개.{0,10}(?:답글|댓글|리플)/i.test(combined)) {
+    return { ok: false, reason: "engagement_farming_context" };
+  }
+  if (terafabxAdCommentReason({ text: combined })) {
+    return { ok: false, reason: "promotional_grok_context" };
+  }
+  return { ok: true, reason: null };
+}
 
 function terafabxAdCommentReason(tweet = {}) {
   const text = cleanSocialText([
@@ -3713,6 +3891,72 @@ async function fetchFxTwitterTweetMetadata(statusUrl) {
   };
 }
 
+function isTerafabxTodayRootPostMetadata(metadata, dateKey = formatKstDateKey(), handle = REQUIRED_X_HANDLE) {
+  if (!metadata?.id || String(metadata.authorHandle || "").toLowerCase() !== String(handle || "").toLowerCase()) return false;
+  if (metadata.replyingToStatus) return false;
+  const created = metadata.createdTimestamp ? new Date(metadata.createdTimestamp * 1000) : new Date(metadata.createdAt || 0);
+  return Number.isFinite(created.getTime()) && formatKstDateKey(created) === dateKey;
+}
+
+function assessTerafabxTodayPostReplyCompletion(summary = {}) {
+  const conditions = [
+    { key: "today_posts_discovered", label: "오늘 @terafabXai 원글을 모두 찾음", met: summary.discoveryComplete === true },
+    { key: "all_posts_checked", label: "찾은 원글의 직접 대댓글을 모두 확인함", met: Number(summary.checkedRootCount || 0) === Number(summary.rootPostCount || 0) },
+    { key: "no_actionable_replies", label: "처리 가능한 인증 대댓글이 0건", met: Number(summary.remainingEligibleCount || 0) === 0 },
+    { key: "no_retryable_errors", label: "재시도해야 할 생성·검수·게시 오류가 0건", met: Number(summary.retryableErrorCount || 0) === 0 },
+  ];
+  return { complete: conditions.every((item) => item.met), conditions };
+}
+
+function terafabxReplyBatchFailureSignature(batch = {}) {
+  if ((batch.posted || []).length || !(batch.rejected || []).length) return "";
+  const errors = Array.from(new Set((batch.rejected || []).map((item) => String(item.error || "").trim()).filter(Boolean)));
+  return errors.length === 1 ? errors[0] : "";
+}
+
+async function discoverTerafabxTodayRootPosts(dateKey = formatKstDateKey()) {
+  return withTerafabxLock("today-post-reply-discovery", async () => {
+    const page = await newPageForPort(CHROME_PORT, `https://x.com/${REQUIRED_X_HANDLE}`);
+    try {
+      // Headed Chrome can suspend a newly-created background tab before X
+      // paints any authenticated UI. Bring only this disposable work tab to
+      // the front; closing it restores the user's previous tab.
+      await page.send("Page.bringToFront", {}, 3000).catch(() => null);
+      await closeXDialogs(page);
+      await withTimeout(verifyXAccount(page), 45_000, `X 로그인 계정 @${REQUIRED_X_HANDLE} 검증 시간 초과`);
+      logEvent("terafabx_today_post_reply_discovery_account_verified", { date: dateKey });
+      await withTimeout(page.navigate(`https://x.com/${REQUIRED_X_HANDLE}`, 8000), 15_000, "오늘 원글 프로필 이동 시간 초과");
+      logEvent("terafabx_today_post_reply_discovery_profile_ready", { date: dateKey });
+      const urls = new Set();
+      const scannedUrls = new Set();
+      let reachedPreviousDay = false;
+      let stagnant = 0;
+      for (let index = 0; index < TERAFABX_TODAY_POST_REPLY_MAX_SCROLLS && stagnant < 6; index += 1) {
+        const rows = await withTimeout(page.eval(`(() => Array.from(document.querySelectorAll('article')).map((article) => [article.querySelector('time'), article.querySelector('a[href*="/status/"]'), /Pinned|고정됨|고정/.test(article.innerText || '')]).map((parts) => ({ href: (parts[0] && parts[0].closest('a[href*="/status/"]') || parts[1] || {}).href || '', datetime: parts[0] && parts[0].getAttribute('datetime') || '', pinned: parts[2] })).filter((row) => row.href))()`), 10_000, "오늘 원글 DOM 읽기 시간 초과");
+        const before = urls.size;
+        for (const row of rows || []) {
+          const parsed = parseXStatusUrl(row.href);
+          if (!parsed?.id || parsed.handle.toLowerCase() !== REQUIRED_X_HANDLE) continue;
+          scannedUrls.add(parsed.normalized);
+          const rowDate = row.datetime ? formatKstDateKey(row.datetime) : "";
+          if (rowDate === dateKey) urls.add(parsed.normalized);
+          else if (rowDate && rowDate < dateKey && !row.pinned && urls.size > 0 && index >= 3) reachedPreviousDay = true;
+        }
+        stagnant = urls.size === before ? stagnant + 1 : 0;
+        await withTimeout(page.send("Input.dispatchMouseEvent", { type: "mouseWheel", x: 500, y: 700, deltaX: 0, deltaY: 900 }), 3_000, "오늘 원글 스크롤 시간 초과").catch(() => {});
+        await sleep(700);
+        if (reachedPreviousDay) break;
+      }
+      logEvent("terafabx_today_post_reply_discovery_urls", { date: dateKey, scannedUrlCount: scannedUrls.size, todayUrlCount: urls.size, reachedPreviousDay });
+      const checked = await Promise.all(Array.from(urls).map((url) => fetchFxTwitterTweetMetadata(url).catch((error) => ({ url, error: error.message }))));
+      const posts = checked.filter((item) => !item.error && isTerafabxTodayRootPostMetadata(item, dateKey));
+      return { date: dateKey, discoveryComplete: reachedPreviousDay, scannedUrlCount: scannedUrls.size, metadataErrorCount: checked.filter((item) => item.error).length, posts };
+    } finally {
+      await page.close().catch(() => null);
+    }
+  });
+}
+
 function normalizeFxTwitterV2Status(status = {}) {
   const author = status.author || {};
   const media = status.media || {};
@@ -3836,14 +4080,103 @@ function assessTerafabxReplyRelationship(metadata, targetUrl, requiredHandle = R
   };
 }
 
-async function verifyTerafabxReplyRelationship(replyUrl, targetUrl) {
+async function verifyTerafabxReplyRelationship(replyUrl, targetUrl, expectedText = "") {
   const metadata = await fetchFxTwitterTweetMetadata(replyUrl);
   const relationship = assessTerafabxReplyRelationship(metadata, targetUrl);
   if (!relationship.ok) {
     throw new Error(`답글 관계 검증 실패: ${JSON.stringify({ targetUrl, replyUrl, ...relationship })}`);
   }
+  if (expectedText && cleanSocialText(metadata.text) !== cleanSocialText(expectedText)) {
+    const error = new Error(`답글 내용 검증 실패: ${JSON.stringify({ targetUrl, replyUrl, expectedText, actualText: metadata.text })}`);
+    error.code = "TERAFABX_REPLY_CONTENT_MISMATCH";
+    throw error;
+  }
+  relationship.expectedText = expectedText || "";
+  relationship.actualText = metadata.text || "";
+  relationship.contentOk = !expectedText || cleanSocialText(metadata.text) === cleanSocialText(expectedText);
   logEvent("terafabx_reply_relationship_verified", { targetUrl, replyUrl, ...relationship });
   return relationship;
+}
+
+async function deleteTerafabxOwnReply(replyUrl, options = {}) {
+  const normalizedReplyUrl = normalizeXStatusUrl(replyUrl);
+  const metadata = await fetchFxTwitterTweetMetadata(normalizedReplyUrl);
+  if (String(metadata.authorHandle || "").toLowerCase() !== REQUIRED_X_HANDLE) {
+    throw new Error(`@${REQUIRED_X_HANDLE} 작성 답글만 삭제할 수 있습니다.`);
+  }
+  return withTerafabxCommentXLock(options.lockAction || "delete-own-reply", async () => {
+    const page = await getTerafabxCommentXHeadlessPage(normalizedReplyUrl);
+    try {
+      await verifyXAccount(page);
+      await page.navigate(normalizedReplyUrl, 7500);
+      const opened = await page.eval(`(() => {
+        const id = ${JSON.stringify(parseXStatusUrl(normalizedReplyUrl)?.id || "")};
+        const statusHrefMatches = ${terafabxStatusHrefMatches.toString()};
+        const article = Array.from(document.querySelectorAll('article')).find((candidate) =>
+          Array.from(candidate.querySelectorAll('a[href*="/status/"]')).some((anchor) => statusHrefMatches(anchor.href, id))
+        );
+        const caret = article?.querySelector('[data-testid="caret"]');
+        if (!caret) return false;
+        caret.click();
+        return true;
+      })()`);
+      if (!opened) throw new Error("삭제할 답글의 더보기 메뉴를 찾지 못했습니다.");
+      const deleteMenu = await page.eval(`(async () => {
+        const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        const visible = (el) => Boolean(el) && (el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+        for (let attempt = 0; attempt < 20; attempt += 1) {
+          const candidates = Array.from(document.querySelectorAll('[role="menuitem"], [data-testid="Dropdown"] [role="button"], [data-testid="Dropdown"] button'))
+            .filter(visible);
+          const item = candidates
+            .find((el) => /(^|\s)(게시물\s*)?삭제(하기)?(\s|$)|(^|\s)Delete(\s+(post|reply))?(\s|$)/i.test(
+              String(el.innerText || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim()
+            ));
+          if (item) {
+            item.click();
+            return { selected: true };
+          }
+          await wait(250);
+        }
+        return {
+          selected: false,
+          url: location.href,
+          candidates: Array.from(document.querySelectorAll('[role="menuitem"], [role="menu"], [data-testid="Dropdown"], button, [role="button"]'))
+            .filter(visible)
+            .map((el) => ({
+              tag: el.tagName,
+              role: el.getAttribute('role') || '',
+              testid: el.getAttribute('data-testid') || '',
+              label: el.getAttribute('aria-label') || '',
+              text: String(el.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 180),
+            }))
+            .filter((item) => item.text || item.label || item.testid)
+            .slice(-80),
+        };
+      })()`);
+      if (!deleteMenu?.selected) {
+        logEvent("terafabx_own_reply_delete_menu_missing", { replyUrl: normalizedReplyUrl, diagnostics: deleteMenu });
+        throw new Error("답글 삭제 메뉴를 찾지 못했습니다.");
+      }
+      await sleep(600);
+      const confirmed = await page.eval(`(() => {
+        const visible = (el) => Boolean(el) && (el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+        const button = Array.from(document.querySelectorAll('[data-testid="confirmationSheetConfirm"], button, [role="button"]')).filter(visible).find((el) =>
+          el.getAttribute('data-testid') === 'confirmationSheetConfirm'
+          || /^(삭제|Delete)$/i.test(String(el.innerText || '').replace(/\s+/g, ' ').trim())
+        );
+        if (!button) return false;
+        button.click();
+        return true;
+      })()`);
+      if (!confirmed) throw new Error("답글 삭제 확인 버튼을 찾지 못했습니다.");
+      await sleep(1800);
+      logEvent("terafabx_own_reply_deleted", { replyUrl: normalizedReplyUrl, reason: options.reason || "automation_rollback" });
+      return { ok: true, replyUrl: normalizedReplyUrl };
+    } finally {
+      await page.close().catch(() => null);
+      await closeTerafabxCommentXHeadlessBrowser().catch(() => null);
+    }
+  }, { wait: true, timeoutMs: 120_000 });
 }
 
 async function reconcileTerafabxOwnPostReplyHistory(rootUrl) {
@@ -3980,6 +4313,10 @@ function terafabxBrowserConcurrency(requested, available = Number.POSITIVE_INFIN
   ));
 }
 
+function terafabxGrokIndividualRequestCount(missing) {
+  return Math.min(Math.max(0, Number(missing || 0)), 1);
+}
+
 async function runFixedWorkerPool(items, concurrency, worker) {
   const list = Array.isArray(items) ? items : [];
   const workerCount = Math.max(1, Math.min(list.length || 1, Math.floor(Number(concurrency) || 1)));
@@ -4026,26 +4363,6 @@ function buildTerafabxOwnPostReplyTarget(candidate = {}, discovery = {}) {
   };
 }
 
-function buildTerafabxOwnPostRootContextFallback(discovery = {}) {
-  const rootText = cleanSocialText(discovery.rootPost?.text || "");
-  const mediaHint = Number(discovery.rootPost?.mediaCount || 0) > 0 ? "미디어가 포함된 원글" : "텍스트 중심 원글";
-  return {
-    contextSummary: [
-      `부모 원글은 "${rootText || "내용 확인 필요"}"라는 @terafabXai 게시물이며 ${mediaHint}이다.`,
-      "이 배치는 해당 원글에 달린 인증 계정의 직접 댓글에 짧고 자연스럽게 맞장구치는 작업이다.",
-      "각 대댓글은 상대 댓글의 웃음, 감탄, 질문, 공감 표현을 우선 반영해야 한다.",
-    ].join(" "),
-    keyPoints: [
-      rootText ? `부모 원글: ${rootText.slice(0, 180)}` : "부모 원글 문맥 확인 필요",
-      "인증 계정 직접 댓글에만 답함",
-      "모르는 척 되묻지 말고 원글 소재를 알고 있는 톤으로 반응",
-      "짧고 구어체인 한국어 맞장구 우선",
-    ],
-    rawPreview: "local-root-context-fallback",
-    provider: "local-root-context-fallback",
-  };
-}
-
 function buildTerafabxOwnPostTargetSharedContext(rootContextInput, target = {}) {
   const rootContext = normalizeTerafabxContextResult(rootContextInput);
   const targetText = cleanSocialText(target.targetText || "");
@@ -4068,10 +4385,9 @@ function buildTerafabxOwnPostTargetSharedContext(rootContextInput, target = {}) 
   };
 }
 
-async function analyzeTerafabxOwnPostRootContext(rootUrl, discovery = {}) {
+async function analyzeTerafabxOwnPostRootContext(rootUrl, discovery = {}, options = {}) {
   const rootText = cleanSocialText(discovery.rootPost?.text || "");
-  const fallback = buildTerafabxOwnPostRootContextFallback(discovery);
-  if (!rootText) return fallback;
+  if (!rootText) throw new Error("부모 원글 텍스트가 없어 Grok 문맥 분석을 실행할 수 없습니다.");
   try {
     const root = parseXStatusUrl(rootUrl);
     const rootTarget = {
@@ -4083,16 +4399,18 @@ async function analyzeTerafabxOwnPostRootContext(rootUrl, discovery = {}) {
     };
     const context = await analyzeTerafabxContextWithGrok(rootTarget, {
       maxAttempts: 1,
-      session: `${TERAFABX_GROK_WEB_SESSION}-own-post-root-context`,
+      session: options.session || `${TERAFABX_GROK_WEB_SESSION}-own-post-root-context`,
       skipGrokStateSync: true,
     });
-    return {
+    const verified = {
       ...context,
       provider: context.provider || "web-root-context",
     };
+    assertConfirmedTerafabxGrokContext(verified);
+    return verified;
   } catch (error) {
-    logEvent("terafabx_own_post_reply_root_context_fallback", { rootUrl, error: error.message });
-    return fallback;
+    logEvent("terafabx_own_post_reply_root_context_required", { rootUrl, error: error.message });
+    throw error;
   }
 }
 
@@ -4274,6 +4592,24 @@ async function enrichTerafabxAvatarList(rows, { limit = 20, eventType } = {}) {
   return { rows: next, changed, fetched };
 }
 
+function mergeTerafabxAvatarEnrichment(currentRows = [], enrichedRows = []) {
+  const enrichedByUrl = new Map((Array.isArray(enrichedRows) ? enrichedRows : [])
+    .map((row) => [normalizeXStatusUrl(row?.targetUrl || row?.url || ""), row])
+    .filter(([url]) => Boolean(url)));
+  return (Array.isArray(currentRows) ? currentRows : []).map((row) => {
+    const targetUrl = normalizeXStatusUrl(row?.targetUrl || row?.url || "");
+    const enriched = enrichedByUrl.get(targetUrl);
+    if (!enriched?.follower?.avatarUrl) return row;
+    return {
+      ...row,
+      follower: {
+        ...(row.follower || {}),
+        ...enriched.follower,
+      },
+    };
+  });
+}
+
 async function ensureTerafabxFxTwitterAvatars({ limit = 20 } = {}) {
   const queue = loadTerafabxCommentReviewQueue();
   const queueResult = await enrichTerafabxAvatarList(queue, { limit, eventType: "terafabx_review_queue_avatar_enriched" });
@@ -4291,9 +4627,10 @@ async function ensureTerafabxFxTwitterAvatars({ limit = 20 } = {}) {
     eventType: "terafabx_pending_comment_avatar_enriched",
   });
   if (historyResult.changed || pendingResult.changed) {
+    const latestState = loadTerafabxState();
     saveTerafabxState({
-      commentHistory: historyResult.rows,
-      pendingCommentPosts: pendingResult.rows,
+      commentHistory: mergeTerafabxAvatarEnrichment(latestState.commentHistory, historyResult.rows),
+      pendingCommentPosts: mergeTerafabxAvatarEnrichment(latestState.pendingCommentPosts, pendingResult.rows),
     });
   }
   return {
@@ -4719,10 +5056,10 @@ function terafabxReplyPrompt(target, extraRule = "", actor = "Grok") {
 
 function terafabxGrokContextPrompt(target, extraRule = "", actor = "Grok") {
   return [
-    "너는 X 계정 @terafabXai(과즙루피)의 한국어 답글 문맥 분석기다.",
-    "아래 원문 또는 부모글-댓글 대화를 자세히 해석하되, 공개 답글 후보는 절대 작성하지 마라.",
-    "context_summary: 원문 주제, 인용/답글 구조, 감정/상황, 안전하게 반응할 포인트를 2~4문장으로 써라.",
-    "key_points: 댓글 생성·검수자가 참고할 핵심 소재와 관찰 포인트 2~5개를 써라.",
+    "다음 X 게시물 1건의 문맥만 한국어로 간단히 분석해. 여러 게시물을 묶지 마라.",
+    "원문 또는 부모글-댓글 대화를 해석하되, 공개 답글 후보는 절대 작성하지 마라.",
+    "context_summary: 주제, 대화 구조, 감정과 안전한 반응 포인트를 1~2문장으로 써라.",
+    "key_points: 핵심 소재와 관찰 포인트 2~4개를 써라.",
     `${actor}이 확신할 수 없는 내용은 context_summary에서 추정이라고 표시해라.`,
     "reply, comment, final_reply 같은 댓글 필드는 출력하지 마라.",
     "반드시 JSON 한 줄만 출력해라. 형식: {\"context_summary\":\"원문 이해\",\"key_points\":[\"포인트1\",\"포인트2\"]}",
@@ -4867,6 +5204,7 @@ async function cleanupTerafabxAutomationBrowsersOnShutdown() {
     browserPlans.push(
       { port: TERAFABX_VERIFIED_REVIEW_GEMINI_PORT_BASE + index, profileDir: `${TERAFABX_GEMINI_PROFILE_DIR}-review-${index + 1}` },
       { port: TERAFABX_OWN_POST_REPLY_GEMINI_PORT_BASE + index, profileDir: `${TERAFABX_GEMINI_PROFILE_DIR}-own-post-reply-${index + 1}` },
+      { port: TERAFABX_TODAY_POST_REPLY_GEMINI_PORT_BASE + index, profileDir: `${TERAFABX_GEMINI_PROFILE_DIR}-today-post-reply-${index + 1}` },
     );
   }
   const uniqueBrowserPlans = Array.from(new Map(browserPlans.map((plan) => [`${plan.port}:${plan.profileDir}`, plan])).values());
@@ -4938,7 +5276,7 @@ async function runGrokWebAgent(prompt, options = {}) {
   fs.writeFileSync(path.join(runDir, "runner.stderr.txt"), result.stderr || "");
   if (result.code !== 0 || !fs.existsSync(outPath)) {
     await closeTerafabxGrokWebSession(session).catch(() => {});
-    const message = [result.stderr, result.stdout, `exit=${result.code}`].filter(Boolean).join("\n").trim();
+    const message = [result.stderr, result.stdout, `exit=${result.code}`, result.signal ? `signal=${result.signal}` : ""].filter(Boolean).join("\n").trim();
     logEvent("terafabx_grok_web_error", {
       targetUrl: options.targetUrl || null,
       attempt: Number(options.attempt || 1),
@@ -5012,6 +5350,11 @@ async function analyzeTerafabxContextWithGrok(target, options = {}) {
       return { ...result, provider: `${provider}-context`, mode };
     } catch (error) {
       logEvent("terafabx_grok_context_attempt_failed", { provider, attempt, targetUrl: target.url, error: error.message });
+      if (isTerafabxGrokNonJsonLimitText(error.message)) {
+        error.code = "TERAFABX_GROK_CONTEXT_LIMIT_TEXT";
+        error.noRetry = true;
+        throw error;
+      }
       if (error.noRetry) throw error;
     }
   }
@@ -5171,6 +5514,14 @@ function isTerafabxReplySubmitCandidate(candidate = {}) {
   return recognizedControl && /^(답글|Reply)$/i.test(text);
 }
 
+function isTerafabxInlineReplyComposerContext(context = {}) {
+  return Boolean(
+    context.inlineReplyScopeFound
+    && context.targetArticleFound
+    && context.currentStatusMatchesTarget
+  );
+}
+
 function isTerafabxReplySubmissionUncertain(error) {
   return String(error?.code || "") === "TERAFABX_REPLY_SUBMISSION_UNCERTAIN";
 }
@@ -5243,8 +5594,15 @@ async function postTerafabxReply(targetUrl, comment, options = {}) {
   }
   if (result?.ok && result.replyUrl && options.verifyRelationship !== false) {
     try {
-      result.relationship = await verifyTerafabxReplyRelationship(result.replyUrl, targetUrl);
+      result.relationship = await verifyTerafabxReplyRelationship(result.replyUrl, targetUrl, comment);
     } catch (error) {
+      if (error?.code === "TERAFABX_REPLY_CONTENT_MISMATCH") {
+        try {
+          error.rollback = await deleteTerafabxOwnReply(result.replyUrl, { reason: "content_mismatch_rollback" });
+        } catch (rollbackError) {
+          error.rollbackError = rollbackError?.message || String(rollbackError);
+        }
+      }
       error.code = "TERAFABX_REPLY_SUBMISSION_UNCERTAIN";
       throw error;
     }
@@ -5262,22 +5620,31 @@ async function likeTerafabxTarget(targetUrl, options = {}) {
       await closeXDialogs(page);
       await verifyXAccount(page);
       await page.navigate(normalizedTargetUrl, 7500);
-      const clicked = await page.eval(`(() => {
-        const id = ${JSON.stringify(id)};
-        const statusHrefMatches = ${terafabxStatusHrefMatches.toString()};
-        const article = Array.from(document.querySelectorAll("article")).find((candidate) =>
-          Array.from(candidate.querySelectorAll('a[href*="/status/"]')).some((a) => statusHrefMatches(a.href, id))
-        ) || null;
-        if (!article) return { ok: false, reason: "target_article_not_found", url: location.href };
-        if (article.querySelector('[data-testid="unlike"]')) return { ok: true, alreadyLiked: true, clicked: false, url: location.href };
-        const button = article.querySelector('[data-testid="like"]');
-        if (!button || button.disabled || button.getAttribute("aria-disabled") === "true") {
-          return { ok: false, reason: "like_button_not_available", url: location.href };
+      let clicked = null;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        for (let poll = 0; poll < 12; poll += 1) {
+          clicked = await page.eval(`(() => {
+            const id = ${JSON.stringify(id)};
+            const statusHrefMatches = ${terafabxStatusHrefMatches.toString()};
+            const article = Array.from(document.querySelectorAll("article")).find((candidate) =>
+              Array.from(candidate.querySelectorAll('a[href*="/status/"]')).some((a) => statusHrefMatches(a.href, id))
+            ) || null;
+            if (!article) return { ok: false, reason: "target_article_not_found", url: location.href };
+            if (article.querySelector('[data-testid="unlike"]')) return { ok: true, alreadyLiked: true, clicked: false, url: location.href };
+            const button = article.querySelector('[data-testid="like"]');
+            if (!button || button.disabled || button.getAttribute("aria-disabled") === "true") {
+              return { ok: false, reason: "like_button_not_available", url: location.href };
+            }
+            button.scrollIntoView({ block: "center" });
+            button.click();
+            return { ok: true, alreadyLiked: false, clicked: true, url: location.href };
+          })()`);
+          if (clicked?.ok || clicked?.reason !== "target_article_not_found") break;
+          await sleep(300);
         }
-        button.scrollIntoView({ block: "center" });
-        button.click();
-        return { ok: true, alreadyLiked: false, clicked: true, url: location.href };
-      })()`);
+        if (clicked?.ok || clicked?.reason !== "target_article_not_found") break;
+        await page.navigate(normalizedTargetUrl, 7500);
+      }
       if (!clicked?.ok) throw new Error(`원 댓글 좋아요 실패: ${JSON.stringify(clicked)}`);
       if (clicked.clicked) await sleep(900);
       const verified = await page.eval(`(() => {
@@ -5323,6 +5690,61 @@ function shouldUseTerafabxQuickIntent(options = {}, targetId = "") {
   // X intent may render a generic top-level composer. It cannot prove the
   // parent relationship before submit, so reply automation must never use it.
   return false;
+}
+
+async function replaceTerafabxEditorTextWithKeyEvents(page, text) {
+  await page.eval(`(() => {
+    const editors = Array.from(document.querySelectorAll('[data-testid="tweetTextarea_0"], [role="textbox"][contenteditable="true"], [contenteditable="true"]')).filter((el) => el.offsetWidth && el.offsetHeight);
+    const editor = editors.find((candidate) => candidate.closest('[role="dialog"]')) || editors.pop();
+    if (!editor) return false;
+    editor.focus();
+    const selection = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(editor);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    return true;
+  })()`);
+  await page.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Backspace", code: "Backspace" }, 3000);
+  await page.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Backspace", code: "Backspace" }, 3000);
+  // X can remount the ProseMirror editor after the clearing Backspace. If the
+  // first character is sent during that remount it is silently dropped,
+  // especially for Korean text. Wait for the empty editor to settle, resolve
+  // the current dialog editor again, and place a collapsed caret before typing.
+  await sleep(500);
+  const refocused = await page.eval(`(() => {
+    const editors = Array.from(document.querySelectorAll('[data-testid="tweetTextarea_0"], [role="textbox"][contenteditable="true"], [contenteditable="true"]')).filter((el) => el.offsetWidth && el.offsetHeight);
+    const editor = editors.find((candidate) => candidate.closest('[role="dialog"]')) || editors.pop();
+    if (!editor) return false;
+    editor.click();
+    editor.focus();
+    const selection = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(editor);
+    range.collapse(false);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    return true;
+  })()`);
+  if (!refocused) throw new Error("답글 입력창 재포커스에 실패했습니다.");
+  await sleep(150);
+  // The freshly-mounted X reply editor can consume the first trusted char
+  // event. Prime it with whitespace so the first real Korean syllable is not
+  // lost. cleanSocialText and X both trim this harmless leading whitespace.
+  await page.send("Input.dispatchKeyEvent", { type: "char", text: " ", unmodifiedText: " " }, 3000);
+  await sleep(120);
+  for (const character of Array.from(String(text || ""))) {
+    if (character === "\n") {
+      await page.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter" }, 3000);
+      await page.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter" }, 3000);
+    } else {
+      // A CDP char event follows the same trusted keyboard path as a real
+      // keystroke. Input.insertText changes the DOM but X can leave its React
+      // submit state disabled.
+      await page.send("Input.dispatchKeyEvent", { type: "char", text: character, unmodifiedText: character }, 3000);
+    }
+    await sleep(20);
+  }
 }
 
 async function postTerafabxReplyUnlocked(targetUrl, comment, options = {}) {
@@ -5446,6 +5868,15 @@ async function postTerafabxReplyUnlocked(targetUrl, comment, options = {}) {
       editor.dispatchEvent(new Event("change", { bubbles: true }));
       return true;
     })()`).catch(() => false);
+    await sleep(500);
+    const settledTyped = await page.eval(`(() => {
+      const editors = Array.from(document.querySelectorAll('[data-testid="tweetTextarea_0"], [role="textbox"][contenteditable="true"], [contenteditable="true"]')).filter((el) => el.offsetWidth && el.offsetHeight);
+      const editor = editors.find((candidate) => candidate.closest('[role="dialog"]')) || editors.pop();
+      return editor ? (editor.innerText || editor.textContent || "") : "";
+    })()`);
+    if (cleanSocialText(settledTyped) !== cleanSocialText(comment)) {
+      throw new Error(`게시 직전 입력 텍스트 불일치: ${settledTyped}`);
+    }
     logEvent("terafabx_reply_text_typed", { targetUrl, comment });
     if (options.validate !== false) validateTerafabxReply(typed);
     let clickedPost = await page.eval(`(async () => {
@@ -5633,6 +6064,7 @@ async function postTerafabxReplyUnlocked(targetUrl, comment, options = {}) {
 }
 
 function buildTerafabxFixedImageReplyRecord(target, options = {}) {
+  const grokContext = assertConfirmedTerafabxGrokContext(options.grokContext);
   const comment = validateTerafabxReply(target.fixedReply || TERAFABX_IMAGE_ONLY_REPLY_EMOJI);
   return {
     at: new Date().toISOString(),
@@ -5645,11 +6077,7 @@ function buildTerafabxFixedImageReplyRecord(target, options = {}) {
     imageCount: Number(target.imageCount || 0),
     comment,
     grokComment: comment,
-    grokContext: {
-      summary: "인증 계정이 텍스트 없이 이미지만 첨부한 직속 댓글이라 고정 이모지 규칙을 적용함.",
-      keyPoints: ["이미지 전용 댓글", "고정 이모지 응답"],
-      rawPreview: "",
-    },
+    grokContext: terafabxGrokContextForRecord(grokContext),
     geminiReview: {
       used: false,
       score: null,
@@ -5660,7 +6088,7 @@ function buildTerafabxFixedImageReplyRecord(target, options = {}) {
       finalJudge: null,
     },
     replyUrl: null,
-    generator: "fixed-image-only-emoji",
+    generator: `${grokContext.provider}+fixed-image-only-emoji`,
     manual: Boolean(options.manual),
     source: options.source || "comment",
   };
@@ -5698,7 +6126,6 @@ function assertTerafabxReplyReviewScoreQualified(review = {}, minScore = TERAFAB
 }
 
 async function buildTerafabxPreparedCommentRecord(target, options = {}) {
-  if (target.imageOnly === true) return buildTerafabxFixedImageReplyRecord(target, options);
   const worker = Math.max(0, Number(options.workerIndex || 0));
   const chromePort = Number(options.chromePort || (TERAFABX_COMMENT_PREFILL_GEMINI_PORT_BASE + worker));
   const profileDir = options.profileDir || `${TERAFABX_GEMINI_PROFILE_DIR}-comment-prefill-${worker + 1}`;
@@ -5722,6 +6149,8 @@ async function buildTerafabxPreparedCommentRecord(target, options = {}) {
       session: geminiOptions.grokContextSession,
       skipGrokStateSync: Boolean(geminiOptions.skipGrokStateSync),
     });
+  assertConfirmedTerafabxGrokContext(grokContext);
+  if (target.imageOnly === true) return buildTerafabxFixedImageReplyRecord(target, { ...options, grokContext });
   const grokResult = await generateTerafabxReplyWithGeminiFallback(target, { attempt: 1, ...geminiOptions, grokContext });
   logEvent("terafabx_comment_gemini_direct", {
     targetUrl: target.url,
@@ -5809,6 +6238,10 @@ async function buildTerafabxPreparedCommentRecord(target, options = {}) {
 }
 
 async function runTerafabxCommentOnce({ manual = false } = {}) {
+  if (loadTerafabxState().commentPrefillOnly) {
+    logEvent("terafabx_comment_post_blocked_prefill_only", { source: "comment_once", manual });
+    return { ok: true, action: "comment", skipped: "prefill_only_no_post" };
+  }
   if (terafabxBusy) throw new Error("다른 과즙루피 자동화 작업이 진행 중입니다.");
   if (terafabxCommentPrefillBusy) throw new Error("자동댓글 prefill 작업이 진행 중입니다.");
   const daily = terafabxDailyCommentProgress();
@@ -5843,7 +6276,7 @@ async function runTerafabxCommentOnce({ manual = false } = {}) {
   }
 }
 
-function saveTerafabxOwnPostReplySuccess({ prepared, candidate, target, rootPostUrl, replyUrl, manual, startedAt }) {
+function saveTerafabxOwnPostReplySuccess({ prepared, candidate, target, rootPostUrl, replyUrl, manual, startedAt, source = "own_post_reply" }) {
   const postedAt = new Date().toISOString();
   const previous = loadTerafabxState();
   const historyRecord = {
@@ -5853,7 +6286,7 @@ function saveTerafabxOwnPostReplySuccess({ prepared, candidate, target, rootPost
     posted: true,
     status: "posted",
     manual,
-    source: "own_post_reply",
+    source,
     rootPostUrl,
     targetUrl: target.url,
     targetId: target.targetId,
@@ -6058,6 +6491,9 @@ async function runTerafabxOwnPostReplyBatch({
   limit = TERAFABX_OWN_POST_REPLY_BATCH_LIMIT,
   delayMinMs = TERAFABX_OWN_POST_REPLY_DELAY_MIN_MS,
   delayMaxMs = TERAFABX_OWN_POST_REPLY_DELAY_MAX_MS,
+  resourceFactory = terafabxOwnPostReplyWorkerResources,
+  rootGrokSession = `${TERAFABX_GROK_WEB_SESSION}-own-post-root-context`,
+  source = "own_post_reply",
 } = {}) {
   if (terafabxOwnPostReplyBusy) throw new Error("다른 인증댓글 하트+답글 작업이 진행 중입니다.");
   const rootUrl = normalizeXStatusUrl(postUrl);
@@ -6071,9 +6507,10 @@ async function runTerafabxOwnPostReplyBatch({
   terafabxOwnPostReplyBusy = true;
   const startedAt = new Date().toISOString();
   const workerIndexes = Array.from({ length: workerCount }, (_, index) => index);
+  const workerResources = workerIndexes.map(resourceFactory);
   try {
     if (queueRequestId) updateTerafabxOwnPostReplyQueueItem(queueRequestId, { stage: "collecting", stageLabel: "댓글 수집 중" });
-    seedTerafabxOwnPostReplyGeminiProfiles(workerIndexes);
+    workerResources.forEach((resource) => seedTerafabxGeminiProfileFromTemplate(resource.profileDir));
     await reconcileTerafabxOwnPostReplyHistory(rootUrl);
     const discovery = await collectTerafabxOwnPostConversation(rootUrl);
     const candidates = discovery.candidates.slice(0, batchLimit);
@@ -6098,7 +6535,7 @@ async function runTerafabxOwnPostReplyBatch({
       return { ok: true, action: "own-post-reply-batch", skipped: "no_candidate", posted: [], rejected: [], skippedTargets: [] };
     }
     await syncTerafabxGrokWebState();
-    const rootContext = await analyzeTerafabxOwnPostRootContext(rootUrl, discovery);
+    const rootContext = await analyzeTerafabxOwnPostRootContext(rootUrl, discovery, { session: rootGrokSession });
     logEvent("terafabx_own_post_reply_batch_prepare_start", {
       rootUrl,
       candidateCount: candidates.length,
@@ -6116,19 +6553,20 @@ async function runTerafabxOwnPostReplyBatch({
     const delays = [];
     const prepareCandidate = async (candidate, workerIndex) => {
       const target = buildTerafabxOwnPostReplyTarget(candidate, discovery);
-      if (grokContextUnavailable && !target.imageOnly) {
+      const resource = workerResources[workerIndex];
+      if (grokContextUnavailable) {
         return { ok: false, candidate, target, workerIndex, error: grokContextUnavailable.message, skipped: "grok_context_unavailable" };
       }
       try {
         const grokContext = buildTerafabxOwnPostTargetSharedContext(rootContext, target);
         const prepared = await buildTerafabxPreparedCommentRecord(target, {
           manual,
-          source: "own_post_reply",
+          source,
           parallel: true,
           workerIndex,
-          chromePort: TERAFABX_OWN_POST_REPLY_GEMINI_PORT_BASE + workerIndex,
-          profileDir: terafabxOwnPostReplyGeminiProfileDir(workerIndex),
-          grokContextSession: `${TERAFABX_GROK_WEB_SESSION}-own-post-reply-context-${workerIndex + 1}`,
+          chromePort: resource.chromePort,
+          profileDir: resource.profileDir,
+          grokContextSession: resource.grokContextSession,
           skipGrokStateSync: true,
           grokContext,
           deferGeminiReview: useBatchReview,
@@ -6166,8 +6604,8 @@ async function runTerafabxOwnPostReplyBatch({
         if (reviewableResults.length) {
           try {
             const reviewedResults = await reviewTerafabxPreparedReplyBatchWithGemini(reviewableResults, {
-              chromePort: TERAFABX_OWN_POST_REPLY_GEMINI_PORT_BASE,
-              profileDir: terafabxOwnPostReplyGeminiProfileDir(0),
+              chromePort: workerResources[0].chromePort,
+              profileDir: workerResources[0].profileDir,
               cleanupBrowser: true,
             });
             const reviewedByTarget = new Map(reviewedResults.map((item) => [item.target?.url || item.prepared?.targetUrl || "", item]));
@@ -6249,6 +6687,7 @@ async function runTerafabxOwnPostReplyBatch({
             replyUrl: result.replyUrl,
             manual,
             startedAt,
+            source,
           });
           posted.push({
             targetUrl: item.target.url,
@@ -6304,14 +6743,14 @@ async function runTerafabxOwnPostReplyBatch({
     return result;
   } finally {
     await closeTerafabxCommentXHeadlessBrowser().catch(() => null);
-    await Promise.all(workerIndexes.map(async (workerIndex) => {
+    await Promise.all(workerResources.map(async (resource) => {
       await closeTerafabxGeminiHeadlessBrowser({
-        port: TERAFABX_OWN_POST_REPLY_GEMINI_PORT_BASE + workerIndex,
-        profileDir: terafabxOwnPostReplyGeminiProfileDir(workerIndex),
+        port: resource.chromePort,
+        profileDir: resource.profileDir,
       }).catch(() => null);
-      await closeTerafabxGrokWebSession(`${TERAFABX_GROK_WEB_SESSION}-own-post-reply-context-${workerIndex + 1}`).catch(() => null);
+      await closeTerafabxGrokWebSession(resource.grokContextSession).catch(() => null);
     }));
-    await closeTerafabxGrokWebSession(`${TERAFABX_GROK_WEB_SESSION}-own-post-root-context`).catch(() => null);
+    await closeTerafabxGrokWebSession(rootGrokSession).catch(() => null);
     terafabxOwnPostReplyBusy = false;
   }
 }
@@ -6829,7 +7268,7 @@ async function postDiscoveryCoupangAffiliateReply(canonicalUrl) {
   };
 }
 
-async function runTerafabxCommentPrefillQueue({ manual = false, targetCount = TERAFABX_COMMENT_PREFILL_TARGET, concurrency = TERAFABX_COMMENT_PREFILL_CONCURRENCY } = {}) {
+async function runTerafabxCommentPrefillQueue({ manual = false, targetCount = TERAFABX_COMMENT_PREFILL_TARGET, concurrency = TERAFABX_COMMENT_PREFILL_CONCURRENCY, probeGrok = false } = {}) {
   if (terafabxCommentPrefillBusy) {
     logEvent("terafabx_comment_prefill_skip_busy", { manual });
     return { ok: true, action: "comment-prefill", skipped: "busy" };
@@ -6844,14 +7283,37 @@ async function runTerafabxCommentPrefillQueue({ manual = false, targetCount = TE
   terafabxCommentPrefillBusy = true;
   terafabxCommentPrefillLastStartedAt = Date.now();
   const startedAt = new Date().toISOString();
+  terafabxCommentPrefillRuntime = {
+    status: "running",
+    stage: "checking_queue",
+    lastStartedAt: startedAt,
+    lastFinishedAt: terafabxCommentPrefillRuntime.lastFinishedAt,
+    lastError: null,
+    requested: 0,
+    selected: 0,
+    queued: 0,
+    failed: 0,
+  };
   let workerResources = [];
   try {
+    const quotaBlocker = activeTerafabxGrokQuotaBlocker();
+    if (quotaBlocker && !probeGrok) {
+      terafabxCommentPrefillRuntime = {
+        ...terafabxCommentPrefillRuntime,
+        status: "error",
+        stage: "grok_quota_blocked",
+        lastFinishedAt: new Date().toISOString(),
+        lastError: quotaBlocker.message,
+      };
+      return { ok: false, action: "comment-prefill", skipped: "grok_quota", error: quotaBlocker.message, backoffUntil: quotaBlocker.until };
+    }
     const currentPending = pendingTerafabxCommentPosts();
     const daily = terafabxDailyCommentProgress();
-    const target = Math.min(Math.max(0, Number(targetCount || 0)), daily.remaining);
-    const missing = Math.max(0, target - currentPending.length);
+    const unlimited = targetCount == null || !Number.isFinite(Number(targetCount));
+    const target = unlimited ? null : Math.min(Math.max(0, Number(targetCount || 0)), daily.remaining);
+    const missing = unlimited ? Math.min(1, daily.remaining) : Math.max(0, target - currentPending.length);
     const workerCount = terafabxBrowserConcurrency(concurrency, missing);
-    logEvent("terafabx_comment_prefill_start", { manual, pendingCount: currentPending.length, targetCount: target, missing, concurrency: workerCount });
+    logEvent("terafabx_comment_prefill_start", { manual, pendingCount: currentPending.length, targetCount: target, unlimited, missing, concurrency: workerCount });
     if (missing <= 0) {
       saveTerafabxState({
         lastCommentPrefillRunAt: new Date().toISOString(),
@@ -6894,7 +7356,38 @@ async function runTerafabxCommentPrefillQueue({ manual = false, targetCount = TE
     });
     const contextResults = contextChunks.flat();
     const results = contextResults.filter((item) => !item.ok);
-    const ready = contextResults.filter((item) => item.ok);
+    const safetyRejectedTargets = [];
+    const ready = contextResults.filter((item) => {
+      if (!item.ok) return false;
+      const safety = assessTerafabxGrokContextSafety(item.target, item.grokContext);
+      if (safety.ok) return true;
+      logEvent("terafabx_comment_prefill_item_rejected", {
+        targetUrl: item.target.url,
+        workerIndex: item.workerIndex,
+        stage: "grok_context_safety",
+        reason: safety.reason,
+      });
+      results.push({
+        ok: false,
+        skipped: true,
+        targetUrl: item.target.url,
+        workerIndex: item.workerIndex,
+        stage: "grok_context_safety",
+        reason: safety.reason,
+      });
+      safetyRejectedTargets.push(normalizeXStatusUrl(item.target.url || ""));
+      return false;
+    });
+    if (safetyRejectedTargets.length) {
+      const latestState = loadTerafabxState();
+      saveTerafabxState({
+        seenTargets: Array.from(new Set([
+          ...safetyRejectedTargets.filter(Boolean),
+          ...(latestState.seenTargets || []),
+        ])).slice(0, 500),
+      });
+    }
+    terafabxCommentPrefillRuntime.stage = "gemini_batch";
     for (let offset = 0; offset < ready.length; offset += 5) {
       const chunk = ready.slice(offset, offset + 5);
       try {
@@ -7019,7 +7512,9 @@ function maybeStartTerafabxCommentPrefill(reason = "tick") {
     return { scheduled: false, skipped: "grok_quota_backoff", retryAt: state.lastCommentPrefillQuotaRetryAt };
   }
   const pendingCount = pendingTerafabxCommentPosts(state).length;
-  if (pendingCount >= TERAFABX_COMMENT_PREFILL_TARGET) return { scheduled: false, skipped: "target_reached" };
+  if (!TERAFABX_COMMENT_PREFILL_UNLIMITED && pendingCount >= TERAFABX_COMMENT_PREFILL_TARGET) {
+    return { scheduled: false, skipped: "target_reached" };
+  }
   if (terafabxCommentPrefillBusy) return { scheduled: false, skipped: "busy" };
   if (terafabxCommentPrefillDeferredTimer) {
     return {
@@ -7054,6 +7549,11 @@ function isTerafabxPendingCommentEligible(item = {}, nowMs = Date.now()) {
 }
 
 async function runTerafabxPendingCommentPosts({ manual = false, limit = 5 } = {}) {
+  if (loadTerafabxState().commentPrefillOnly) {
+    const pendingCount = pendingTerafabxCommentPosts().length;
+    logEvent("terafabx_comment_post_blocked_prefill_only", { source: "pending", manual, pendingCount });
+    return { ok: true, action: "pending-comment", skipped: "prefill_only_no_post", pendingCount };
+  }
   if (terafabxBusy) throw new Error("다른 과즙루피 자동화 작업이 진행 중입니다.");
   if (!manual && isTerafabxQuietPostingTime()) {
     const pendingCount = pendingTerafabxCommentPosts().length;
@@ -7101,6 +7601,7 @@ async function runTerafabxPendingCommentPosts({ manual = false, limit = 5 } = {}
           continue;
         }
         try {
+          assertConfirmedTerafabxGrokContext(record.grokContext);
           const comment = validateTerafabxReply(record.comment);
           logEvent("terafabx_pending_comment_post_item_start", { index: index + 1, total: candidates.length, targetUrl });
           const result = await postTerafabxReply(targetUrl, comment, { headless: true });
@@ -7178,17 +7679,41 @@ async function runTerafabxPendingCommentPosts({ manual = false, limit = 5 } = {}
 
 function assessTerafabxCurrentCommentPolicy(record) {
   const errors = [];
-  const length = Array.from(cleanSocialText(record?.comment || "")).length;
+  const commentText = cleanSocialText(record?.comment || "");
+  const length = Array.from(commentText).length;
   if (length < 8) errors.push(`comment_too_short:${length}`);
   if (length > 45) errors.push(`comment_too_long:${length}`);
+  if (TERAFABX_COMMENT_TARGET_BANNED_RE.test(commentText)) errors.push("sensitive_comment_text");
   const finalJudge = record?.geminiReview?.finalJudge || {};
   if (isTerafabxGrokContextFallback(record?.grokContext)) errors.push("grok_context_fallback");
+  if (!isConfirmedTerafabxGrokContext(record?.grokContext)) errors.push("grok_context_required");
   const context = Number(finalJudge?.dimensions?.context);
   if (!Number.isFinite(context) || context < 30) errors.push(`context_gate_failed:${Number.isFinite(context) ? context : "missing"}`);
   if (finalJudge?.fatalError === true) errors.push("fatal_context_error");
   const languageQuality = assessTerafabxLanguageQuality(record?.comment || "");
   for (const error of languageQuality.errors) errors.push(`language_quality:${error}`);
   for (const warning of languageQuality.styleWarnings) errors.push(`style_quality:${warning}`);
+  const deterministicCliche = scoreTerafabxClichePenalty(commentText);
+  if (deterministicCliche.penalty > 0) {
+    errors.push(`deterministic_cliche:${deterministicCliche.matches.map((item) => item.label).join(",")}`);
+  }
+  const targetText = cleanSocialText([record?.targetText, record?.rootPostText].filter(Boolean).join(" "));
+  const asksUncertainStatus = /(?:고장(?:난|인가|일까|일까요)|(?:진짜|실제|합성|조작|AI).{0,8}(?:인가|일까|일까요|맞나|맞나요))/i.test(targetText);
+  const resolvesUncertainStatus = /(?:고장|가짜|합성|조작|AI).{0,12}(?:아니|아닌|아니라)|(?:정상|진짜|실제).{0,8}(?:맞|이다|인\s*(?:것|거))/i.test(commentText);
+  if (asksUncertainStatus && resolvesUncertainStatus) errors.push("unsupported_uncertainty_resolution");
+  const evidenceText = cleanSocialText([
+    record?.targetText,
+    record?.rootPostText,
+    record?.grokContext?.summary,
+    record?.grokContext?.contextSummary,
+    ...(record?.grokContext?.keyPoints || []),
+  ].filter(Boolean).join(" "));
+  const unsupportedWeekdays = ["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"]
+    .filter((weekday) => commentText.includes(weekday) && !evidenceText.includes(weekday));
+  if (unsupportedWeekdays.length) errors.push(`unsupported_temporal_detail:${unsupportedWeekdays.join(",")}`);
+  const unsupportedSensoryTerms = ["찰진", "쫀득", "쫄깃", "바삭", "고소", "달콤", "매콤", "짭짤", "향긋", "식감", "냄새", "촉감"]
+    .filter((term) => cleanSocialText(record?.comment || "").includes(term) && !evidenceText.includes(term));
+  if (unsupportedSensoryTerms.length) errors.push(`unsupported_sensory_detail:${unsupportedSensoryTerms.join(",")}`);
   const structuredQualityRolloutAt = Date.parse("2026-07-13T00:46:00.000Z");
   const recordCreatedAt = Date.parse(record?.queuedAt || record?.at || record?.postedAt || "");
   const requiresStructuredQuality = !Number.isFinite(recordCreatedAt) || recordCreatedAt >= structuredQualityRolloutAt;
@@ -7209,7 +7734,6 @@ function assessTerafabxCurrentCommentPolicy(record) {
   const visibleSubject = assessTerafabxParentContextMismatch(record || {}, record?.comment || "");
   if (!visibleSubject.ok) errors.push("visible_subject_unknown_question");
   const sourceText = cleanSocialText([record?.rootPostText, record?.targetText, record?.quotePostText].filter(Boolean).join(" "));
-  const commentText = cleanSocialText(record?.comment || "");
   const currencyAmountPattern = /(?:\d[\d,.]*|[일이삼사오육칠팔구십백천만억조]+)\s*(?:원|달러|유로|파운드|엔|위안)/giu;
   const commentCurrencyClaims = commentText.match(currencyAmountPattern) || [];
   const sourceCurrencyClaims = sourceText.match(currencyAmountPattern) || [];
@@ -7378,6 +7902,9 @@ function savePostedTerafabxReviewComment(record, posted, { manual = true } = {})
 }
 
 async function postSingleTerafabxCommentReviewRecord(identifier, { manual = true } = {}) {
+  if (loadTerafabxState().commentPrefillOnly) {
+    throw new Error("prefill-only 모드에서는 검수 댓글도 게시하지 않습니다.");
+  }
   const waitStartedAt = Date.now();
   let ownsBusy = false;
   let record = null;
@@ -7395,6 +7922,7 @@ async function postSingleTerafabxCommentReviewRecord(identifier, { manual = true
     if (!targetUrl || !parseXStatusUrl(targetUrl)) throw new Error("유효한 X 원문 URL이 아닙니다.");
     terafabxBusy = true;
     ownsBusy = true;
+    assertConfirmedTerafabxGrokContext(record.grokContext);
     const comment = validateTerafabxReply(record.comment);
     logEvent("terafabx_review_queue_manual_post_start", { targetUrl, id: record.id || "", handle: record.follower?.handle || null });
     const result = await postTerafabxReply(targetUrl, comment, { headless: true });
@@ -7415,6 +7943,9 @@ async function postSingleTerafabxCommentReviewRecord(identifier, { manual = true
 }
 
 async function runTerafabxCommentReviewQueue({ manual = true, limit = 0, minScore = TERAFABX_REVIEW_COMMENT_MIN_SCORE, delayMs = TERAFABX_REVIEW_COMMENT_DELAY_MS } = {}) {
+  if (loadTerafabxState().commentPrefillOnly) {
+    return { ok: true, action: "review-comment", skipped: "prefill_only_no_post", posted: [], failed: [] };
+  }
   if (terafabxBusy) throw new Error("다른 과즙루피 자동화 작업이 진행 중입니다.");
   if (!manual && isTerafabxQuietPostingTime()) {
     const pendingCount = loadTerafabxCommentReviewQueue().filter((item) => item && !item.posted && item.status !== "error").length;
@@ -7630,6 +8161,117 @@ async function runTerafabxFollowOnce({ limit = TERAFABX_FOLLOW_LIMIT, manual = f
   }
 }
 
+function deriveTerafabxCommentPipelineHealth({
+  enabled = false,
+  pendingCount = 0,
+  prefillBusy = false,
+  lastStatus = "idle",
+  lastError = "",
+  grokActiveSessionCount = 0,
+  geminiReadyCount = 0,
+  workerCount = 0,
+  grokQuotaBlocker = "",
+} = {}) {
+  const configuredWorkers = Math.max(0, Number(workerCount || 0));
+  const readyWorkers = Math.max(0, Number(geminiReadyCount || 0));
+  const error = String(lastError || "");
+  const geminiBlocked = configuredWorkers > 0 && readyWorkers < configuredWorkers;
+  if (!enabled) return { status: "off", label: "꺼짐", blocker: null };
+  if (grokQuotaBlocker) {
+    const blocker = String(grokQuotaBlocker);
+    return { status: "blocked", label: blocker.includes("개별 요청 일시 제한") ? "Grok 개별 요청 대기" : "Grok 사용량 제한", blocker };
+  }
+  if (prefillBusy) {
+    return {
+      status: "running",
+      label: grokActiveSessionCount > 0 ? "Grok 분석 중" : "댓글 준비 중",
+      blocker: null,
+    };
+  }
+  if (lastStatus === "error" || (pendingCount <= 0 && geminiBlocked)) {
+    return {
+      status: "blocked",
+      label: "생성 차단",
+      blocker: error || `Gemini worker ${readyWorkers}/${configuredWorkers} 준비`,
+    };
+  }
+  if (pendingCount > 0) return { status: "ready", label: "게시 대기", blocker: null };
+  return { status: "idle", label: "대기", blocker: null };
+}
+
+function getTerafabxCommentPipelineStatus(state, pendingCommentPosts) {
+  const workerCount = Math.max(0, Number(TERAFABX_COMMENT_PREFILL_CONCURRENCY || 0));
+  const workers = Array.from({ length: workerCount }, (_, index) => {
+    const resource = terafabxCommentPrefillWorkerResources(index);
+    return {
+      index: index + 1,
+      grokSession: resource.grokContextSession,
+      geminiPort: resource.chromePort,
+      geminiProfileReady: fs.existsSync(resource.profileDir),
+    };
+  });
+  const geminiReadyCount = workers.filter((worker) => worker.geminiProfileReady).length;
+  const grokStateExists = fs.existsSync(TERAFABX_GROK_WEB_STATE_PATH);
+  let grokStateUpdatedAt = null;
+  if (grokStateExists) {
+    try { grokStateUpdatedAt = fs.statSync(TERAFABX_GROK_WEB_STATE_PATH).mtime.toISOString(); } catch {}
+  }
+  const pendingCount = pendingCommentPosts.length;
+  const daily = terafabxDailyCommentProgress(state);
+  const targetCount = TERAFABX_COMMENT_PREFILL_UNLIMITED
+    ? null
+    : Math.min(TERAFABX_COMMENT_PREFILL_TARGET, daily.remaining);
+  const quotaBlocker = activeTerafabxGrokQuotaBlocker(state);
+  const health = deriveTerafabxCommentPipelineHealth({
+    enabled: Boolean(state.commentEnabled),
+    pendingCount,
+    prefillBusy: terafabxCommentPrefillBusy,
+    lastStatus: terafabxCommentPrefillRuntime.status,
+    lastError: terafabxCommentPrefillRuntime.lastError,
+    grokActiveSessionCount: terafabxActiveGrokSessions.size,
+    geminiReadyCount,
+    workerCount,
+    grokQuotaBlocker: quotaBlocker?.message || "",
+  });
+  if (state.commentPrefillOnly && pendingCount > 0 && health.status === "ready") {
+    health.label = "생성 보관";
+  }
+  return {
+    ...health,
+    prefillOnly: Boolean(state.commentPrefillOnly),
+    pendingCount,
+    targetCount,
+    unlimited: TERAFABX_COMMENT_PREFILL_UNLIMITED,
+    missingCount: TERAFABX_COMMENT_PREFILL_UNLIMITED ? null : Math.max(0, targetCount - pendingCount),
+    stage: terafabxCommentPrefillRuntime.stage,
+    lastStartedAt: terafabxCommentPrefillRuntime.lastStartedAt,
+    lastFinishedAt: terafabxCommentPrefillRuntime.lastFinishedAt,
+    lastStatus: terafabxCommentPrefillRuntime.status,
+    lastError: terafabxCommentPrefillRuntime.lastError,
+    lastRequested: terafabxCommentPrefillRuntime.requested,
+    lastSelected: terafabxCommentPrefillRuntime.selected,
+    lastQueued: terafabxCommentPrefillRuntime.queued,
+    lastFailed: terafabxCommentPrefillRuntime.failed,
+    grok: {
+      provider: TERAFABX_GROK_PROVIDER === "cli" ? "cli" : "web",
+      configuredWorkers: workerCount,
+      activeSessionCount: terafabxActiveGrokSessions.size,
+      activeSessions: Array.from(terafabxActiveGrokSessions),
+      stateReady: grokStateExists,
+      stateUpdatedAt: grokStateUpdatedAt,
+      waitingOnGemini: !terafabxCommentPrefillBusy && geminiReadyCount < workerCount,
+      quotaBackoffUntil: quotaBlocker?.until || null,
+      quotaMessage: quotaBlocker?.message || null,
+    },
+    gemini: {
+      configuredWorkers: workerCount,
+      readyWorkers: geminiReadyCount,
+      missingWorkers: workers.filter((worker) => !worker.geminiProfileReady).map((worker) => worker.index),
+      workers,
+    },
+  };
+}
+
 function getTerafabxAutomationStatus() {
   const state = loadTerafabxState();
   const now = Date.now();
@@ -7639,6 +8281,7 @@ function getTerafabxAutomationStatus() {
   const lastHeartMs = state.lastHeartRunAt ? new Date(state.lastHeartRunAt).getTime() : 0;
   const lastFollowMs = state.lastFollowRunAt ? new Date(state.lastFollowRunAt).getTime() : 0;
   const lastOwnPostReplyMs = state.lastOwnPostReplyRunAt ? new Date(state.lastOwnPostReplyRunAt).getTime() : 0;
+  const lastTodayPostReplyMs = state.todayPostReplyLastRunAt ? new Date(state.todayPostReplyLastRunAt).getTime() : 0;
   const lastVerifiedReviewMs = state.verifiedCommentReviewLastRunAt ? new Date(state.verifiedCommentReviewLastRunAt).getTime() : 0;
   const verifiedReviewBackoffMs = state.verifiedCommentReviewBackoffUntil ? new Date(state.verifiedCommentReviewBackoffUntil).getTime() : 0;
   const verifiedReviewBackoffActive = Number.isFinite(verifiedReviewBackoffMs) && verifiedReviewBackoffMs > now;
@@ -7697,6 +8340,7 @@ function getTerafabxAutomationStatus() {
       scheduled: Boolean(terafabxCommentPrefillDeferredTimer),
       scheduledFor: terafabxCommentPrefillDeferredAt ? new Date(terafabxCommentPrefillDeferredAt).toISOString() : null,
       targetCount: TERAFABX_COMMENT_PREFILL_TARGET,
+      unlimited: TERAFABX_COMMENT_PREFILL_UNLIMITED,
       concurrency: TERAFABX_COMMENT_PREFILL_CONCURRENCY,
       geminiPortBase: TERAFABX_COMMENT_PREFILL_GEMINI_PORT_BASE,
       lastRunAt: state.lastCommentPrefillRunAt,
@@ -7710,6 +8354,7 @@ function getTerafabxAutomationStatus() {
       quotaLimited: isTerafabxGrokQuotaBackoffActive(state),
       quotaRetryAt: isTerafabxGrokQuotaBackoffActive(state) ? state.lastCommentPrefillQuotaRetryAt || null : null,
     },
+    commentPipeline: getTerafabxCommentPipelineStatus(state, pendingCommentPosts),
     commentMonitor: loadTerafabxCommentMonitorState(),
     jobGapMs: TERAFABX_JOB_GAP_MS,
     lock: getTerafabxLockState(),
@@ -7743,6 +8388,7 @@ function getTerafabxAutomationStatus() {
     },
     comment: {
       enabled: Boolean(state.commentEnabled),
+      prefillOnly: Boolean(state.commentPrefillOnly),
       intervalMs: 0,
       baseIntervalMs: dailyCommentProgress.baseIntervalMs,
       daily: dailyCommentProgress,
@@ -7784,6 +8430,31 @@ function getTerafabxAutomationStatus() {
       manualQueue: ownPostReplyManualQueue.slice().reverse(),
       pendingManualCount: ownPostReplyManualQueue.filter((item) => ["queued", "running"].includes(item.status)).length,
     },
+    todayPostReply: {
+      enabled: Boolean(state.todayPostReplyEnabled),
+      busy: terafabxTodayPostReplyBusy,
+      manualRequested: state.todayPostReplyManualRequested === true,
+      intervalMs: TERAFABX_TODAY_POST_REPLY_INTERVAL_MS,
+      date: formatKstDateKey(),
+      nextRunAt: state.todayPostReplyEnabled
+        ? new Date(Math.max(now, lastTodayPostReplyMs + TERAFABX_TODAY_POST_REPLY_INTERVAL_MS)).toISOString()
+        : null,
+      lastRunAt: state.todayPostReplyLastRunAt,
+      lastStatus: state.todayPostReplyLastStatus,
+      lastError: state.todayPostReplyLastError,
+      lastCompletedDate: state.todayPostReplyLastCompletedDate,
+      summary: state.todayPostReplyLastSummary,
+      resources: {
+        grokSessionPrefix: TERAFABX_TODAY_POST_REPLY_GROK_SESSION,
+        geminiPortBase: TERAFABX_TODAY_POST_REPLY_GEMINI_PORT_BASE,
+        concurrency: terafabxBrowserConcurrency(TERAFABX_OWN_POST_REPLY_CONCURRENCY),
+        sharesAutoCommentWorkers: false,
+        xWriterSerialized: true,
+        geminiScriptPath: resolveTerafabxGeminiScriptPath(),
+        geminiScriptReady: fs.existsSync(resolveTerafabxGeminiScriptPath()),
+      },
+      completion: assessTerafabxTodayPostReplyCompletion(state.todayPostReplyLastSummary || {}),
+    },
     affiliate: {
       defaultTargetUrl: state.affiliateDefaultTargetUrl || "",
       defaultLink: state.affiliateDefaultLink || "",
@@ -7823,6 +8494,13 @@ async function maybeRunTerafabxCommentAutomation() {
   const daily = terafabxDailyCommentProgress(state);
   if (!state.commentEnabled || daily.reached) return;
   const pendingCount = pendingTerafabxCommentPosts(state).length;
+  if (state.commentPrefillOnly) {
+    if (!terafabxCommentPrefillBusy && (TERAFABX_COMMENT_PREFILL_UNLIMITED || pendingCount < TERAFABX_COMMENT_PREFILL_TARGET)) {
+      maybeStartTerafabxCommentPrefill("prefill_only_scheduler");
+    }
+    logEvent("terafabx_comment_scheduler_prefill_only", { pendingCount, targetCount: TERAFABX_COMMENT_PREFILL_TARGET, unlimited: TERAFABX_COMMENT_PREFILL_UNLIMITED });
+    return;
+  }
   if (pendingCount <= 0) {
     if (!terafabxCommentPrefillBusy) maybeStartTerafabxCommentPrefill("empty_comment_queue");
     return;
@@ -7965,6 +8643,133 @@ async function maybeRunTerafabxOwnPostReplyAutomation() {
   }
 }
 
+async function runTerafabxTodayPostReplySweep({ manual = false } = {}) {
+  if (terafabxTodayPostReplyBusy || terafabxOwnPostReplyBusy) throw new Error("다른 대댓글 하트+답글 작업이 진행 중입니다.");
+  if (!manual && isTerafabxQuietPostingTime()) return { ok: true, deferred: true, quietUntil: nextTerafabxQuietPostingEnd() };
+  terafabxTodayPostReplyBusy = true;
+  const startedAt = new Date().toISOString();
+  const date = formatKstDateKey();
+  try {
+    saveTerafabxState({ todayPostReplyManualRequested: false, todayPostReplyLastStatus: "discovering", todayPostReplyLastError: null });
+    const discovery = await discoverTerafabxTodayRootPosts(date);
+    const results = [];
+    const selfHealingActions = [];
+    const geminiScriptPath = resolveTerafabxGeminiScriptPath();
+    const legacyGeminiScriptPath = path.join(NAVER_BLOG_ADPOST_ROOT, "scripts", "gemini_custom_prompt.js");
+    if (!fs.existsSync(legacyGeminiScriptPath) && fs.existsSync(geminiScriptPath)) {
+      selfHealingActions.push({ type: "gemini_script_fallback", status: "recovered", path: geminiScriptPath });
+    }
+    let postedCount = 0;
+    let retryableErrorCount = discovery.metadataErrorCount;
+    let lastFailureSignature = "";
+    let repeatedFailureCount = 0;
+    let circuitBreaker = null;
+    for (let postIndex = 0; postIndex < discovery.posts.length; postIndex += 1) {
+      const post = discovery.posts[postIndex];
+      saveTerafabxState({
+        todayPostReplyLastStatus: "processing",
+        todayPostReplyLastSummary: {
+          date,
+          discoveryComplete: discovery.discoveryComplete,
+          rootPostCount: discovery.posts.length,
+          checkedRootCount: postIndex,
+          postedCount,
+          remainingEligibleCount: null,
+          retryableErrorCount,
+          selfHealingActions,
+          currentPostUrl: post.url,
+        },
+      });
+      try {
+        const batch = await runTerafabxOwnPostReplyBatch({
+          postUrl: post.url,
+          manual,
+          resourceFactory: terafabxTodayPostReplyWorkerResources,
+          rootGrokSession: `${TERAFABX_TODAY_POST_REPLY_GROK_SESSION}-root-context`,
+          source: "today_post_reply",
+        });
+        postedCount += batch.posted?.length || 0;
+        retryableErrorCount += (batch.rejected || []).filter((item) => item.stage !== "target_unavailable").length;
+        results.push({ postUrl: post.url, batch });
+        const failureSignature = terafabxReplyBatchFailureSignature(batch);
+        repeatedFailureCount = failureSignature && failureSignature === lastFailureSignature
+          ? repeatedFailureCount + 1
+          : (failureSignature ? 1 : 0);
+        lastFailureSignature = failureSignature;
+        if (failureSignature && repeatedFailureCount >= 2) {
+          circuitBreaker = {
+            reason: "repeated_identical_batch_failure",
+            count: repeatedFailureCount,
+            error: failureSignature,
+            stoppedAtPostIndex: postIndex,
+          };
+          selfHealingActions.push({ type: "circuit_breaker", status: "stopped", ...circuitBreaker });
+          retryableErrorCount += Math.max(0, discovery.posts.length - postIndex - 1);
+          logEvent("terafabx_today_post_reply_circuit_breaker", circuitBreaker);
+          break;
+        }
+      } catch (error) {
+        retryableErrorCount += 1;
+        results.push({ postUrl: post.url, error: error.message });
+      }
+    }
+    let remainingEligibleCount = 0;
+    let checkedRootCount = 0;
+    for (const post of discovery.posts) {
+      try {
+        const recheck = await collectTerafabxOwnPostConversation(post.url);
+        remainingEligibleCount += recheck.candidates.length;
+        checkedRootCount += 1;
+      } catch (error) {
+        retryableErrorCount += 1;
+        results.push({ postUrl: post.url, recheckError: error.message });
+      }
+    }
+    const summary = {
+      date,
+      discoveryComplete: discovery.discoveryComplete,
+      rootPostCount: discovery.posts.length,
+      checkedRootCount,
+      postedCount,
+      remainingEligibleCount,
+      retryableErrorCount,
+      scannedUrlCount: discovery.scannedUrlCount,
+      startedAt,
+      completedAt: new Date().toISOString(),
+      selfHealingActions,
+      circuitBreaker,
+      geminiScriptPath,
+    };
+    const completion = assessTerafabxTodayPostReplyCompletion(summary);
+    const result = { ok: true, action: "today-post-reply", ...summary, ...completion, results };
+    saveTerafabxState({
+      todayPostReplyLastRunAt: result.completedAt,
+      todayPostReplyLastStatus: completion.complete ? "complete" : "partial",
+      todayPostReplyLastError: completion.complete ? null : `${remainingEligibleCount}건 남음 · 재시도 오류 ${retryableErrorCount}건`,
+      todayPostReplyLastCompletedDate: completion.complete ? date : loadTerafabxState().todayPostReplyLastCompletedDate,
+      todayPostReplyLastSummary: result,
+    });
+    logEvent("terafabx_today_post_reply_done", { ...summary, complete: completion.complete });
+    return result;
+  } catch (error) {
+    saveTerafabxState({ todayPostReplyLastRunAt: new Date().toISOString(), todayPostReplyLastStatus: "error", todayPostReplyLastError: error.message });
+    logEvent("terafabx_today_post_reply_error", { startedAt, error: error.message });
+    throw error;
+  } finally {
+    terafabxTodayPostReplyBusy = false;
+  }
+}
+
+async function maybeRunTerafabxTodayPostReplyAutomation() {
+  const state = loadTerafabxState();
+  if (terafabxTodayPostReplyBusy || terafabxOwnPostReplyBusy) return;
+  const lastRunMs = state.todayPostReplyLastRunAt ? new Date(state.todayPostReplyLastRunAt).getTime() : 0;
+  const manual = state.todayPostReplyManualRequested === true;
+  const due = manual || (state.todayPostReplyEnabled && Date.now() - lastRunMs >= TERAFABX_TODAY_POST_REPLY_INTERVAL_MS);
+  if (!due) return;
+  await runTerafabxTodayPostReplySweep({ manual });
+}
+
 function loadTerafabxCommentMonitorState() {
   const daily = terafabxDailyCommentProgress();
   return {
@@ -8012,13 +8817,14 @@ function evaluateTerafabxCommentWorkflow(state, options = {}) {
   const windowMs = Number(options.windowMs || TERAFABX_COMMENT_MONITOR_INTERVAL_MS);
   const quiet = options.quiet === undefined ? isTerafabxQuietPostingTime(now) : Boolean(options.quiet);
   const enabled = state?.commentEnabled !== false;
+  const prefillOnly = state?.commentPrefillOnly === true;
   const pending = pendingTerafabxCommentPosts(state || {});
   const daily = terafabxDailyCommentProgress(state || {}, now, { dailyTarget: options.dailyTarget });
   const posted = (state?.commentHistory || []).filter((item) => {
     const time = terafabxCommentRecordTime(item);
     return time >= nowMs - windowMs && time <= nowMs && Boolean(item.replyUrl || item.posted || item.status === "posted");
   });
-  const target = enabled && !quiet
+  const target = enabled && !prefillOnly && !quiet
     ? Math.max(1, Math.floor(windowMs / daily.requiredIntervalMs))
     : 0;
   const findings = [];
@@ -8030,7 +8836,7 @@ function evaluateTerafabxCommentWorkflow(state, options = {}) {
       target,
     });
   }
-  if (enabled && !quiet && daily.postedToday < daily.targetByNow) {
+  if (enabled && !prefillOnly && !quiet && daily.postedToday < daily.targetByNow) {
     findings.push({
       type: "daily_pace_below_target",
       severity: "warning",
@@ -8048,10 +8854,10 @@ function evaluateTerafabxCommentWorkflow(state, options = {}) {
     const queuedAt = new Date(item.queuedAt || item.at || 0).getTime();
     return Number.isFinite(queuedAt) && queuedAt > 0 ? Math.max(oldest, nowMs - queuedAt) : oldest;
   }, 0);
-  if (!quiet && oldestPendingAgeMs > Math.max(windowMs * 1.5, daily.requiredIntervalMs * 3)) {
+  if (!prefillOnly && !quiet && oldestPendingAgeMs > Math.max(windowMs * 1.5, daily.requiredIntervalMs * 3)) {
     findings.push({ type: "pending_queue_stalled", severity: "warning", pendingCount: pending.length, oldestPendingAgeMs });
   }
-  const qualityFeedback = deriveTerafabxCommentQualityFeedback(state?.commentHistory || []);
+  const qualityFeedback = deriveTerafabxCommentQualityFeedback(prefillOnly ? pending : (state?.commentHistory || []));
   if (qualityFeedback.belowThresholdCount > 0) {
     findings.push({ type: "independent_judge_failures", severity: "warning", count: qualityFeedback.belowThresholdCount });
   }
@@ -8063,6 +8869,7 @@ function evaluateTerafabxCommentWorkflow(state, options = {}) {
   }
   return {
     enabled,
+    prefillOnly,
     quiet,
     windowMs,
     windowStartedAt: new Date(nowMs - windowMs).toISOString(),
@@ -8079,11 +8886,15 @@ function evaluateTerafabxCommentWorkflow(state, options = {}) {
 }
 
 function shouldTerafabxCommentMonitorRequestPrefill(state = {}, evaluation = {}, options = {}) {
-  const targetCount = Math.max(0, Number(options.targetCount ?? TERAFABX_COMMENT_PREFILL_TARGET) || 0);
+  const rawTargetCount = Object.prototype.hasOwnProperty.call(options, "targetCount")
+    ? options.targetCount
+    : TERAFABX_COMMENT_PREFILL_TARGET;
+  const unlimited = rawTargetCount == null || !Number.isFinite(Number(rawTargetCount));
+  const targetCount = unlimited ? null : Math.max(0, Number(rawTargetCount) || 0);
   return Boolean(
     state.commentEnabled
     && !evaluation.daily?.reached
-    && Number(evaluation.pendingCount || 0) < targetCount
+    && (unlimited || Number(evaluation.pendingCount || 0) < targetCount)
     && !options.prefillBusy
     && !options.manualActionPending
     && !isTerafabxGrokQuotaBackoffActive(state, options.nowMs ?? Date.now())
@@ -8092,9 +8903,13 @@ function shouldTerafabxCommentMonitorRequestPrefill(state = {}, evaluation = {},
 
 function terafabxGrokQuotaMonitorFinding(state = {}, evaluation = {}, options = {}) {
   const nowMs = Number(options.nowMs ?? Date.now());
-  const targetCount = Math.max(0, Number(options.targetCount ?? TERAFABX_COMMENT_PREFILL_TARGET) || 0);
+  const rawTargetCount = Object.prototype.hasOwnProperty.call(options, "targetCount")
+    ? options.targetCount
+    : TERAFABX_COMMENT_PREFILL_TARGET;
+  const unlimited = rawTargetCount == null || !Number.isFinite(Number(rawTargetCount));
+  const targetCount = unlimited ? null : Math.max(0, Number(rawTargetCount) || 0);
   if (!isTerafabxGrokQuotaBackoffActive(state, nowMs)) return null;
-  if (evaluation.daily?.reached || Number(evaluation.pendingCount || 0) >= targetCount) return null;
+  if (evaluation.daily?.reached || (!unlimited && Number(evaluation.pendingCount || 0) >= targetCount)) return null;
   return {
     type: "grok_quota_limited",
     severity: "error",
@@ -8113,13 +8928,21 @@ function quarantineExhaustedTerafabxPendingComments(state = loadTerafabxState())
     exhausted.push({ ...item, status: "error", errorAt: failedAt, failedReason: "monitor_max_attempts" });
     return false;
   });
-  if (!exhausted.length) return { count: 0, remainingCount: remaining.length };
+  const removedCount = rawPending.length - remaining.length;
+  if (!removedCount) return { count: 0, exhaustedCount: 0, policyRejectedCount: 0, remainingCount: remaining.length };
   saveTerafabxState({
     pendingCommentPosts: remaining,
-    failedPendingCommentPosts: [...exhausted, ...(state.failedPendingCommentPosts || [])].slice(0, 100),
+    failedPendingCommentPosts: [...policyRejected, ...exhausted, ...(state.failedPendingCommentPosts || [])].slice(0, 100),
   });
-  logEvent("terafabx_comment_monitor_quarantined", { count: exhausted.length, remainingCount: remaining.length });
-  return { count: exhausted.length, remainingCount: remaining.length };
+  const result = {
+    count: exhausted.length + policyRejected.length,
+    exhaustedCount: exhausted.length,
+    policyRejectedCount: policyRejected.length,
+    removedCount,
+    remainingCount: remaining.length,
+  };
+  logEvent("terafabx_comment_monitor_quarantined", result);
+  return result;
 }
 
 function recoverRecentTransientPrefillFailures(state = loadTerafabxState(), options = {}) {
@@ -8182,8 +9005,8 @@ function recoverRecentTransientPrefillFailures(state = loadTerafabxState(), opti
 function auditTerafabxPrefillQuality(state = loadTerafabxState(), options = {}) {
   const sinceMs = Number(options.sinceMs || TERAFABX_PREFILL_GENERICITY_ROLLOUT_AT);
   const limit = Math.max(1, Number(options.limit || 500));
-  const pending = pendingTerafabxCommentPosts(state)
-    .filter((item) => item?.source === "prefill");
+  const pending = (Array.isArray(state.pendingCommentPosts) ? state.pendingCommentPosts : [])
+    .filter((item) => item?.source === "prefill" && item?.status !== "posted");
   const posted = (state.commentHistory || [])
     .filter((item) => item?.source === "prefill")
     .filter((item) => terafabxCommentRecordTime(item) >= sinceMs);
@@ -8338,7 +9161,7 @@ async function runTerafabxCommentMonitor(options = {}) {
       }
     }
     const overdue = evaluation.postedInWindow < evaluation.targetInWindow;
-    if (state.commentEnabled && !evaluation.quiet && overdue && evaluation.pendingCount > 0 && !terafabxBusy && !terafabxSchedulerBusy && !terafabxManualActionPending) {
+    if (state.commentEnabled && !state.commentPrefillOnly && !evaluation.quiet && overdue && evaluation.pendingCount > 0 && !terafabxBusy && !terafabxSchedulerBusy && !terafabxManualActionPending) {
       setImmediate(() => maybeRunTerafabxCommentAutomation().catch((error) => {
         logEvent("terafabx_comment_monitor_scheduler_kick_error", { error: error.message });
       }));
@@ -8393,6 +9216,42 @@ function validateThreadsUrl(value) {
   return `https://www.threads.com/@${match[1]}/post/${match[2]}`;
 }
 
+function validateYouTubeUrl(value) {
+  const parsed = new URL(String(value || "").trim());
+  const hostname = parsed.hostname.toLowerCase().replace(/^www\./, "");
+  let videoId = "";
+  let shorts = false;
+  if (hostname === "youtu.be") {
+    videoId = parsed.pathname.split("/").filter(Boolean)[0] || "";
+  } else if (hostname === "youtube.com" || hostname === "m.youtube.com") {
+    const shortsMatch = parsed.pathname.match(/^\/shorts\/([A-Za-z0-9_-]{6,})/);
+    const embedMatch = parsed.pathname.match(/^\/(?:embed|live)\/([A-Za-z0-9_-]{6,})/);
+    if (shortsMatch) {
+      videoId = shortsMatch[1];
+      shorts = true;
+    } else if (embedMatch) {
+      videoId = embedMatch[1];
+    } else if (parsed.pathname === "/watch") {
+      videoId = parsed.searchParams.get("v") || "";
+    }
+  }
+  if (!/^[A-Za-z0-9_-]{6,}$/.test(videoId)) {
+    throw new Error("YouTube 영상 또는 Shorts URL 형식이 아닙니다.");
+  }
+  return shorts
+    ? `https://www.youtube.com/shorts/${videoId}`
+    : `https://www.youtube.com/watch?v=${videoId}`;
+}
+
+function isYouTubeUrl(value) {
+  try {
+    validateYouTubeUrl(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function isInssiderPostUrl(value) {
   try {
     const parsed = new URL(value);
@@ -8416,7 +9275,9 @@ function validateInssiderUrl(value) {
 }
 
 function normalizeDiscoveryUrl(value) {
-  return isInssiderPostUrl(value) ? validateInssiderUrl(value).canonicalUrl : validateThreadsUrl(value);
+  if (isInssiderPostUrl(value)) return validateInssiderUrl(value).canonicalUrl;
+  if (isYouTubeUrl(value)) return validateYouTubeUrl(value);
+  return validateThreadsUrl(value);
 }
 
 function parseCompactCount(value) {
@@ -9079,6 +9940,39 @@ async function downloadMedia(urls) {
   return { dir, files };
 }
 
+async function downloadYouTubeVideo(url) {
+  const canonicalUrl = validateYouTubeUrl(url);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "youtube-x-upload-"));
+  const outputTemplate = path.join(dir, "video.%(ext)s");
+  try {
+    const result = await execFileOutput("yt-dlp", [
+      "--no-playlist",
+      "--merge-output-format", "mp4",
+      "--remux-video", "mp4",
+      "--max-filesize", "500M",
+      "-f", "bv*[vcodec^=avc1][ext=mp4][height<=720]+ba[ext=m4a]/b[vcodec^=avc1][ext=mp4][height<=720]/18",
+      "-o", outputTemplate,
+      "--print", "after_move:filepath",
+      canonicalUrl,
+    ], { timeout: 10 * 60 * 1000, maxBuffer: 4 * 1024 * 1024 });
+    const printedPath = String(result.stdout || "").trim().split(/\r?\n/).filter(Boolean).at(-1);
+    const candidates = [
+      printedPath,
+      ...fs.readdirSync(dir).filter((name) => name.endsWith(".mp4")).map((name) => path.join(dir, name)),
+    ].filter((file, index, values) => file && values.indexOf(file) === index && fs.existsSync(file));
+    const file = candidates[0];
+    if (!file) throw new Error(`yt-dlp가 MP4 영상 파일을 만들지 못했습니다: ${String(result.stderr || "").slice(-500)}`);
+    const size = fs.statSync(file).size;
+    if (size <= 0) throw new Error("다운로드한 YouTube 영상 파일이 비어 있습니다.");
+    if (size > 512 * 1024 * 1024) throw new Error("YouTube 영상이 X 업로드 제한 512MB를 초과합니다.");
+    logEvent("youtube_video_downloaded", { canonicalUrl, file: path.basename(file), size });
+    return { dir, files: [file], size };
+  } catch (error) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    throw new Error(`YouTube 영상 다운로드 실패: ${error.message}`);
+  }
+}
+
 function downloadFile(url, file) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
@@ -9101,6 +9995,15 @@ function downloadFile(url, file) {
   });
 }
 
+function isVerifiedXAccountState(accountState = {}, requiredHandle = REQUIRED_X_HANDLE) {
+  const wanted = String(requiredHandle || "").replace(/^@/, "").toLowerCase();
+  if (!wanted) return false;
+  const accountText = String(accountState.accountText || "").toLowerCase();
+  let profilePath = "";
+  try { profilePath = new URL(String(accountState.profileHref || ""), "https://x.com").pathname.toLowerCase(); } catch {}
+  return accountText.includes(`@${wanted}`) || profilePath === `/${wanted}`;
+}
+
 async function verifyXAccount(page) {
   let accountState = null;
   const currentUrl = await page.evalFast("location.href", 5000).catch(() => "");
@@ -9113,15 +10016,11 @@ async function verifyXAccount(page) {
       accountState = await page.eval(`(() => {
         const button = document.querySelector('[data-testid="SideNav_AccountSwitcher_Button"]');
         const profileLink = document.querySelector('[data-testid="AppTabBar_Profile_Link"]');
-        const avatars = Array.from(document.querySelectorAll('[data-testid^="UserAvatar-Container-"]'));
-        const canonical = document.querySelector('link[rel="canonical"]');
         return {
           url: location.href,
           title: document.title,
           accountText: button?.innerText || "",
           profileHref: profileLink?.href || "",
-          canonicalHref: canonical?.href || "",
-          avatarTestIds: avatars.map((avatar) => avatar.getAttribute("data-testid")).filter(Boolean).slice(0, 8),
           bodyText: (document.body.innerText || "").slice(0, 1000),
         };
       })()`);
@@ -9149,9 +10048,11 @@ async function verifyXAccount(page) {
       }
       await sleep(1000);
     }
-  }
-  logEvent("x_account_verify_failed_state", { required: REQUIRED_X_HANDLE, accountState });
-  throw new Error(`X 로그인 계정 검증 실패: @${REQUIRED_X_HANDLE}가 아닙니다.`);
+    return false;
+  };
+  if (await verifyCurrentPage(6)) return;
+  logEvent("x_account_verify_failed_state", { required: REQUIRED_X_HANDLE, accountState, homeFallback: false });
+  throw new Error(`현재 X 화면에서 로그인 계정 @${REQUIRED_X_HANDLE} 검증에 실패했습니다.`);
 }
 
 async function waitForComposer(page) {
@@ -10069,9 +10970,10 @@ async function saveDiscoveryCandidates(candidates) {
       await db.prepare(`
         UPDATE thread_discoveries
         SET author = ?, text_preview = ?, media_preview_url = COALESCE(NULLIF(?, ''), media_preview_url), like_count = ?,
-            media_count = ?, viral_score = ?, status = 'review',
+            media_count = ?, viral_score = ?,
+            status = CASE WHEN status IN ('queued_schedule', 'scheduling') THEN status ELSE 'review' END,
             criteria = ?, discovered_at = CURRENT_TIMESTAMP
-        WHERE canonical_url = ? AND status IN ('review', 'draft', 'queued', 'failed', 'failed_post', 'failed_draft', 'failed_schedule', 'discovered', 'skipped')
+        WHERE canonical_url = ? AND status IN ('review', 'draft', 'queued', 'queued_schedule', 'scheduling', 'failed', 'failed_post', 'failed_draft', 'failed_schedule', 'discovered', 'skipped')
       `).run(candidate.author, candidate.textPreview, candidate.mediaPreviewUrl || "", candidate.likeCount, candidate.mediaCount, candidate.viralScore || 0, candidate.criteria || "", candidate.canonicalUrl);
       updated += 1;
       continue;
@@ -10164,9 +11066,11 @@ async function markDiscoveryExtractionFailed(canonicalUrl, details = {}) {
 }
 
 async function addDiscoveryPlaceholder(url, options = {}) {
-  const canonicalUrl = validateThreadsUrl(url);
+  const canonicalUrl = normalizeDiscoveryUrl(url);
   const db = await getDiscoveryDb();
-  const author = new URL(canonicalUrl).pathname.split("/")[1].replace("@", "");
+  const author = isYouTubeUrl(canonicalUrl)
+    ? "YouTube"
+    : new URL(canonicalUrl).pathname.split("/")[1].replace("@", "");
   const textPreview = String(options.text || "").trim() || "수집 중";
   const excludedKeyword = excludedDiscoveryKeywordForText(`${author} ${textPreview}`);
   if (excludedKeyword) {
@@ -10208,6 +11112,102 @@ async function addDiscoveryPlaceholder(url, options = {}) {
   `).run(canonicalUrl, author, textPreview, criteria);
   logEvent("discovery_placeholder_added", { canonicalUrl, origin: options.origin || null });
   return { canonicalUrl, inserted: 1, updated: 0, skippedCompleted: 0 };
+}
+
+function youtubeVideoId(canonicalUrl) {
+  const parsed = new URL(validateYouTubeUrl(canonicalUrl));
+  return parsed.pathname.startsWith("/shorts/")
+    ? parsed.pathname.split("/")[2]
+    : parsed.searchParams.get("v");
+}
+
+function buildYouTubeXText(title, canonicalUrl, maxLength = 280) {
+  const url = validateYouTubeUrl(canonicalUrl);
+  const cleanTitle = String(title || "YouTube 영상").trim() || "YouTube 영상";
+  const separator = "\n";
+  const titleLimit = Math.max(1, maxLength - xWeightedLength(separator) - xWeightedLength(url));
+  return `${truncateXText(cleanTitle, titleLimit)}${separator}${url}`;
+}
+
+function sanitizeYouTubeXTitle(value, maxLength = 280) {
+  const cleaned = String(value || "")
+    .replace(/https?:\/\/\S+/giu, " ")
+    .replace(/(^|\s)#[\p{L}\p{N}_-]+/gu, " ")
+    .replace(/[ \t]+/g, " ")
+    .replace(/ *\n+ */g, " ")
+    .trim();
+  return truncateXText(cleaned || "YouTube 영상", maxLength);
+}
+
+async function extractYouTubePost(url) {
+  const canonicalUrl = validateYouTubeUrl(url);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  try {
+    const endpoint = new URL("https://www.youtube.com/oembed");
+    endpoint.searchParams.set("url", canonicalUrl);
+    endpoint.searchParams.set("format", "json");
+    const response = await fetch(endpoint, {
+      signal: controller.signal,
+      headers: { "user-agent": "thread-dashboard/1.0" },
+    });
+    if (!response.ok) throw new Error(`YouTube 메타데이터 응답 오류 (${response.status})`);
+    const metadata = await response.json();
+    const title = String(metadata.title || "").trim();
+    if (!title) throw new Error("YouTube 영상 제목을 찾지 못했습니다.");
+    const author = String(metadata.author_name || "YouTube").trim() || "YouTube";
+    const text = sanitizeYouTubeXTitle(title);
+    return {
+      url: canonicalUrl,
+      text,
+      title,
+      author,
+      authorUrl: String(metadata.author_url || ""),
+      thumbnailUrl: String(metadata.thumbnail_url || `https://i.ytimg.com/vi/${youtubeVideoId(canonicalUrl)}/hqdefault.jpg`),
+      mediaUrls: [],
+      imageMediaUrls: [],
+      videoMediaUrls: [],
+      likeCount: 0,
+      diagnostics: { source: "youtube_oembed", videoId: youtubeVideoId(canonicalUrl) },
+    };
+  } catch (error) {
+    if (error?.name === "AbortError") throw new Error("YouTube 메타데이터 수집 시간이 초과되었습니다.");
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function addYouTubeToDiscoveryReview(url, options = {}) {
+  const post = await extractYouTubePost(url);
+  const canonicalUrl = post.url;
+  const textPreview = String(options.text || post.text).trim() || post.text;
+  const saved = await saveDiscoveryCandidates([{
+    canonicalUrl,
+    author: post.author,
+    textPreview: textPreview.slice(0, 280),
+    mediaPreviewUrl: post.thumbnailUrl,
+    likeCount: 0,
+    mediaCount: 1,
+    viralScore: 0,
+    criteria: JSON.stringify({
+      source: "youtube",
+      manualShare: true,
+      videoId: post.diagnostics.videoId,
+      title: post.title,
+      authorUrl: post.authorUrl,
+      thumbnailUrl: post.thumbnailUrl,
+      uploadVideo: true,
+    }),
+  }]);
+  logEvent("youtube_added_to_discovery", { canonicalUrl, author: post.author, ...saved });
+  return { canonicalUrl, mediaCount: 1, saved, message: "YouTube 영상을 대시보드에 추가함" };
+}
+
+async function addSourceToDiscoveryReview(url, options = {}) {
+  return isYouTubeUrl(url)
+    ? addYouTubeToDiscoveryReview(url, options)
+    : addThreadToDiscoveryReview(url, options);
 }
 
 async function markDiscoveryDetailError(canonicalUrl, error) {
@@ -10615,6 +11615,19 @@ async function markDiscoveryScheduled(canonicalUrl, mediaCount, scheduledAt) {
   `).run(scheduledAt || null, mediaCount || 0, canonicalUrl);
 }
 
+async function markDiscoveryScheduleQueueState(canonicalUrl, status) {
+  if (!['queued_schedule', 'scheduling'].includes(status)) {
+    throw new Error(`지원하지 않는 자동 예약 큐 상태입니다: ${status}`);
+  }
+  const db = await getDiscoveryDb();
+  await db.prepare(`
+    UPDATE thread_discoveries
+    SET status = ?, last_error = NULL, discovered_at = CURRENT_TIMESTAMP
+    WHERE canonical_url = ?
+      AND status NOT IN ('scheduled', 'posted', 'x_draft', 'skipped')
+  `).run(status, canonicalUrl);
+}
+
 async function cancelDiscoveryScheduledPost(canonicalUrl) {
   const url = normalizeDiscoveryUrl(canonicalUrl);
   const db = await getDiscoveryDb();
@@ -10709,7 +11722,7 @@ async function discardDiscoveredRows() {
 }
 
 async function discardDiscoveryRow(canonicalUrl) {
-  const url = validateThreadsUrl(canonicalUrl);
+  const url = normalizeDiscoveryUrl(canonicalUrl);
   const db = await getDiscoveryDb();
   const result = await db.prepare(`
     UPDATE thread_discoveries
@@ -10758,13 +11771,15 @@ async function refreshDiscoveryPreviews(limit = 20) {
   const failed = [];
   for (const row of rows) {
     try {
-      const post = await extractThreadPost(row.canonicalUrl);
+      const post = isYouTubeUrl(row.canonicalUrl)
+        ? await extractYouTubePost(row.canonicalUrl)
+        : await extractThreadPost(row.canonicalUrl);
       await db.prepare(`
         UPDATE thread_discoveries
         SET text_preview = ?, media_preview_url = COALESCE(NULLIF(?, ''), media_preview_url),
             media_count = ?, last_error = NULL
         WHERE canonical_url = ?
-      `).run(post.text.slice(0, 240), post.mediaUrls[0] || post.imageMediaUrls?.[0] || "", post.mediaUrls.length, row.canonicalUrl);
+      `).run(post.text.slice(0, 280), post.thumbnailUrl || post.mediaUrls[0] || post.imageMediaUrls?.[0] || "", isYouTubeUrl(row.canonicalUrl) ? 1 : post.mediaUrls.length, row.canonicalUrl);
       refreshed.push(row.canonicalUrl);
     } catch (error) {
       failed.push({ canonicalUrl: row.canonicalUrl, error: error.message });
@@ -10774,7 +11789,7 @@ async function refreshDiscoveryPreviews(limit = 20) {
 }
 
 async function refetchDiscoveryRow(canonicalUrl, options = {}) {
-  const url = validateThreadsUrl(canonicalUrl);
+  const url = normalizeDiscoveryUrl(canonicalUrl);
   const db = await getDiscoveryDb();
   const existing = await db.prepare(`
     SELECT canonical_url AS canonicalUrl, status
@@ -10796,7 +11811,7 @@ async function refetchDiscoveryRow(canonicalUrl, options = {}) {
       AND status NOT IN ('scheduled', 'posted', 'x_draft')
   `).run(url);
   try {
-    const result = await addThreadToDiscoveryReview(url, { text: options.text });
+    const result = await addSourceToDiscoveryReview(url, { text: options.text });
     logEvent("discovery_refetch_ok", { canonicalUrl: url, mediaCount: result.mediaCount });
     return result;
   } catch (error) {
@@ -10807,7 +11822,7 @@ async function refetchDiscoveryRow(canonicalUrl, options = {}) {
 }
 
 async function reinspectScheduledDiscoverySource(canonicalUrl) {
-  const url = validateThreadsUrl(canonicalUrl);
+  const url = normalizeDiscoveryUrl(canonicalUrl);
   const db = await getDiscoveryDb();
   const row = await db.prepare(`
     SELECT canonical_url AS canonicalUrl, status, criteria
@@ -10815,30 +11830,33 @@ async function reinspectScheduledDiscoverySource(canonicalUrl) {
     WHERE canonical_url = ?
   `).get(url);
   if (!row || row.status !== "scheduled") throw new Error("재검사할 예약 항목을 찾지 못했습니다.");
-  const post = await withMirrorChromeLock("scheduled_source_reinspect", () => extractThreadPost(url, { allowEmptyText: true }));
+  const post = isYouTubeUrl(url)
+    ? await extractYouTubePost(url)
+    : await withMirrorChromeLock("scheduled_source_reinspect", () => extractThreadPost(url, { allowEmptyText: true }));
   if (!String(post.text || "").trim() && post.mediaUrls.length === 0) {
     throw new Error("예약 원문의 텍스트와 미디어를 모두 확인하지 못했습니다.");
   }
   const criteria = {
     ...parseDiscoveryCriteria(row.criteria),
-    hasMedia: post.mediaUrls.length > 0,
-    textOnly: post.mediaUrls.length === 0,
+    hasMedia: isYouTubeUrl(url) || post.mediaUrls.length > 0,
+    textOnly: !isYouTubeUrl(url) && post.mediaUrls.length === 0,
     mediaOnly: !String(post.text || "").trim() && post.mediaUrls.length > 0,
     sourceReinspectedAt: new Date().toISOString(),
     extractionDiagnostics: post.diagnostics,
   };
+  const mediaCount = isYouTubeUrl(url) ? 1 : post.mediaUrls.length;
   await db.prepare(`
     UPDATE thread_discoveries
     SET text_preview = ?, media_preview_url = ?, media_count = ?, criteria = ?, last_error = NULL
     WHERE canonical_url = ? AND status = 'scheduled'
-  `).run(post.text.slice(0, 240) || "(본문 없음)", post.mediaUrls[0] || "", post.mediaUrls.length, JSON.stringify(criteria), url);
+  `).run(post.text.slice(0, 280) || "(본문 없음)", post.thumbnailUrl || post.mediaUrls[0] || "", mediaCount, JSON.stringify(criteria), url);
   logEvent("scheduled_source_reinspected", {
     canonicalUrl: url,
     textPreview: post.text.slice(0, 120),
-    mediaCount: post.mediaUrls.length,
+    mediaCount,
     diagnostics: post.diagnostics,
   });
-  return { canonicalUrl: url, text: post.text, mediaCount: post.mediaUrls.length, diagnostics: post.diagnostics };
+  return { canonicalUrl: url, text: post.text, mediaCount, diagnostics: post.diagnostics };
 }
 
 function formatDashboardDateTime(value) {
@@ -10866,7 +11884,7 @@ async function renderDiscoveryDashboard(requestUrl = "/discovery") {
   const nowMs = Date.now();
   const allRows = mergeDiscoveryRowsWithMirrorHistory(await listDiscoveryRows(300), nowMs);
   const dashboardRows = allRows.map((row) => dashboardDiscoveryRow(row, nowMs));
-  const discoveredStatuses = new Set(["review", "draft", "failed", "failed_post", "failed_draft", "failed_schedule"]);
+  const discoveredStatuses = new Set(["review", "draft", "queued_schedule", "scheduling", "failed", "failed_post", "failed_draft", "failed_schedule"]);
   const viewRows = {
     discovered: dashboardRows.filter((row) => discoveredStatuses.has(row.status)),
     scheduled: dashboardRows.filter((row) => {
@@ -11184,7 +12202,7 @@ async function renderDiscoveryDashboard(requestUrl = "/discovery") {
     </div>
   </header>
   <form class="add-url" id="add-url-form">
-    <input id="add-url-input" type="url" placeholder="Threads URL 추가" autocomplete="off" />
+    <input id="add-url-input" type="url" placeholder="Threads 또는 YouTube URL 추가" autocomplete="off" />
     <button id="add-url-button" type="submit">추가</button>
   </form>
   <section class="dashboard-overview" aria-label="대시보드 요약">
@@ -11524,7 +12542,7 @@ async function getDiscoveryDashboardData(requestUrl = "/api/discovery/dashboard"
   });
   const automation = buildAutomationDashboardData(allRows, nowMs);
   const dashboardRows = allRows.map((row) => dashboardDiscoveryRow(row, nowMs));
-  const discoveredStatuses = new Set(["review", "draft", "failed", "failed_post", "failed_draft", "failed_schedule"]);
+  const discoveredStatuses = new Set(["review", "draft", "queued_schedule", "scheduling", "failed", "failed_post", "failed_draft", "failed_schedule"]);
   const viewRows = {
     discovered: dashboardRows.filter((row) => discoveredStatuses.has(row.status)),
     scheduled: dashboardRows.filter((row) => {
@@ -12034,8 +13052,57 @@ async function createXDraftFromThread(url, options = {}) {
 }
 
 async function postDiscoveryRowToX(canonicalUrl, options = {}) {
-  if (!isInssiderPostUrl(canonicalUrl)) {
+  if (!isInssiderPostUrl(canonicalUrl) && !isYouTubeUrl(canonicalUrl)) {
     return mirrorThread(canonicalUrl, options);
+  }
+  if (isYouTubeUrl(canonicalUrl)) {
+    const url = validateYouTubeUrl(canonicalUrl);
+    const completed = findCompletedMirror(url);
+    if (completed) {
+      throw new DuplicateMirrorError("이미 X에 게시 또는 예약된 YouTube URL입니다.", {
+        canonicalUrl: url,
+        previousStatus: completed.status,
+        previousScheduledAt: completed.scheduledAt,
+        previousCompletedAt: completed.completedAt,
+      });
+    }
+    const row = await getDiscoveryRow(url);
+    if (!row) throw new Error("저장된 YouTube 대시보드 항목을 찾지 못했습니다.");
+    const criteria = parseDiscoveryCriteria(row.criteria);
+    const post = {
+      url,
+      text: sanitizeYouTubeXTitle(options.textOverride || criteria.title || row.textPreview),
+      mediaUrls: [],
+      imageMediaUrls: [],
+      videoMediaUrls: [url],
+      diagnostics: { source: "youtube_downloaded_video" },
+    };
+    const scheduledAt = parseRequestedScheduleTime(options.scheduledAt);
+    const media = await downloadYouTubeVideo(url);
+    try {
+      const postResult = await postToX(post, media.files, {
+        schedule: Boolean(options.schedule),
+        scheduledAt,
+      });
+      recordCompletedMirror({
+        canonicalUrl: url,
+        status: postResult.scheduledAt ? "scheduled" : "posted",
+        scheduledAt: postResult.scheduledAt?.toISOString(),
+        postUrl: postResult.postUrl || null,
+        mediaCount: media.files.length,
+      });
+      logEvent("youtube_x_post_success", { canonicalUrl: url, scheduledAt: postResult.scheduledAt?.toISOString(), mediaCount: media.files.length });
+      return {
+        canonicalUrl: url,
+        mediaCount: media.files.length,
+        scheduledAt: postResult.scheduledAt?.toISOString(),
+        postUrl: postResult.postUrl || null,
+        message: postResult.scheduledAt ? `X 예약됨 · ${postResult.scheduledAt.toLocaleString("ko-KR")}` : "X 게시됨",
+      };
+    } finally {
+      fs.rmSync(media.dir, { recursive: true, force: true });
+      logEvent("cleanup_done", { canonicalUrl: url, dir: media.dir, source: "youtube" });
+    }
   }
   const completed = findCompletedMirror(canonicalUrl);
   if (completed) {
@@ -12124,8 +13191,31 @@ async function postDiscoveryRowToX(canonicalUrl, options = {}) {
 }
 
 async function createXDraftFromDiscoveryRow(canonicalUrl, options = {}) {
-  if (!isInssiderPostUrl(canonicalUrl)) {
+  if (!isInssiderPostUrl(canonicalUrl) && !isYouTubeUrl(canonicalUrl)) {
     return createXDraftFromThread(canonicalUrl, options);
+  }
+  if (isYouTubeUrl(canonicalUrl)) {
+    const url = validateYouTubeUrl(canonicalUrl);
+    const row = await getDiscoveryRow(url);
+    if (!row) throw new Error("저장된 YouTube 대시보드 항목을 찾지 못했습니다.");
+    const criteria = parseDiscoveryCriteria(row.criteria);
+    const post = {
+      url,
+      text: sanitizeYouTubeXTitle(options.textOverride || criteria.title || row.textPreview),
+      mediaUrls: [],
+      imageMediaUrls: [],
+      videoMediaUrls: [url],
+      diagnostics: { source: "youtube_downloaded_video" },
+    };
+    const media = await downloadYouTubeVideo(url);
+    try {
+      await createXDraft(post, media.files);
+      logEvent("youtube_x_draft_success", { canonicalUrl: url, mediaCount: media.files.length });
+      return { canonicalUrl: url, mediaCount: media.files.length, message: "X 초안 저장됨" };
+    } finally {
+      fs.rmSync(media.dir, { recursive: true, force: true });
+      logEvent("cleanup_done", { canonicalUrl: url, dir: media.dir, draft: true, source: "youtube" });
+    }
   }
   const row = await getDiscoveryRow(canonicalUrl);
   if (!row) throw new Error("저장된 인싸이더 대시보드 항목을 찾지 못했습니다.");
@@ -12215,7 +13305,7 @@ function shouldRecoverDiscoveryPlaceholder(row, nowMs = Date.now()) {
 
 async function processDiscoveryAutoScheduleJob(canonicalUrl, source, text) {
   logEvent("discovery_auto_schedule_async_start", { canonicalUrl, source });
-  const detail = await addThreadToDiscoveryReview(canonicalUrl, { text, allowTextOnly: true });
+  const detail = await addSourceToDiscoveryReview(canonicalUrl, { text, allowTextOnly: true });
   if (detail.skipped) {
     logEvent("discovery_auto_schedule_async_skipped", {
       canonicalUrl,
@@ -12225,6 +13315,7 @@ async function processDiscoveryAutoScheduleJob(canonicalUrl, source, text) {
     });
     return { skipped: true, detail };
   }
+  await markDiscoveryScheduleQueueState(canonicalUrl, "scheduling");
   const result = await runDiscoveryAutoSchedule(canonicalUrl, {
     text,
     source,
@@ -12302,7 +13393,7 @@ async function recoverRecentDiscoveryPlaceholders() {
         if (isDiscoveryAutoScheduleSource(originalSource)) {
           await processDiscoveryAutoScheduleJob(row.canonicalUrl, source);
         } else {
-          const detail = await addThreadToDiscoveryReview(row.canonicalUrl);
+          const detail = await addSourceToDiscoveryReview(row.canonicalUrl);
           logEvent("discovery_startup_recovery_success", {
             canonicalUrl: row.canonicalUrl,
             source,
@@ -13175,6 +14266,34 @@ const server = http.createServer(async (req, res) => {
     }
     return;
   }
+  if (req.method === "POST" && req.url === "/api/terafabx/today-post-reply") {
+    try {
+      const body = await readRequestBody(req);
+      const payload = JSON.parse(body || "{}");
+      const action = String(payload.action || "run");
+      if (!["preview", "run", "enable", "disable"].includes(action)) throw new Error("action은 preview, run, enable, disable만 가능합니다.");
+      let result;
+      if (action === "preview") {
+        result = await discoverTerafabxTodayRootPosts();
+      } else if (action === "run") {
+        if (terafabxTodayPostReplyBusy || loadTerafabxState().todayPostReplyManualRequested) {
+          result = { queued: true, duplicate: true };
+        } else {
+          saveTerafabxState({ todayPostReplyManualRequested: true, todayPostReplyLastStatus: "queued", todayPostReplyLastError: null });
+          setImmediate(() => maybeRunTerafabxTodayPostReplyAutomation().catch((error) => logEvent("terafabx_today_post_reply_manual_error", { error: error.message })));
+          result = { queued: true, duplicate: false };
+        }
+      } else {
+        result = saveTerafabxState({ todayPostReplyEnabled: action === "enable" });
+        logEvent(`terafabx_today_post_reply_${action}d`, { enabled: action === "enable" });
+      }
+      json(res, 200, { ok: true, action, result, status: getTerafabxAutomationStatus() });
+    } catch (error) {
+      logEvent("terafabx_today_post_reply_action_error", { error: error.message });
+      json(res, 500, { ok: false, error: error.message });
+    }
+    return;
+  }
   if (req.method === "POST" && req.url === "/api/terafabx/automation") {
     try {
       const body = await readRequestBody(req);
@@ -13185,14 +14304,17 @@ const server = http.createServer(async (req, res) => {
       if (!["run", "enable", "disable"].includes(action)) throw new Error("action은 run, enable, disable만 가능합니다.");
       let result;
       if (action === "enable") {
-        if (job === "comment") result = saveTerafabxState({ commentEnabled: true });
+        if (job === "comment") result = saveTerafabxState({
+          commentEnabled: true,
+          commentPrefillOnly: payload.prefillOnly === true,
+        });
         else if (job === "comment-prefill") throw new Error("comment-prefill은 수동 run만 지원합니다.");
         else if (job === "verified-review") result = saveTerafabxState({ verifiedCommentReviewEnabled: true, commentEnabled: false });
         else if (job === "review-comment") throw new Error("review-comment는 수동 run만 지원합니다.");
         else if (job === "follow") result = saveTerafabxState({ followEnabled: true });
         else result = saveTerafabxState({ heartEnabled: true });
       } else if (action === "disable") {
-        if (job === "comment") result = saveTerafabxState({ commentEnabled: false });
+        if (job === "comment") result = saveTerafabxState({ commentEnabled: false, commentPrefillOnly: false });
         else if (job === "comment-prefill") throw new Error("comment-prefill은 수동 run만 지원합니다.");
         else if (job === "verified-review") result = saveTerafabxState({ verifiedCommentReviewEnabled: false });
         else if (job === "review-comment") throw new Error("review-comment는 수동 run만 지원합니다.");
@@ -13203,8 +14325,11 @@ const server = http.createServer(async (req, res) => {
       } else if (job === "comment-prefill") {
         result = await runTerafabxCommentPrefillQueue({
           manual: true,
-          targetCount: Number(payload.targetCount || TERAFABX_COMMENT_PREFILL_TARGET),
+          targetCount: Object.prototype.hasOwnProperty.call(payload, "targetCount")
+            ? Number(payload.targetCount)
+            : TERAFABX_COMMENT_PREFILL_TARGET,
           concurrency: Number(payload.concurrency || TERAFABX_COMMENT_PREFILL_CONCURRENCY),
+          probeGrok: payload.probeGrok === true,
         });
       } else if (job === "verified-review") {
         result = await runTerafabxVerifiedCommentReviewOnce({ manual: true, limit: Number(payload.limit || TERAFABX_VERIFIED_REVIEW_BATCH_SIZE) });
@@ -13399,7 +14524,7 @@ const server = http.createServer(async (req, res) => {
       });
       setImmediate(async () => {
         try {
-          await addThreadToDiscoveryReview(placeholder.canonicalUrl, { text: payload.text });
+          await addSourceToDiscoveryReview(placeholder.canonicalUrl, { text: payload.text });
         } catch (error) {
           await markDiscoveryDetailError(placeholder.canonicalUrl, error).catch(() => {});
           logEvent("discovery_add_url_async_error", {
@@ -13429,7 +14554,7 @@ const server = http.createServer(async (req, res) => {
       });
       setImmediate(async () => {
         try {
-          await addThreadToDiscoveryReview(placeholder.canonicalUrl, { text: payload.text });
+          await addSourceToDiscoveryReview(placeholder.canonicalUrl, { text: payload.text });
         } catch (error) {
           await markDiscoveryDetailError(placeholder.canonicalUrl, error).catch(() => {});
           logEvent("discovery_add_url_async_error", {
@@ -13674,13 +14799,13 @@ const server = http.createServer(async (req, res) => {
     try {
       const body = await readRequestBody(req);
       const payload = JSON.parse(body || "{}");
-      const canonicalUrl = validateThreadsUrl(payload.url);
+      const canonicalUrl = normalizeDiscoveryUrl(payload.url);
       const completed = findCompletedMirror(canonicalUrl);
       if (completed) {
         json(res, 409, {
           ok: false,
           duplicate: true,
-          error: "이미 X에 게시 또는 예약된 Threads URL입니다.",
+          error: "이미 X에 게시 또는 예약된 URL입니다.",
           canonicalUrl,
           previousStatus: completed.status,
           previousScheduledAt: completed.scheduledAt,
@@ -13692,6 +14817,9 @@ const server = http.createServer(async (req, res) => {
         text: payload.text,
         origin: payload.origin || "auto_schedule_async",
       });
+      if (!placeholder.skippedExcluded) {
+        await markDiscoveryScheduleQueueState(canonicalUrl, "queued_schedule");
+      }
       json(res, 202, {
         ok: true,
         accepted: true,
@@ -13753,11 +14881,11 @@ const server = http.createServer(async (req, res) => {
     try {
       const body = await readRequestBody(req);
       const payload = JSON.parse(body || "{}");
-      const canonicalUrl = validateThreadsUrl(payload.url);
+      const canonicalUrl = normalizeDiscoveryUrl(payload.url);
       json(res, 202, { ok: true, accepted: true, canonicalUrl, message: "대시보드 추가 접수됨" });
       setImmediate(async () => {
         try {
-          await addThreadToDiscoveryReview(canonicalUrl, { text: payload.text });
+          await addSourceToDiscoveryReview(canonicalUrl, { text: payload.text });
         } catch (error) {
           logEvent("share_add_to_discovery_error", { canonicalUrl, error: error.message });
         }
@@ -13856,21 +14984,27 @@ async function futureScheduledDiscoveryRows() {
 }
 
 async function recoverMissingXScheduledPost(canonicalUrl) {
-  const url = validateThreadsUrl(canonicalUrl);
+  const url = normalizeDiscoveryUrl(canonicalUrl);
   const row = await getDiscoveryRow(url);
   if (!row || row.status !== "scheduled") throw new Error("복구할 예약 DB 항목을 찾지 못했습니다.");
   const scheduledAt = new Date(row.scheduledPostAt || 0);
   if (!Number.isFinite(scheduledAt.getTime()) || scheduledAt.getTime() <= Date.now()) {
     throw new Error("복구할 예약 시각이 이미 지났거나 올바르지 않습니다.");
   }
-  const threadPost = await extractThreadPost(url, { allowEmptyText: true });
+  const threadPost = isYouTubeUrl(url)
+    ? await extractYouTubePost(url)
+    : await extractThreadPost(url, { allowEmptyText: true });
   const storedText = isDiscoveryPlaceholderText(row.textPreview) ? "" : row.textPreview;
-  threadPost.text = truncateXText(storedText || threadPost.text, 280);
+  threadPost.text = isYouTubeUrl(url)
+    ? sanitizeYouTubeXTitle(storedText || threadPost.title || threadPost.text)
+    : truncateXText(storedText || threadPost.text, 280);
   if (!threadPost.text && threadPost.mediaUrls.length === 0) throw new Error("복구할 예약 제목과 미디어가 없습니다.");
-  if (Number(row.mediaCount || 0) > 0 && threadPost.mediaUrls.length === 0) {
+  if (!isYouTubeUrl(url) && Number(row.mediaCount || 0) > 0 && threadPost.mediaUrls.length === 0) {
     throw new Error("원문 미디어를 다시 확인하지 못해 누락 예약 자동 복구를 중단했습니다.");
   }
-  const media = await downloadMedia(threadPost.mediaUrls);
+  const media = isYouTubeUrl(url)
+    ? await downloadYouTubeVideo(url)
+    : await downloadMedia(threadPost.mediaUrls);
   try {
     const result = await postToX(threadPost, media.files, { schedule: true, scheduledAt });
     recordCompletedMirror({
@@ -13894,7 +15028,7 @@ async function recoverMissingXScheduledPost(canonicalUrl) {
 }
 
 async function confirmExistingXScheduledPost(canonicalUrl, scheduledAtValue) {
-  const url = validateThreadsUrl(canonicalUrl);
+  const url = normalizeDiscoveryUrl(canonicalUrl);
   const row = await getDiscoveryRow(url);
   if (!row) throw new Error("확인할 대시보드 항목을 찾지 못했습니다.");
   const scheduledAt = new Date(scheduledAtValue || row.scheduledPostAt || 0);
@@ -14137,6 +15271,12 @@ function startServer() {
   }, 60 * 1000);
 
   setInterval(() => {
+    maybeRunTerafabxTodayPostReplyAutomation().catch((error) => {
+      logEvent("terafabx_today_post_reply_tick_error", { error: error.message });
+    });
+  }, 60 * 1000);
+
+  setInterval(() => {
     maybeRunScheduledInssiderReplies().catch((error) => {
       logEvent("inssider_scheduled_reply_tick_error", { error: error.message });
     });
@@ -14163,6 +15303,11 @@ module.exports = {
   TERAFABX_GROK_WEB_URL,
   TERAFABX_GROK_CONTEXT_MODE,
   cleanThreadText,
+  validateYouTubeUrl,
+  isYouTubeUrl,
+  normalizeDiscoveryUrl,
+  buildYouTubeXText,
+  sanitizeYouTubeXTitle,
   dashboardDiscoveryRow,
   DuplicateMirrorError,
   isPublishedDiscoveryRow,
@@ -14173,9 +15318,12 @@ module.exports = {
   terafabxDailyCommentProgress,
   terafabxCommentPrefillCooldownDelay,
   deriveTerafabxCommentQualityFeedback,
+  deriveTerafabxCommentPipelineHealth,
+  assessTerafabxGrokContextSafety,
   evaluateTerafabxCommentWorkflow,
   shouldTerafabxCommentMonitorRequestPrefill,
   terafabxGrokQuotaMonitorFinding,
+  terafabxPendingCommentPolicyFailure,
   assessTerafabxCurrentCommentPolicy,
   quarantineTerafabxPendingCommentPost,
   auditTerafabxPrefillQuality,
@@ -14191,6 +15339,8 @@ module.exports = {
   isTerafabxSkippableOwnPostReplyTargetError,
   terafabxStatusHrefMatches,
   isTerafabxReplySubmitCandidate,
+  isTerafabxInlineReplyComposerContext,
+  isVerifiedXAccountState,
   isTerafabxReplySubmissionUncertain,
   isTerafabxTransientReplyPageError,
   shouldRetryTerafabxHeadlessReply,
@@ -14198,8 +15348,15 @@ module.exports = {
   terafabxPendingCommentFailureDisposition,
   recoverRecentTransientPrefillFailures,
   terafabxBrowserConcurrency,
+  terafabxGrokIndividualRequestCount,
+  terafabxGrokIndividualBackoffUntil,
+  mergeTerafabxAvatarEnrichment,
   terafabxCommentPrefillWorkerResources,
   knownTerafabxGrokWebSessions,
+  terafabxTodayPostReplyWorkerResources,
+  isTerafabxTodayRootPostMetadata,
+  assessTerafabxTodayPostReplyCompletion,
+  terafabxReplyBatchFailureSignature,
   isTerafabxGeminiWorkTab,
   ensureTerafabxGeminiHeadlessBrowser,
   cleanupTerafabxGeminiWorkTabs,
@@ -14218,6 +15375,8 @@ module.exports = {
   randomTerafabxOwnPostReplyDelayMs,
   runFixedWorkerPool,
   shouldUseTerafabxQuickIntent,
+  postTerafabxReply,
+  deleteTerafabxOwnReply,
   judgeTerafabxReplyWithGeminiHeadless,
   parseTerafabxFinalJudge,
   parseTerafabxGeminiBatchReview,

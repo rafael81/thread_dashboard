@@ -979,8 +979,27 @@ function AutomationTimelineView({
   ownPostReplyResult,
   ownPostReplyError,
   ownPostReplyStatus,
+  commentPipeline,
+  todayPostReply,
+  onTodayPostReplyAction,
 }) {
   const scopeLabel = metrics.isAll ? "전체 기간" : metrics.isToday ? "오늘" : metrics.date;
+  const pipelineStatus = commentPipeline?.status || "idle";
+  const pipelineBadgeVariant = pipelineStatus === "blocked"
+    ? "destructive"
+    : pipelineStatus === "ready" || pipelineStatus === "running"
+      ? "secondary"
+      : "outline";
+  const stageLabels = {
+    idle: "대기",
+    checking_queue: "큐 확인",
+    gemini_profiles: "Gemini 워커 준비",
+    grok_context: "Grok 문맥 분석",
+    gemini_batch: "Gemini 생성·심사",
+    queue_ready: "게시 큐 준비",
+    batch_partial_failure: "일부 생성 실패",
+    blocked: "차단됨",
+  };
   return (
     <div className="grid gap-4 px-4 lg:px-6">
       <Card>
@@ -1061,6 +1080,68 @@ function AutomationTimelineView({
             </div>
           </div>
 
+          <div className={`grid gap-4 rounded-lg border p-4 ${pipelineStatus === "blocked" ? "border-destructive/40 bg-destructive/5" : "bg-muted/20"}`} aria-live="polite">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+              <div className="grid gap-1">
+                <div className="flex flex-wrap items-center gap-2 font-medium">
+                  <SparklesIcon className="size-4" />
+                  자동댓글 파이프라인
+                  <Badge variant={pipelineBadgeVariant}>{commentPipeline?.label || "대기"}</Badge>
+                  <Badge variant="outline">단계: {stageLabels[commentPipeline?.stage] || commentPipeline?.stage || "대기"}</Badge>
+                </div>
+                <p className="text-sm text-muted-foreground">
+                  댓글 대기 {compact(commentPipeline?.pendingCount)} / 목표 {commentPipeline?.unlimited ? "무제한" : compact(commentPipeline?.targetCount)} · {commentPipeline?.unlimited ? "계속 보충" : `부족 ${compact(commentPipeline?.missingCount)}`}
+                </p>
+              </div>
+              <div className="text-xs text-muted-foreground sm:text-right">
+                <div>최근 시도 {formatDate(commentPipeline?.lastStartedAt)}</div>
+                <div>최근 종료 {formatDate(commentPipeline?.lastFinishedAt)}</div>
+              </div>
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="rounded-md border bg-background p-3">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-sm font-medium">Grok 문맥 워커</span>
+                  <Badge variant={Number(commentPipeline?.grok?.activeSessionCount || 0) > 0 ? "secondary" : "outline"}>
+                    활성 {compact(commentPipeline?.grok?.activeSessionCount)} / {compact(commentPipeline?.grok?.configuredWorkers)}
+                  </Badge>
+                </div>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {commentPipeline?.grok?.waitingOnGemini
+                    ? "Gemini 워커 준비 전이라 작업 시작 대기 중"
+                    : commentPipeline?.grok?.stateReady
+                      ? `로그인 상태 준비됨 · ${formatDate(commentPipeline?.grok?.stateUpdatedAt)}`
+                      : "Grok 로그인 상태 파일 없음"}
+                </p>
+              </div>
+              <div className="rounded-md border bg-background p-3">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-sm font-medium">Gemini 생성·심사 워커</span>
+                  <Badge variant={Number(commentPipeline?.gemini?.readyWorkers || 0) === Number(commentPipeline?.gemini?.configuredWorkers || 0) ? "secondary" : "destructive"}>
+                    준비 {compact(commentPipeline?.gemini?.readyWorkers)} / {compact(commentPipeline?.gemini?.configuredWorkers)}
+                  </Badge>
+                </div>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {commentPipeline?.gemini?.missingWorkers?.length
+                    ? `미준비 워커: ${commentPipeline.gemini.missingWorkers.join(", ")}`
+                    : "모든 워커 프로필 준비됨"}
+                </p>
+              </div>
+            </div>
+            {commentPipeline?.blocker || commentPipeline?.lastError ? (
+              <Alert variant="destructive">
+                <AlertTitle>현재 차단 원인</AlertTitle>
+                <AlertDescription>{commentPipeline?.blocker || commentPipeline?.lastError}</AlertDescription>
+              </Alert>
+            ) : null}
+            <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+              <span>최근 요청 {compact(commentPipeline?.lastRequested)}</span>
+              <span>대상 선택 {compact(commentPipeline?.lastSelected)}</span>
+              <span>큐 추가 {compact(commentPipeline?.lastQueued)}</span>
+              <span>실패 {compact(commentPipeline?.lastFailed)}</span>
+            </div>
+          </div>
+
           <OwnPostReplyControl
             value={ownPostReplyUrl}
             onChange={onOwnPostReplyUrlChange}
@@ -1070,6 +1151,69 @@ function AutomationTimelineView({
             error={ownPostReplyError}
             status={ownPostReplyStatus}
           />
+
+          <Card>
+            <CardHeader>
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                <div>
+                  <CardTitle>오늘 게시글 대댓글 순회</CardTitle>
+                  <CardDescription>오늘 작성한 원글을 찾아 인증 계정의 직접 대댓글에 하트와 대댓글을 답니다.</CardDescription>
+                </div>
+                <Badge variant={todayPostReply?.lastStatus === "complete" ? "secondary" : todayPostReply?.lastStatus === "error" ? "destructive" : "outline"}>
+                  {todayPostReply?.busy ? "실행 중" : todayPostReply?.manualRequested ? "대기 중" : todayPostReply?.lastStatus || "대기"}
+                </Badge>
+              </div>
+            </CardHeader>
+            <CardContent className="grid gap-4">
+              <div className="flex flex-wrap gap-2">
+                <Button type="button" disabled={todayPostReply?.busy || todayPostReply?.manualRequested} onClick={() => onTodayPostReplyAction("run")}>
+                  {todayPostReply?.busy || todayPostReply?.manualRequested ? <Loader2Icon data-icon="inline-start" className="animate-spin" /> : <HeartIcon data-icon="inline-start" />}
+                  지금 순회
+                </Button>
+                <Button type="button" variant="outline" onClick={() => onTodayPostReplyAction(todayPostReply?.enabled ? "disable" : "enable")}>
+                  10분 자동 순회 {todayPostReply?.enabled ? "끄기" : "켜기"}
+                </Button>
+              </div>
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+                {[
+                  ["오늘 원글", todayPostReply?.summary?.rootPostCount],
+                  ["확인 원글", todayPostReply?.summary?.checkedRootCount],
+                  ["게시", todayPostReply?.summary?.postedCount],
+                  ["남은 대상", todayPostReply?.summary?.remainingEligibleCount],
+                  ["재시도 오류", todayPostReply?.summary?.retryableErrorCount],
+                ].map(([label, value]) => <div key={label} className="rounded-lg border p-3"><div className="text-xs text-muted-foreground">{label}</div><div className="text-xl font-semibold tabular-nums">{compact(value)}</div></div>)}
+              </div>
+              <div className="rounded-lg border bg-muted/20 p-4">
+                <div className="mb-2 font-medium">완료 조건</div>
+                <div className="grid gap-1 text-sm">
+                  {(todayPostReply?.completion?.conditions || []).map((condition) => (
+                    <div key={condition.key} className={condition.met ? "text-foreground" : "text-muted-foreground"}>
+                      {condition.met ? "✓" : "○"} {condition.label}
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                <span>Grok 전용: {todayPostReply?.resources?.grokSessionPrefix || "-"}</span>
+                <span>Gemini 전용 포트: {todayPostReply?.resources?.geminiPortBase || "-"}~</span>
+                <span>Gemini 실행기 {todayPostReply?.resources?.geminiScriptReady ? "준비됨" : "없음"}</span>
+                <span>자동댓글 워커 공유 안 함</span>
+                <span>X 쓰기만 직렬화</span>
+                <span>최근 실행 {formatDate(todayPostReply?.lastRunAt)}</span>
+              </div>
+              {todayPostReply?.summary?.selfHealingActions?.length ? (
+                <div className="rounded-lg border bg-muted/20 p-3 text-sm">
+                  <div className="font-medium">자가개선 로그</div>
+                  {todayPostReply.summary.selfHealingActions.map((action, index) => (
+                    <div key={`${action.type}-${index}`} className="mt-1 text-muted-foreground">
+                      {action.type === "gemini_script_fallback" ? "✓ 누락된 외부 Gemini 실행기를 로컬 fallback으로 복구" : `○ 반복 오류 차단: ${action.error || action.reason}`}
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+              {todayPostReply?.lastError ? <Alert variant="destructive"><AlertTitle>미완료 사유</AlertTitle><AlertDescription>{todayPostReply.lastError}</AlertDescription></Alert> : null}
+            </CardContent>
+          </Card>
 
           <div className="rounded-lg border">
             <div className="flex flex-col gap-2 border-b p-4 sm:flex-row sm:items-center sm:justify-between">
@@ -1257,6 +1401,7 @@ function Dashboard() {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState("");
+  const [autoScheduleSubmitting, setAutoScheduleSubmitting] = useState([]);
   const [urlInput, setUrlInput] = useState("");
   const [titleEdits, setTitleEdits] = useState({});
   const [scheduleEdits, setScheduleEdits] = useState({});
@@ -1422,6 +1567,34 @@ function Dashboard() {
     }
   }
 
+  async function queueDiscoveryAutoSchedule(row, textOverride) {
+    const url = row.canonicalUrl;
+    setAutoScheduleSubmitting((current) => current.includes(url) ? current : [...current, url]);
+    setError("");
+    try {
+      await api("/api/discovery/auto-schedule-async", {
+        method: "POST",
+        body: JSON.stringify({
+          url,
+          text: rowText(row, textOverride),
+          origin: "dashboard_auto_schedule",
+        }),
+      });
+      setData((current) => current?.rows ? {
+        ...current,
+        rows: current.rows.map((item) => item.canonicalUrl === url
+          ? { ...item, status: "queued_schedule", canPost: false, lastError: null }
+          : item),
+      } : current);
+      toast.success("자동 예약 큐에 추가됨");
+    } catch (err) {
+      setError(err.message);
+      toast.error(err.message);
+    } finally {
+      setAutoScheduleSubmitting((current) => current.filter((item) => item !== url));
+    }
+  }
+
   async function runTerafabx(job, action) {
     await runAction(`terafabx-${job}-${action}`, async () => {
       const result = await api("/api/terafabx/automation", {
@@ -1464,6 +1637,16 @@ function Dashboard() {
     } finally {
       setBusy("");
     }
+  }
+
+  async function runTodayPostReplyAction(action) {
+    await runAction(`today-post-reply-${action}`, async () => {
+      await api("/api/terafabx/today-post-reply", {
+        method: "POST",
+        body: JSON.stringify({ action }),
+      });
+      await load(view);
+    }, action === "run" ? "오늘 게시글 대댓글 순회를 시작했습니다" : "오늘 게시글 대댓글 자동화 상태를 변경했습니다");
   }
 
   async function runTerafabxReviewAction(item, action) {
@@ -1519,6 +1702,7 @@ function Dashboard() {
       titleEdits={titleEdits}
       scheduleEdits={scheduleEdits}
       busy={busy}
+      autoScheduleSubmitting={autoScheduleSubmitting}
       onViewChange={setView}
       onTitleChange={setTitleEdits}
       onScheduleChange={setScheduleEdits}
@@ -1545,12 +1729,7 @@ function Dashboard() {
           }),
         }), "X 예약됨")
       }
-      onAutoSchedule={(row, text) =>
-        runAction(`auto-${row.canonicalUrl}`, () => api("/api/discovery/auto-schedule", {
-          method: "POST",
-          body: JSON.stringify({ url: row.canonicalUrl, text: rowText(row, text) }),
-        }), "자동 예약됨")
-      }
+      onAutoSchedule={queueDiscoveryAutoSchedule}
       onCancelSchedule={(row) =>
         runAction(`cancel-schedule-${row.canonicalUrl}`, () => api("/api/discovery/cancel-schedule", {
           method: "POST",
@@ -1706,7 +1885,10 @@ function Dashboard() {
                   onOwnPostReplyAction={runOwnPostReplyAction}
                   ownPostReplyResult={ownPostReplyResult}
                   ownPostReplyError={ownPostReplyError}
+                  todayPostReply={data?.terafabx?.todayPostReply}
+                  onTodayPostReplyAction={runTodayPostReplyAction}
                   ownPostReplyStatus={data?.terafabx?.ownPostReply}
+                  commentPipeline={data?.terafabx?.commentPipeline}
                 />
               ) : (
                 <>
@@ -1716,14 +1898,14 @@ function Dashboard() {
                   <CardHeader>
                     <CardTitle>수동 추가</CardTitle>
                     <CardDescription>
-                      Android 공유 없이 Threads URL을 대시보드에 바로 넣습니다.
+                      Android 공유 없이 Threads 또는 YouTube URL을 대시보드에 바로 넣습니다.
                     </CardDescription>
                   </CardHeader>
                   <CardContent className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto]">
                     <Input
                       value={urlInput}
                       onChange={(event) => setUrlInput(event.target.value)}
-                      placeholder="https://www.threads.com/@..."
+                      placeholder="Threads 또는 YouTube Shorts URL"
                     />
                     <Button
                       disabled={!urlInput.trim() || controlsBusy}
@@ -1855,6 +2037,9 @@ function Dashboard() {
                           <div className="flex items-center gap-2 font-medium">
                             <MessageCircleIcon className="size-4" />
                             자동댓글 {data?.terafabx?.comment?.enabled ? "ON" : "OFF"}
+                            <Badge variant={data?.terafabx?.commentPipeline?.status === "blocked" ? "destructive" : "outline"}>
+                              {data?.terafabx?.commentPipeline?.label || "대기"}
+                            </Badge>
                           </div>
                           <p className="truncate text-sm text-muted-foreground">
                             최근 {data?.terafabx?.comment?.lastComment || "-"}
@@ -1874,6 +2059,11 @@ function Dashboard() {
                           {data?.terafabx?.commentPrefill?.lastError ? (
                             <p className="line-clamp-2 text-xs text-destructive" title={data.terafabx.commentPrefill.lastError}>
                               {data.terafabx.commentPrefill.lastError}
+                            </p>
+                          ) : null}
+                          {!data?.terafabx?.commentPrefill?.lastError && data?.terafabx?.commentPipeline?.blocker ? (
+                            <p className="line-clamp-2 text-xs text-destructive">
+                              {data.terafabx.commentPipeline.blocker}
                             </p>
                           ) : null}
                         </div>

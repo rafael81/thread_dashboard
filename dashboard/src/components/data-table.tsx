@@ -83,6 +83,7 @@ export type DashboardRow = {
   mediaCount?: number
   viralScore?: number
   criteria?: {
+    source?: string
     shortHook?: boolean
     strongMedia?: boolean
     controversy?: boolean
@@ -101,6 +102,7 @@ type DataTableProps = {
   titleEdits: Record<string, string>
   scheduleEdits: Record<string, string>
   busy: string
+  autoScheduleSubmitting: string[]
   onViewChange: (view: string) => void
   onTitleChange: React.Dispatch<React.SetStateAction<Record<string, string>>>
   onScheduleChange: React.Dispatch<React.SetStateAction<Record<string, string>>>
@@ -137,6 +139,8 @@ function statusLabel(status: string) {
     posted: "게시됨",
     x_draft: "초안",
     failed_schedule: "예약 실패",
+    queued_schedule: "예약 대기",
+    scheduling: "예약 진행 중",
     failed_post: "게시 실패",
     failed_draft: "초안 실패",
   }
@@ -217,6 +221,7 @@ function ThreadSheet({
   titleEdits,
   scheduleEdits,
   busy,
+  autoScheduleSubmitting,
   onTitleChange,
   onScheduleChange,
   onSaveTitle,
@@ -235,6 +240,7 @@ function ThreadSheet({
   onOpenRowChange: (url: string | null) => void
 }) {
   const disabled = Boolean(busy) || !row.canPost
+  const autoScheduleDisabled = !row.canPost || autoScheduleSubmitting.includes(row.canonicalUrl)
   const isScheduled = row.status === "scheduled" && Boolean(row.scheduledPostAt)
   const [draftText, setDraftText] = React.useState(titleEdits[row.canonicalUrl] ?? row.textPreview ?? "")
   const [draftSchedule, setDraftSchedule] = React.useState(scheduleEdits[row.canonicalUrl] || "")
@@ -257,7 +263,7 @@ function ThreadSheet({
         onInteractOutside={(event) => event.preventDefault()}
       >
         <SheetHeader className="gap-1">
-          <SheetTitle>@{row.author || "unknown"}</SheetTitle>
+          <SheetTitle>{row.criteria?.source === "youtube" ? "YouTube · " : "@"}{row.author || "unknown"}</SheetTitle>
           <SheetDescription>
             좋아요 {compact(row.likeCount)} · 미디어 {compact(row.mediaCount)} · 점수 {compact(row.viralScore)}
           </SheetDescription>
@@ -267,6 +273,7 @@ function ThreadSheet({
             <MediaPreview row={row} large />
             <div className="flex flex-wrap gap-2">
               <Badge variant="outline">{statusLabel(row.status)}</Badge>
+              {row.criteria?.source === "youtube" ? <Badge variant="secondary">YouTube</Badge> : null}
               {row.scheduledPostAt ? (
                 <Badge variant="secondary">예약 {formatDate(row.scheduledPostAt)}</Badge>
               ) : null}
@@ -358,9 +365,9 @@ function ThreadSheet({
                 <Clock3Icon data-icon="inline-start" />
                 예약 게시
               </Button>
-              <Button onClick={() => onAutoSchedule(row, draftText)} disabled={disabled}>
+              <Button onClick={() => onAutoSchedule(row, draftText)} disabled={autoScheduleDisabled}>
                 <CalendarClockIcon data-icon="inline-start" />
-                자동 예약
+                {autoScheduleSubmitting.includes(row.canonicalUrl) ? "접수 중" : "자동 예약"}
               </Button>
             </div>
           </div>
@@ -523,8 +530,8 @@ export function DataTable(props: DataTableProps) {
                     <DropdownMenuItem onClick={() => props.onDraft(row.original)} disabled={!row.original.canPost || Boolean(busy)}>
                       초안 저장
                     </DropdownMenuItem>
-                    <DropdownMenuItem onClick={() => props.onAutoSchedule(row.original)} disabled={!row.original.canPost || Boolean(busy)}>
-                      자동 예약
+                    <DropdownMenuItem onClick={() => props.onAutoSchedule(row.original)} disabled={!row.original.canPost || props.autoScheduleSubmitting.includes(row.original.canonicalUrl)}>
+                      {props.autoScheduleSubmitting.includes(row.original.canonicalUrl) ? "접수 중" : "자동 예약"}
                     </DropdownMenuItem>
                   </DropdownMenuGroup>
                 </DropdownMenuContent>

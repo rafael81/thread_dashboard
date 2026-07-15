@@ -16,6 +16,8 @@ const {
   runFixedWorkerPool,
   shouldUseTerafabxQuickIntent,
   terafabxBrowserConcurrency,
+  terafabxGrokIndividualRequestCount,
+  terafabxGrokIndividualBackoffUntil,
   terafabxCommentPrefillWorkerResources,
   knownTerafabxGrokWebSessions,
   terafabxOwnPostReplyBatchLimit,
@@ -39,6 +41,8 @@ const {
   terafabxGeminiReviewPrompt,
   terafabxStatusHrefMatches,
   isTerafabxReplySubmitCandidate,
+  isTerafabxInlineReplyComposerContext,
+  isVerifiedXAccountState,
   isTerafabxReplySubmissionUncertain,
   isTerafabxTransientReplyPageError,
   shouldRetryTerafabxHeadlessReply,
@@ -210,10 +214,23 @@ test("verified image-only direct replies use the fixed heart emoji rule", () => 
     postUrl: rootUrl,
     rootPost: { url: rootUrl, text: "침수된 집에서 고양이가 물을 마시는 장면" },
   });
-  const record = buildTerafabxFixedImageReplyRecord(target, { manual: true, source: "own_post_reply" });
+  assert.throws(
+    () => buildTerafabxFixedImageReplyRecord(target, { manual: true, source: "own_post_reply" }),
+    /Grok 상세 문맥 분석 성공 기록/,
+  );
+  const record = buildTerafabxFixedImageReplyRecord(target, {
+    manual: true,
+    source: "own_post_reply",
+    grokContext: {
+      contextSummary: "Grok이 부모 원글과 이미지 전용 직접 댓글의 관계를 상세하게 확인했다.",
+      keyPoints: ["부모 원글과 연결된 이미지 반응"],
+      rawPreview: '{"context_summary":"ok","key_points":["image"]}',
+      provider: "web-context",
+    },
+  });
   assert.equal(target.imageOnly, true);
   assert.equal(record.comment, "❤️");
-  assert.equal(record.generator, "fixed-image-only-emoji");
+  assert.equal(record.generator, "web-context+fixed-image-only-emoji");
   assert.equal(record.geminiReview.decision, "fixed_image_only_emoji");
 });
 
@@ -255,6 +272,8 @@ test("Grok context prompt does not ask Grok to generate a reply", () => {
     url: "https://x.com/example/status/1",
     targetText: "주말 출근자들을 응원합니다",
   });
+  assert.match(prompt, /X 게시물 1건/);
+  assert.match(prompt, /여러 게시물을 묶지 마라/);
   assert.match(prompt, /공개 답글 후보는 절대 작성하지 마라/);
   assert.match(prompt, /reply, comment, final_reply 같은 댓글 필드는 출력하지 마라/);
 });
@@ -376,6 +395,7 @@ test("comment prefill batches generation and rewrite without self scoring", () =
   assert.match(prompt, /점수를 매기지 마라/);
   assert.doesNotMatch(prompt, /context 0~40/);
   assert.match(prompt, /JSON 배열/);
+  assert.match(prompt, /웃음이 터지네요/);
 });
 
 test("automatic comments outrank manual and own-post Gemini work", () => {
@@ -472,6 +492,25 @@ test("reply submit accepts localized controls only after the reply composer kind
   assert.equal(isTerafabxReplySubmitCandidate({ withinReplyComposer: true, testid: "tweetButton", text: "Post" }), false);
 });
 
+test("inline reply scope requires the exact target status page and target article", () => {
+  const valid = {
+    inlineReplyScopeFound: true,
+    targetArticleFound: true,
+    currentStatusMatchesTarget: true,
+  };
+  assert.equal(isTerafabxInlineReplyComposerContext(valid), true);
+  assert.equal(isTerafabxInlineReplyComposerContext({ ...valid, currentStatusMatchesTarget: false }), false);
+  assert.equal(isTerafabxInlineReplyComposerContext({ ...valid, targetArticleFound: false }), false);
+  assert.equal(isTerafabxInlineReplyComposerContext({ ...valid, inlineReplyScopeFound: false }), false);
+});
+
+test("X account verification trusts only authenticated account UI", () => {
+  assert.equal(isVerifiedXAccountState({ profileHref: "https://x.com/terafabXai" }, "terafabXai"), true);
+  assert.equal(isVerifiedXAccountState({ accountText: "과즙루피\n@terafabXai" }, "terafabXai"), true);
+  assert.equal(isVerifiedXAccountState({ url: "https://x.com/terafabXai", canonicalHref: "https://x.com/terafabXai" }, "terafabXai"), false);
+  assert.equal(isVerifiedXAccountState({ profileHref: "https://x.com/someone-else" }, "terafabXai"), false);
+});
+
 test("an uncertain reply submission is quarantined instead of retried", () => {
   const error = new Error("reply verification timed out after submit");
   error.code = "TERAFABX_REPLY_SUBMISSION_UNCERTAIN";
@@ -533,6 +572,13 @@ test("recent quality-passed prefill exhausted by a blank X page is recoverable",
       errorAt: "2026-07-13T14:40:00.000Z",
       failedReason: "max_attempts",
       lastError: 'target root 검증 실패: {"text":""}',
+      targetText: "의정부고 졸업사진 퀄리티가 엄청난 장면",
+      grokContext: {
+        contextSummary: "Grok이 의정부고 졸업사진의 구체적인 장면과 댓글 반응 지점을 상세히 확인했다.",
+        keyPoints: ["의정부고 졸업사진"],
+        rawPreview: '{"context_summary":"의정부고 졸업사진"}',
+        provider: "web-context",
+      },
       geminiReview: { finalJudge: {
         score: 100,
         passed: true,
@@ -571,6 +617,7 @@ test("Grok quota text is not converted into a typed own-post backoff error", () 
     (error) => error?.code !== "TERAFABX_GROK_QUOTA_LIMIT" && /Unexpected token|not valid JSON/.test(error.message),
   );
   assert.equal(isTerafabxGrokNonJsonLimitText("You've reached your limit of 50 Grok Auto questions per 2 hours for now."), true);
+  assert.equal(isTerafabxGrokNonJsonLimitText("주간 한도에 도달했습니다. 7월 19일에 초기화됩니다."), true);
   assert.equal(isTerafabxGrokNonJsonLimitText('{"context_summary":"정상","key_points":["문맥"]}'), false);
 });
 
@@ -600,6 +647,13 @@ test("browser-heavy TerafabX workers keep five-way concurrency", () => {
   assert.equal(terafabxBrowserConcurrency(20, 20), 5);
   assert.equal(terafabxBrowserConcurrency(2, 1), 1);
   assert.equal(terafabxBrowserConcurrency(1, 10), 1);
+});
+
+test("Grok prefill selects exactly one context request at a time", () => {
+  assert.equal(terafabxGrokIndividualRequestCount(180), 1);
+  assert.equal(terafabxGrokIndividualRequestCount(1), 1);
+  assert.equal(terafabxGrokIndividualRequestCount(0), 0);
+  assert.equal(terafabxGrokIndividualBackoffUntil(Date.parse("2026-07-14T00:00:00.000Z")), "2026-07-14T00:10:00.000Z");
 });
 
 test("five comment prefill workers use distinct Grok sessions, Gemini ports, and profiles", () => {

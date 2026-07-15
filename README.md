@@ -138,16 +138,18 @@ Useful options:
 
 ## Threads to X Mirror Server
 
-Run the local server:
+Run the local server and its dedicated headed Chrome together:
 
 ```sh
 npm run mirror-server
 ```
 
-The server expects a headed Chrome instance with remote debugging on port
-`9224`, already logged in to X as `@terafabXai`.
+`npm start` is an alias for the same command. The launcher starts Chrome with
+remote debugging on port `9224` and the dedicated `Profile 1`, then starts the
+dashboard/mirror server on port `3131`. If that exact Chrome is already open,
+the launcher reuses it.
 
-Start Chrome manually on macOS if needed:
+The equivalent manual Chrome command is:
 
 ```sh
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
@@ -164,6 +166,18 @@ Endpoint:
 
 ```sh
 POST http://localhost:3131/api/mirror-thread
+```
+
+Dashboard/app share endpoints accept Threads posts plus YouTube watch, Shorts,
+and `youtu.be` links. YouTube rows use oEmbed metadata for the title, channel,
+and thumbnail. Posting/scheduling downloads an H.264 MP4 with `yt-dlp`, uploads
+the video to X, and removes hashtags and source links from the X title. Temporary
+video files are deleted after every success or failure. `yt-dlp` and `ffmpeg`
+must be installed.
+
+```sh
+POST http://localhost:3131/api/discovery/add-url-async
+POST http://localhost:3131/api/discovery/auto-schedule-async
 ```
 
 Body:
