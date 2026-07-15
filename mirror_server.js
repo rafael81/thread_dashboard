@@ -13284,6 +13284,13 @@ function isDiscoveryAutoScheduleSource(source) {
   return /auto[_-]?schedule/i.test(String(source || ""));
 }
 
+function discoveryAutoScheduleRequestMode(method, requestUrl) {
+  if (String(method || "").toUpperCase() !== "POST") return null;
+  if (requestUrl === "/api/discovery/auto-schedule-async") return "async";
+  if (requestUrl === "/api/discovery/auto-schedule") return "legacy";
+  return null;
+}
+
 function discoveryRowTimestamp(value) {
   const text = String(value || "").trim();
   if (!text) return NaN;
@@ -14766,40 +14773,15 @@ const server = http.createServer(async (req, res) => {
     }
     return;
   }
-  if (req.method === "POST" && req.url === "/api/discovery/auto-schedule") {
-    if (busy) {
-      json(res, 429, { ok: false, error: "다른 미러링 작업이 진행 중입니다." });
-      return;
-    }
-    let canonicalUrl = "";
-    try {
-      const body = await readRequestBody(req);
-      const payload = JSON.parse(body || "{}");
-      canonicalUrl = normalizeDiscoveryUrl(payload.url);
-      const result = await runDiscoveryAutoSchedule(canonicalUrl, {
-        text: payload.text,
-        source: "dashboard",
-      });
-      json(res, 200, { ok: true, autoScheduled: true, ...result });
-    } catch (error) {
-      if (canonicalUrl && shouldMarkDiscoveryScheduleFailed(error)) {
-        await markDiscoveryScheduleFailed(canonicalUrl, error);
-      }
-      if (error instanceof DuplicateMirrorError) {
-        logEvent("discovery_auto_schedule_duplicate", { error: error.message, ...error.details });
-        json(res, 409, { ok: false, duplicate: true, error: error.message, ...error.details });
-      } else {
-        logEvent("discovery_auto_schedule_error", { canonicalUrl, error: error.message });
-        json(res, 500, { ok: false, error: error.message });
-      }
-    }
-    return;
-  }
-  if (req.method === "POST" && req.url === "/api/discovery/auto-schedule-async") {
+  const autoScheduleRequestMode = discoveryAutoScheduleRequestMode(req.method, req.url);
+  if (autoScheduleRequestMode) {
     try {
       const body = await readRequestBody(req);
       const payload = JSON.parse(body || "{}");
       const canonicalUrl = normalizeDiscoveryUrl(payload.url);
+      const source = payload.origin || (autoScheduleRequestMode === "legacy"
+        ? "dashboard_auto_schedule_legacy"
+        : "auto_schedule_async");
       const completed = findCompletedMirror(canonicalUrl);
       if (completed) {
         json(res, 409, {
@@ -14815,12 +14797,12 @@ const server = http.createServer(async (req, res) => {
       }
       const placeholder = await addDiscoveryPlaceholder(canonicalUrl, {
         text: payload.text,
-        origin: payload.origin || "auto_schedule_async",
+        origin: source,
       });
       if (!placeholder.skippedExcluded) {
         await markDiscoveryScheduleQueueState(canonicalUrl, "queued_schedule");
       }
-      json(res, 202, {
+      json(res, autoScheduleRequestMode === "legacy" ? 200 : 202, {
         ok: true,
         accepted: true,
         autoSchedule: true,
@@ -14831,13 +14813,12 @@ const server = http.createServer(async (req, res) => {
       if (placeholder.skippedExcluded) {
         logEvent("discovery_auto_schedule_async_skipped", {
           canonicalUrl,
-          source: payload.origin || "auto_schedule_async",
+          source,
           reason: "excluded_keyword",
         });
         return;
       }
       setImmediate(() => {
-        const source = payload.origin || "auto_schedule_async";
         enqueueDiscoveryAutoScheduleJob(canonicalUrl, source, async () => {
           try {
             await processDiscoveryAutoScheduleJob(canonicalUrl, source, payload.text);
@@ -15408,6 +15389,7 @@ module.exports = {
   terafabxReplyPrompt,
   isTerafabxImageOnlyReply,
   publishedDiscoveryTime,
+  discoveryAutoScheduleRequestMode,
   isDiscoveryAutoScheduleSource,
   shouldRecoverDiscoveryPlaceholder,
   shouldMarkDiscoveryScheduleFailed,

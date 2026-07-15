@@ -27,6 +27,7 @@ const {
   terafabxGrokContextBatchPrompt,
   normalizeTerafabxContextResult,
   parseTerafabxGrokContextBatch,
+  discoveryAutoScheduleRequestMode,
   isDiscoveryAutoScheduleSource,
   ensureComposerText,
   mergeDiscoveryRowsWithMirrorHistory,
@@ -1156,4 +1157,11 @@ test('startup recovery resumes scheduling only for auto-schedule sources', () =>
   assert.equal(isDiscoveryAutoScheduleSource('auto-schedule-async'), true);
   assert.equal(isDiscoveryAutoScheduleSource('android_share'), false);
   assert.equal(isDiscoveryAutoScheduleSource('manual'), false);
+});
+
+test('legacy and current dashboard auto-schedule requests both use the queue path', () => {
+  assert.equal(discoveryAutoScheduleRequestMode('POST', '/api/discovery/auto-schedule'), 'legacy');
+  assert.equal(discoveryAutoScheduleRequestMode('POST', '/api/discovery/auto-schedule-async'), 'async');
+  assert.equal(discoveryAutoScheduleRequestMode('GET', '/api/discovery/auto-schedule'), null);
+  assert.equal(discoveryAutoScheduleRequestMode('POST', '/api/discovery/schedule'), null);
 });
