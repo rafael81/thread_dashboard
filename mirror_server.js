@@ -101,6 +101,8 @@ const TERAFABX_VERIFIED_REVIEW_X_PROFILE_DIR = process.env.TERAFABX_VERIFIED_REV
 const TERAFABX_COMMENT_X_CHROME_PORT = Number(process.env.TERAFABX_COMMENT_X_CHROME_PORT || 9236);
 const TERAFABX_COMMENT_X_PROFILE_DIR = process.env.TERAFABX_COMMENT_X_PROFILE_DIR || path.join(__dirname, ".data", "chrome-profiles", "terafabx-comment-x");
 const TERAFABX_COMMENT_X_LOCK_PATH = process.env.TERAFABX_COMMENT_X_LOCK_PATH || path.join(os.tmpdir(), `terafabx-comment-x${TERAFABX_COMMENT_X_CHROME_PORT}.lock`);
+const X_SCHEDULE_MONITOR_CHROME_PORT = Number(process.env.X_SCHEDULE_MONITOR_CHROME_PORT || TERAFABX_COMMENT_X_CHROME_PORT);
+const X_SCHEDULE_MONITOR_PROFILE_DIR = process.env.X_SCHEDULE_MONITOR_PROFILE_DIR || TERAFABX_COMMENT_X_PROFILE_DIR;
 const TERAFABX_COMMENT_PREFILL_TARGET_RAW = String(process.env.TERAFABX_COMMENT_PREFILL_TARGET || "unlimited").trim();
 const TERAFABX_COMMENT_PREFILL_UNLIMITED = /^(?:unlimited|infinity|inf|0)$/i.test(TERAFABX_COMMENT_PREFILL_TARGET_RAW);
 const TERAFABX_COMMENT_PREFILL_TARGET = TERAFABX_COMMENT_PREFILL_UNLIMITED
@@ -14932,6 +14934,7 @@ function loadXScheduleMonitorState() {
     ...readJsonFile(X_SCHEDULE_MONITOR_STATE_PATH, {}),
     busy: xScheduleMonitorBusy,
     intervalMs: X_SCHEDULE_MONITOR_INTERVAL_MS,
+    browser: xScheduleMonitorBrowserConfig(),
   };
 }
 
@@ -14940,6 +14943,14 @@ function saveXScheduleMonitorState(patch = {}) {
   const next = { ...previous, ...patch, busy: xScheduleMonitorBusy, intervalMs: X_SCHEDULE_MONITOR_INTERVAL_MS };
   writeJsonFile(X_SCHEDULE_MONITOR_STATE_PATH, next);
   return next;
+}
+
+function xScheduleMonitorBrowserConfig() {
+  return {
+    chromePort: X_SCHEDULE_MONITOR_CHROME_PORT,
+    profileDir: X_SCHEDULE_MONITOR_PROFILE_DIR,
+    headless: true,
+  };
 }
 
 async function futureScheduledDiscoveryRows() {
@@ -15074,10 +15085,17 @@ async function runXScheduleMonitor(options = {}) {
     .map((item) => `${item.canonicalUrl}|${item.scheduledAt}`));
   saveXScheduleMonitorState({ lastStartedAt: startedAt, lastStatus: "running", lastError: null });
   try {
-    return await withTerafabxLock("x_schedule_monitor", async () => {
+    return await withTerafabxCommentXLock("x_schedule_monitor", async () => {
       const expectedRows = await futureScheduledDiscoveryRows();
-      const page = await newPage(`https://x.com/${REQUIRED_X_HANDLE}`);
+      const browserConfig = xScheduleMonitorBrowserConfig();
+      let page = null;
       try {
+        await ensureTerafabxGeminiHeadlessBrowser({
+          port: browserConfig.chromePort,
+          profileDir: browserConfig.profileDir,
+          seedProfile: false,
+        });
+        page = await newPageForPort(browserConfig.chromePort, `https://x.com/${REQUIRED_X_HANDLE}`);
         await verifyXAccount(page);
         let actualEntries = await readXScheduledEntries(page);
         const anomalies = [];
@@ -15164,12 +15182,21 @@ async function runXScheduleMonitor(options = {}) {
         }
         return result;
       } finally {
-        await page.close();
-        logEvent("x_tab_closed", { source: "x_schedule_monitor" });
+        if (page) await page.close().catch(() => null);
+        const cleanup = await closeTerafabxGeminiHeadlessBrowser({
+          port: browserConfig.chromePort,
+          profileDir: browserConfig.profileDir,
+        }).catch((error) => ({ error: error.message }));
+        logEvent("x_tab_closed", {
+          source: "x_schedule_monitor",
+          chromePort: browserConfig.chromePort,
+          headless: true,
+          cleanup,
+        });
       }
     }, { wait: false });
   } catch (error) {
-    const skipped = /9224 CDP lock 사용 중/.test(error.message);
+    const skipped = /9236 headless X writer 사용 중/.test(error.message);
     const status = skipped ? "skipped_busy" : "error";
     saveXScheduleMonitorState({ lastRunAt: new Date().toISOString(), lastStatus: status, lastError: error.message });
     logEvent("x_schedule_monitor_error", { source: options.source || "timer", skipped, error: error.message });
@@ -15374,6 +15401,7 @@ module.exports = {
   assessXScheduledEntry,
   findXScheduledEntry,
   xScheduledTimeNeedles,
+  xScheduleMonitorBrowserConfig,
   terafabxGrokContextPrompt,
   terafabxGrokContextBatchPrompt,
   normalizeTerafabxContextResult,

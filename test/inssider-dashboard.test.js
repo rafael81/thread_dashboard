@@ -39,6 +39,7 @@ const {
   verifyComposerText,
   xWeightedLength,
   xScheduledTimeNeedles,
+  xScheduleMonitorBrowserConfig,
 } = require('../mirror_server.js');
 const { DEFAULT_GROK_URL, agentBrowserInvocation, buildGrokBatchCommandChunks, buildGrokBatchCommands, isGrokPromptEcho, namespaceProcessIds, parseDoneMarker } = require('../scripts/terafabx-grok-web-agent.js');
 
@@ -1164,4 +1165,11 @@ test('legacy and current dashboard auto-schedule requests both use the queue pat
   assert.equal(discoveryAutoScheduleRequestMode('POST', '/api/discovery/auto-schedule-async'), 'async');
   assert.equal(discoveryAutoScheduleRequestMode('GET', '/api/discovery/auto-schedule'), null);
   assert.equal(discoveryAutoScheduleRequestMode('POST', '/api/discovery/schedule'), null);
+});
+
+test('X schedule monitor uses the dedicated headless X browser', () => {
+  const config = xScheduleMonitorBrowserConfig();
+  assert.equal(config.chromePort, 9236);
+  assert.equal(config.headless, true);
+  assert.match(config.profileDir, /terafabx-comment-x$/);
 });
