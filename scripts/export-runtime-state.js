@@ -17,7 +17,6 @@ const regularFiles = [
   ".data/terafabx-comment-monitor-state.json",
   ".data/terafabx-comment-review-queue.json",
   ".data/x-schedule-monitor-state.json",
-  ".data/naver-blog-ops-state.json",
 ];
 
 const sqliteFiles = [

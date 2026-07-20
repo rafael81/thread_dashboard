@@ -473,6 +473,8 @@ export function DataTable(props: DataTableProps) {
         id: "actions",
         cell: ({ row }) => {
           const isPosted = row.original.status === "posted"
+          const autoSchedulePending = props.autoScheduleSubmitting.includes(row.original.canonicalUrl)
+          const autoScheduleDisabled = !row.original.canPost || autoSchedulePending
 
           return (
             <div className="flex items-center justify-end gap-2">
@@ -484,6 +486,16 @@ export function DataTable(props: DataTableProps) {
                   </a>
                 </Button>
               ) : null}
+              <Button
+                variant="outline"
+                size="sm"
+                aria-label="자동 예약"
+                onClick={() => props.onAutoSchedule(row.original)}
+                disabled={autoScheduleDisabled}
+              >
+                <CalendarClockIcon data-icon="inline-start" />
+                {autoSchedulePending ? "접수 중" : "자동 예약"}
+              </Button>
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <Button
@@ -529,9 +541,6 @@ export function DataTable(props: DataTableProps) {
                     </DropdownMenuItem>
                     <DropdownMenuItem onClick={() => props.onDraft(row.original)} disabled={!row.original.canPost || Boolean(busy)}>
                       초안 저장
-                    </DropdownMenuItem>
-                    <DropdownMenuItem onClick={() => props.onAutoSchedule(row.original)} disabled={!row.original.canPost || props.autoScheduleSubmitting.includes(row.original.canonicalUrl)}>
-                      {props.autoScheduleSubmitting.includes(row.original.canonicalUrl) ? "접수 중" : "자동 예약"}
                     </DropdownMenuItem>
                   </DropdownMenuGroup>
                 </DropdownMenuContent>

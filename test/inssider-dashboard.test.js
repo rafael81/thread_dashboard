@@ -1,10 +1,18 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 
 const {
   cleanThreadText,
+  classifyThreadSocialLine,
+  classifyXScheduleDialogState,
+  composerTextMatchesExpected,
   assessTerafabxLanguageQuality,
   assessXScheduledEntry,
+  scheduledVerificationAttemptDisposition,
+  assessTerafabxDiscoveryStyle,
+  isAutoStyleScheduleWithinHorizon,
   assessTerafabxCurrentCommentPolicy,
   dashboardDiscoveryRow,
   deriveTerafabxCommentQualityFeedback,
@@ -19,6 +27,7 @@ const {
   parseTerafabxFinalJudge,
   scoreTerafabxClichePenalty,
   selectRootPostMediaCandidates,
+  selectThreadSourceText,
   shouldAutoRecoverXScheduledAnomaly,
   findXScheduledEntry,
   terafabxGeminiReviewPrompt,
@@ -28,11 +37,13 @@ const {
   normalizeTerafabxContextResult,
   parseTerafabxGrokContextBatch,
   discoveryAutoScheduleRequestMode,
+  isConfirmedTerafabxGrokContext,
   isDiscoveryAutoScheduleSource,
   ensureComposerText,
   mergeDiscoveryRowsWithMirrorHistory,
   mirrorHistoryDashboardRow,
   shouldMarkDiscoveryScheduleFailed,
+  shouldReleaseReservedScheduleSlot,
   shouldRecoverDiscoveryPlaceholder,
   splitInssiderReplyChunks,
   truncateXText,
@@ -40,8 +51,166 @@ const {
   xWeightedLength,
   xScheduledTimeNeedles,
   xScheduleMonitorBrowserConfig,
+  xPageReadyState,
+  xScheduleRecoveryAction,
+  resolveAgentBrowserBin,
+  agentBrowserCommandArgs,
+  ensureNodeExecutablePath,
+  terafabxCommentAuthorDailyUsage,
+  terafabxCommentAuthorCapDisposition,
+  deferTerafabxPendingCommentForAuthorCap,
+  terafabxOwnRootReplyUsage,
+  terafabxWeightedReplyDecision,
+  nextTerafabxWeightedReplyCount,
+  terafabxWeightedReplyRunDisposition,
 } = require('../mirror_server.js');
-const { DEFAULT_GROK_URL, agentBrowserInvocation, buildGrokBatchCommandChunks, buildGrokBatchCommands, isGrokPromptEcho, namespaceProcessIds, parseDoneMarker } = require('../scripts/terafabx-grok-web-agent.js');
+
+test('automation dashboard shows FxTwitter discovery diagnostics and a manual X home scan', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'dashboard', 'src', 'main.jsx'), 'utf8');
+  assert.match(source, /FxTwitter 팔로잉/);
+  assert.match(source, /최근 24시간/);
+  assert.match(source, /followingCount/);
+  assert.match(source, /failedCount/);
+  assert.match(source, /targetBacklogCount/);
+  assert.match(source, /runTerafabx\("x-home-scan", "run"\)/);
+  assert.match(source, /X 홈 1회 스캔/);
+  assert.match(source, /commentDiscovery=\{data\?\.terafabx\?\.commentDiscovery\}/);
+  assert.match(source, /onManualXHomeScan=\{\(\) => runTerafabx\("x-home-scan", "run"\)\}/);
+});
+
+test('discovery list exposes auto schedule beside the overflow menu instead of inside it', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'dashboard', 'src', 'components', 'data-table.tsx'), 'utf8');
+
+  assert.match(source, /aria-label="자동 예약"[\s\S]*props\.onAutoSchedule\(row\.original\)/);
+  assert.doesNotMatch(source, /<DropdownMenuItem[^>]*onClick=\{\(\) => props\.onAutoSchedule\(row\.original\)\}/);
+  assert.match(source, /autoSchedulePending \? "접수 중" : "자동 예약"/);
+});
+
+test('ordinary auto comments count posted and pending reservations per author on the KST date', () => {
+  const state = {
+    commentHistory: [{ targetUrl: 'https://x.com/Foo/status/1', postedAt: '2026-07-20T00:00:00.000Z', replyUrl: 'https://x.com/terafabXai/status/11', source: 'prefill' }],
+    pendingCommentPosts: [{ targetUrl: 'https://x.com/foo/status/2', status: 'pending', queuedAt: '2026-07-20T01:00:00.000Z', source: 'prefill' }],
+  };
+  const usage = terafabxCommentAuthorDailyUsage(state, { targetUrl: 'https://x.com/FOO/status/3', source: 'prefill' }, new Date('2026-07-20T06:00:00.000Z'));
+  assert.deepEqual({ handle: usage.handle, posted: usage.posted, reserved: usage.reserved, used: usage.used, allowed: usage.allowed }, { handle: 'foo', posted: 1, reserved: 1, used: 2, allowed: false });
+});
+
+test('ordinary auto comment author cap resets at the KST date boundary', () => {
+  const state = { commentHistory: [{ targetUrl: 'https://x.com/foo/status/1', postedAt: '2026-07-19T14:59:59.000Z', replyUrl: 'https://x.com/terafabXai/status/11', source: 'prefill' }], pendingCommentPosts: [] };
+  assert.equal(terafabxCommentAuthorDailyUsage(state, { targetUrl: 'https://x.com/foo/status/2', source: 'prefill' }, new Date('2026-07-19T15:00:01.000Z')).allowed, true);
+});
+
+test('a third ordinary comment for one author is excluded before enqueue', () => {
+  const state = { commentHistory: [
+    { targetUrl: 'https://x.com/foo/status/1', postedAt: '2026-07-20T01:00:00.000Z', replyUrl: 'https://x.com/terafabXai/status/11', source: 'prefill' },
+    { targetUrl: 'https://x.com/foo/status/2', postedAt: '2026-07-20T02:00:00.000Z', replyUrl: 'https://x.com/terafabXai/status/12', source: 'prefill' },
+  ], pendingCommentPosts: [] };
+  assert.equal(terafabxCommentAuthorCapDisposition(state, { targetUrl: 'https://x.com/foo/status/3', source: 'prefill' }, new Date('2026-07-20T06:00:00.000Z')).reason, 'author_daily_cap_reached');
+});
+
+test('cap deferral preserves a quality-approved pending comment without increasing attempts', () => {
+  const deferred = deferTerafabxPendingCommentForAuthorCap({ targetUrl: 'https://x.com/foo/status/3', status: 'pending', attempts: 1 }, '2026-07-20T15:00:00.000Z');
+  assert.equal(deferred.attempts, 1);
+  assert.equal(deferred.status, 'pending');
+  assert.equal(deferred.lastFailureReason, 'author_daily_cap_reached');
+  assert.equal(deferred.nextAttemptAt, '2026-07-20T15:00:00.000Z');
+});
+
+test('automatic own-post replies stop at two total replies per root post across dates', () => {
+  const rootPostUrl = 'https://x.com/terafabXai/status/100';
+  const state = { ownPostReplyHistory: [
+    { rootPostUrl, targetUrl: 'https://x.com/a/status/1', replyUrl: 'https://x.com/terafabXai/status/11', postedAt: '2026-07-19T01:00:00.000Z' },
+    { rootPostUrl, targetUrl: 'https://x.com/b/status/2', replyUrl: 'https://x.com/terafabXai/status/12', postedAt: '2026-07-20T01:00:00.000Z' },
+  ], ownPostReplyManualQueue: [] };
+  assert.deepEqual(terafabxOwnRootReplyUsage(state, rootPostUrl), { rootPostUrl, posted: 2, reserved: 0, used: 2, limit: 2, allowed: false });
+});
+
+test('one own-post reply becomes due after five successful ordinary comments', () => {
+  assert.equal(terafabxWeightedReplyDecision({ successfulAutoCommentsSinceOwnReply: 4 }).due, false);
+  assert.equal(terafabxWeightedReplyDecision({ successfulAutoCommentsSinceOwnReply: 5 }).due, true);
+  assert.equal(nextTerafabxWeightedReplyCount(7, 'own_post_reply', true), 0);
+  assert.equal(nextTerafabxWeightedReplyCount(4, 'ordinary_comment', true), 5);
+  assert.equal(nextTerafabxWeightedReplyCount(5, 'own_post_reply', false), 5);
+});
+
+test('weighted own-post reply is not starved while comment prefill is running', () => {
+  const disposition = terafabxWeightedReplyRunDisposition({
+    successfulAutoCommentsSinceOwnReply: 5,
+    lastWeightedOwnReplyAttemptAt: null,
+  }, {
+    now: new Date('2026-07-20T07:00:00.000Z'),
+    quiet: false,
+    ownReplyBusy: false,
+    todayReplyBusy: false,
+    commentPrefillBusy: true,
+  });
+
+  assert.equal(disposition.due, true);
+  assert.equal(disposition.allowed, true);
+});
+
+test('TerafabX discovery style accepts a short Korean visual entertainment hook', () => {
+  const result = assessTerafabxDiscoveryStyle(
+    { likeCount: 5200, textPreview: '차에 치인 척하는 사람은 봤는데 고양이는 처음 봄ㅋㅋ' },
+    {
+      text: '차에 치인 척하는 사람은 봤는데 고양이는 처음 봄ㅋㅋ',
+      likeCount: 5200,
+      mediaUrls: ['https://cdn.example/video.mp4'],
+      diagnostics: { mediaCandidates: [{ width: 720, height: 1280 }] },
+    },
+  );
+  assert.equal(result.pass, true);
+  assert.ok(result.score >= 6);
+  assert.equal(result.signals.entertainment, true);
+});
+
+test('TerafabX discovery style fails closed for political or promotional posts', () => {
+  for (const text of [
+    '대통령 정당 지지율 속보를 정리했습니다',
+    '공동구매 할인코드는 DM 주세요',
+  ]) {
+    const result = assessTerafabxDiscoveryStyle(
+      { likeCount: 10000, textPreview: text },
+      {
+        text,
+        likeCount: 10000,
+        mediaUrls: ['https://cdn.example/image.jpg'],
+        diagnostics: { mediaCandidates: [{ width: 1080, height: 1080 }] },
+      },
+    );
+    assert.equal(result.pass, false);
+    assert.equal(result.excluded, true);
+  }
+});
+
+test('TerafabX discovery style rejects missing media and long informational captions', () => {
+  const noMedia = assessTerafabxDiscoveryStyle(
+    { likeCount: 9000, textPreview: '이게 어떻게 된 거지?' },
+    { text: '이게 어떻게 된 거지?', likeCount: 9000, mediaUrls: [], diagnostics: {} },
+  );
+  assert.equal(noMedia.pass, false);
+
+  const longInfo = '방법과 꿀팁을 정리했습니다. '.repeat(12);
+  const result = assessTerafabxDiscoveryStyle(
+    { likeCount: 9000, textPreview: longInfo },
+    {
+      text: longInfo,
+      likeCount: 9000,
+      mediaUrls: ['https://cdn.example/image.jpg'],
+      diagnostics: { mediaCandidates: [{ width: 1080, height: 1080 }] },
+    },
+  );
+  assert.equal(result.pass, false);
+  assert.equal(result.longInfoPost, true);
+});
+
+test('TerafabX automatic discovery scheduling does not fill slots beyond its runway', () => {
+  const now = Date.parse('2026-07-19T06:00:00.000Z');
+  assert.equal(isAutoStyleScheduleWithinHorizon('2026-07-20T00:00:00.000Z', now, 18), true);
+  assert.equal(isAutoStyleScheduleWithinHorizon('2026-07-20T00:01:00.000Z', now, 18), false);
+  assert.equal(isAutoStyleScheduleWithinHorizon('2026-07-19T05:59:00.000Z', now, 18), false);
+});
+const { DEFAULT_GROK_URL, agentBrowserInvocation, buildGrokBatchCommandChunks, buildGrokBatchCommands, isGrokPromptEcho, isGrokTitleResponse, namespaceProcessIds, normalizeGrokTitleResponse, parseDoneMarker } = require('../scripts/terafabx-grok-web-agent.js');
 
 test('sharp runtime dependency is importable', async () => {
   const sharp = await import('sharp');
@@ -60,13 +229,14 @@ test('TerafabX Grok context batch keeps target indexes isolated', () => {
   assert.match(prompt, /gctx-12345678-1234-1234-1234-123456789abc/);
 
   const parsed = parseTerafabxGrokContextBatch(JSON.stringify([
-    { index: 1, context_summary: '댓글을 백 개 작성하기도 어렵다며 다른 이용자들의 작성 방식을 궁금해하는 가벼운 하소연이다.', key_points: ['백 개 작성', '가벼운 하소연'] },
-    { index: 0, context_summary: '의정부고 졸업사진 속 손흥민 닮은 학생을 보고 놀라는 유머 글이다.', key_points: ['의정부고 졸업사진', '손흥민 닮은 학생'] },
+    { index: 1, context_summary: '댓글을 백 개 작성하기도 어렵다며 다른 이용자들의 작성 방식을 궁금해하는 가벼운 하소연이다.', key_points: ['백 개 작성', '가벼운 하소연'], reply: '백 개는 생각만 해도 손가락이 아프겠네요' },
+    { index: 0, context_summary: '의정부고 졸업사진 속 손흥민 닮은 학생을 보고 놀라는 유머 글이다.', key_points: ['의정부고 졸업사진', '손흥민 닮은 학생'], reply: '졸업사진에서 손흥민 분위기가 바로 보이네요' },
   ]), targets);
 
   assert.equal(parsed.length, 2);
   assert.equal(parsed[0].ok, true);
   assert.match(parsed[0].context.contextSummary, /손흥민/);
+  assert.match(parsed[0].context.reply, /졸업사진/);
   assert.equal(parsed[1].ok, true);
   assert.match(parsed[1].context.contextSummary, /백 개/);
 });
@@ -77,10 +247,19 @@ test('TerafabX Grok context batch fails closed for a missing index', () => {
     { url: 'https://x.com/b/status/2', targetText: '둘째 글' },
   ];
   const parsed = parseTerafabxGrokContextBatch(JSON.stringify([
-    { index: 0, context_summary: '첫 번째 글의 주제와 감정 및 안전하게 반응할 지점을 충분히 자세히 분석한 결과다.', key_points: ['첫 글'] },
+    { index: 0, context_summary: '첫 번째 글의 주제와 감정 및 안전하게 반응할 지점을 충분히 자세히 분석한 결과다.', key_points: ['첫 글'], reply: '첫 번째 글의 구체적인 장면이 눈에 들어오네요' },
   ]), targets);
   assert.equal(parsed[0].ok, true);
   assert.equal(parsed[1].ok, false);
+});
+
+test('TerafabX accepts a confirmed Grok batch provider record', () => {
+  assert.equal(isConfirmedTerafabxGrokContext({
+    summary: 'Grok이 원문 주제와 장면 및 감정을 충분히 분석하고 안전한 반응 지점을 확인했다.',
+    keyPoints: ['원문의 구체적인 장면', '안전한 반응 지점'],
+    rawPreview: '{"context_summary":"verified","reply":"draft"}',
+    provider: 'web-context-batch',
+  }), true);
 });
 
 test('TerafabX Grok context survives persisted summary field on retry', () => {
@@ -172,10 +351,9 @@ test('TerafabX quiet posting window blocks 01:00-07:00 KST only', () => {
 });
 
 test('TerafabX prefill cooldown schedules the exact remaining delay', () => {
-  const now = Date.parse('2026-07-13T16:43:50.000Z');
-  const startedAt = Date.parse('2026-07-13T16:34:35.000Z');
-  assert.equal(terafabxCommentPrefillCooldownDelay(startedAt, now), 45_000);
-  assert.equal(terafabxCommentPrefillCooldownDelay(startedAt, now + 45_000), 0);
+  const startedAt = Date.parse('2026-07-13T16:43:50.000Z');
+  assert.equal(terafabxCommentPrefillCooldownDelay(startedAt, startedAt + 3_000), 2_000);
+  assert.equal(terafabxCommentPrefillCooldownDelay(startedAt, startedAt + 5_000), 0);
 });
 
 test('TerafabX final judge lets structured Gemini cliche flags override a perfect score', () => {
@@ -748,16 +926,74 @@ test('TerafabX Grok context automation defaults to grok.com headless', () => {
   assert.equal(require('../mirror_server.js').TERAFABX_GROK_WEB_URL, 'https://grok.com/');
 });
 
-test('Grok headless browser uses the regular Chrome identity and system Chrome binary', () => {
-  const invocation = agentBrowserInvocation(['open', 'https://x.com/i/grok'], { session: 'ua-test' });
+test('Grok headless browser leaves user agent ownership to the system Chrome binary', () => {
+  const invocation = agentBrowserInvocation(['open', 'https://x.com/i/grok'], {
+    session: 'ua-test',
+    userAgent: 'Mozilla/5.0 Chrome/149.0.0.0',
+  });
   const userAgentIndex = invocation.args.indexOf('--user-agent');
   const executableIndex = invocation.args.indexOf('--executable-path');
 
-  assert.ok(userAgentIndex >= 0);
-  assert.match(invocation.args[userAgentIndex + 1], /Chrome\/149\.0\.0\.0/);
-  assert.doesNotMatch(invocation.args[userAgentIndex + 1], /HeadlessChrome|Chrome for Testing/);
+  assert.equal(userAgentIndex, -1);
   assert.equal(invocation.args[executableIndex + 1], '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome');
   assert.ok(invocation.args.includes('--lang=ko-KR,--window-size=1440,900'));
+});
+
+test('launchd resolves npx beside the active Node binary and keeps agent-browser arguments', () => {
+  const resolved = resolveAgentBrowserBin({
+    configured: '',
+    execPath: '/opt/homebrew/bin/node',
+    existsSync: (candidate) => candidate === '/opt/homebrew/bin/npx',
+  });
+  assert.equal(resolved, '/opt/homebrew/bin/npx');
+  assert.deepEqual(agentBrowserCommandArgs(['--session', 'worker'], resolved), [
+    '--yes',
+    'agent-browser',
+    '--session',
+    'worker',
+  ]);
+});
+
+test('Grok worker treats an absolute npx path as the npx launcher', () => {
+  const invocation = agentBrowserInvocation(['open', 'https://grok.com/'], {
+    bin: '/opt/homebrew/bin/npx',
+    session: 'absolute-npx-test',
+  });
+  assert.equal(invocation.bin, '/opt/homebrew/bin/npx');
+  assert.deepEqual(invocation.args.slice(0, 2), ['--yes', 'agent-browser']);
+});
+
+test('Grok worker accepts a marker-bound JSON title even when Grok strips outer braces', () => {
+  const marker = 'gctx-22f52c83-5563-4898-a570-88a26db55604';
+  const strippedTitle = `"request_id":"${marker}","index":0,"context_summary":"원문 요약","reply":"좋은 답글"`;
+
+  assert.equal(isGrokTitleResponse(strippedTitle, marker), true);
+  assert.equal(isGrokTitleResponse(strippedTitle, 'gctx-other-request'), false);
+  assert.equal(isGrokTitleResponse(`일반 페이지 ${marker}`, marker), false);
+});
+
+test('Grok worker reconstructs stripped title JSON before server validation', () => {
+  const marker = 'gctx-5f93751e-cfa5-4eff-af5c-87ce451237e3';
+  const strippedTitle = `"requestid":"${marker}","index":0,"contextsummary":"투자 손실과 추가 자금 고민","keypoints":"평단 275만원","추가 자금 2억","reply":"물타기 규모가 정말 크네요" - Grok`;
+
+  assert.deepEqual(JSON.parse(normalizeGrokTitleResponse(strippedTitle, marker)), [{
+    request_id: marker,
+    index: 0,
+    context_summary: '투자 손실과 추가 자금 고민',
+    key_points: ['평단 275만원', '추가 자금 2억'],
+    reply: '물타기 규모가 정말 크네요',
+  }]);
+});
+
+test('launchd prepends the active Node directory to child process PATH', () => {
+  assert.equal(
+    ensureNodeExecutablePath('/usr/bin:/bin', '/opt/homebrew/bin/node'),
+    '/opt/homebrew/bin:/usr/bin:/bin',
+  );
+  assert.equal(
+    ensureNodeExecutablePath('/opt/homebrew/bin:/usr/bin', '/opt/homebrew/bin/node'),
+    '/opt/homebrew/bin:/usr/bin',
+  );
 });
 
 test('Grok namespace cleanup de-duplicates only valid daemon process ids', () => {
@@ -786,7 +1022,128 @@ test('Threads text cleanup preserves short Korean no-space captions', () => {
 });
 
 test('Threads text cleanup still drops unrelated handle-only recommendations', () => {
-  assert.equal(cleanThreadText('aa_size\n끌고가라\ndestination_now_\n1\n/', 'aa_size'), '끌고가라');
+  assert.equal(
+    cleanThreadText('aa_size\n끌고가라\ndestination_now_\n1\n/', 'aa_size', ['destination_now_']),
+    '끌고가라',
+  );
+});
+
+// Regression: @doorlock_videopone/DbASteVEwvG was truncated at the bare `BTS` line.
+test('Threads text cleanup preserves bare Latin tokens inside a multiline caption', () => {
+  const raw = [
+    'doorlock_videopone',
+    '스페인 아르헨티나',
+    '월드컵 결승전',
+    'BTS',
+    '만나',
+    '신나하는',
+    '아이쇼스피드',
+    '미친듯이 좋아하네 ㅋㅋ',
+  ].join('\n');
+
+  assert.equal(
+    cleanThreadText(raw, 'doorlock_videopone'),
+    '스페인 아르헨티나\n월드컵 결승전\nBTS\n만나\n신나하는\n아이쇼스피드\n미친듯이 좋아하네 ㅋㅋ',
+  );
+});
+
+test('Threads social-line classification requires explicit or DOM-confirmed handle evidence', () => {
+  assert.equal(classifyThreadSocialLine('doorlock_videopone', 'doorlock_videopone'), 'expected_handle');
+  assert.equal(classifyThreadSocialLine('@destination_now_', 'doorlock_videopone'), 'explicit_handle');
+  assert.equal(classifyThreadSocialLine('destination_now_', 'doorlock_videopone', ['destination_now_']), 'confirmed_handle');
+  assert.equal(classifyThreadSocialLine('BTS', 'doorlock_videopone'), 'content');
+});
+
+test('X schedule verification retries a transient list-load failure before declaring failure', () => {
+  assert.equal(scheduledVerificationAttemptDisposition({ error: new Error('X schedule 로딩 실패'), attempt: 0, maxAttempts: 6 }), 'retry');
+  assert.equal(scheduledVerificationAttemptDisposition({ assessmentStatus: 'ok', attempt: 1, maxAttempts: 6 }), 'verified');
+  assert.equal(scheduledVerificationAttemptDisposition({ error: new Error('X schedule 로딩 실패'), attempt: 5, maxAttempts: 6 }), 'fail');
+});
+
+test('X schedule list is usable when real schedule rows coexist with a stale retry banner', () => {
+  const state = xPageReadyState({
+    bodyText: '다시 시도\n2026년 7월 21일 오전 12:35에 전송 예정\n스페인 아르헨티나',
+    articleCount: 5,
+    scheduleMarkerCount: 1,
+    accountText: '@terafabXai',
+  }, 'schedule');
+
+  assert.equal(state.errorVisible, true);
+  assert.equal(state.ready, true);
+});
+
+test('X schedule list remains verifiable when a background request is rate-limited after rows loaded', () => {
+  const state = xPageReadyState({
+    bodyText: '2026년 7월 21일 오전 12:35에 전송 예정\n스페인 아르헨티나',
+    articleCount: 5,
+    scheduleMarkerCount: 1,
+    accountText: '@terafabXai',
+    rateLimited: true,
+  }, 'schedule');
+
+  assert.equal(state.rateLimited, true);
+  assert.equal(state.ready, true);
+});
+
+test('X schedule dialog classifies a title-only route as a loading shell', () => {
+  assert.equal(classifyXScheduleDialogState({
+    url: 'https://x.com/compose/post/schedule',
+    bodyText: '예약 게시물',
+    requiredFieldCount: 0,
+    visibleFieldCount: 0,
+  }), 'loading_shell');
+});
+
+test('X schedule recovery waits, reopens once, then fails boundedly', () => {
+  assert.equal(xScheduleRecoveryAction({ state: 'loading_shell', elapsedMs: 10_000, reopenCount: 0, waitLimitMs: 45_000 }), 'wait');
+  assert.equal(xScheduleRecoveryAction({ state: 'loading_shell', elapsedMs: 45_000, reopenCount: 0, waitLimitMs: 45_000 }), 'reopen');
+  assert.equal(xScheduleRecoveryAction({ state: 'loading_shell', elapsedMs: 45_000, reopenCount: 1, waitLimitMs: 45_000 }), 'fail');
+  assert.equal(xScheduleRecoveryAction({ state: 'ready', elapsedMs: 0, reopenCount: 0, waitLimitMs: 45_000 }), 'continue');
+});
+
+test('X schedule dialog reports a relevant 429 before generic loading shell', () => {
+  assert.equal(classifyXScheduleDialogState({
+    url: 'https://x.com/compose/post/schedule',
+    bodyText: '예약 게시물',
+    requiredFieldCount: 0,
+    visibleFieldCount: 0,
+    relevantRateLimitUrl: 'https://x.com/i/api/graphql/example',
+  }), 'rate_limited');
+});
+
+test('auto schedule releases only reservations that failed before X submission started', () => {
+  assert.equal(shouldReleaseReservedScheduleSlot(new Error('schedule dialog failed')), true);
+  assert.equal(shouldReleaseReservedScheduleSlot(new Error('local database failed'), { submissionCompleted: true }), false);
+
+  const uncertain = new Error('post-submit verification failed');
+  uncertain.xScheduleSubmissionStarted = true;
+  assert.equal(shouldReleaseReservedScheduleSlot(uncertain), false);
+});
+
+test('X composer validation rejects duplicated text after the expected title', () => {
+  const expected = '스페인 아르헨티나\n월드컵 결승전';
+  assert.equal(composerTextMatchesExpected(expected, expected), true);
+  assert.equal(composerTextMatchesExpected(expected, `${expected}\n${expected}\nBTS`), false);
+});
+
+test('X composer replacement clears DraftJS state before inserting text', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'mirror_server.js'), 'utf8');
+  assert.match(source, /commands:\s*\["selectAll"\]/);
+  assert.match(source, /commands:\s*\["deleteBackward"\]/);
+});
+
+test('Threads exact embedded caption replaces a truncated DOM fallback', () => {
+  assert.equal(selectThreadSourceText({
+    domText: '스페인 아르헨티나\n월드컵 결승전',
+    embeddedCaption: '스페인 아르헨티나\n월드컵 결승전\n\nBTS\n만나\n신나하는\n아이쇼스피드\n\n미친듯이 좋아하네 ㅋㅋ',
+  }), '스페인 아르헨티나\n월드컵 결승전\n\nBTS\n만나\n신나하는\n아이쇼스피드\n\n미친듯이 좋아하네 ㅋㅋ');
+});
+
+test('Threads translated DOM text is not replaced by a different embedded source caption', () => {
+  assert.equal(selectThreadSourceText({
+    domText: '고양이가 상자를 열고 놀라는 장면',
+    embeddedCaption: 'A cat opens the box and looks surprised',
+  }), '고양이가 상자를 열고 놀라는 장면');
 });
 
 // Regression: a Threads topic/community label was included in an auto-scheduled title.
@@ -931,6 +1288,16 @@ test('X schedule monitor rejects an unexpected standalone ISO date before the ex
 
   assert.equal(result.status, 'title_mismatch');
   assert.equal(result.unexpectedIsoDate, '2026-06-29');
+});
+
+test('X schedule monitor rejects duplicated or appended title content', () => {
+  const result = assessXScheduledEntry(
+    { textPreview: '스페인 아르헨티나\n월드컵 결승전' },
+    { text: '2026년 7월 21일 (화) 오전 12:35에 전송 예정\n스페인 아르헨티나\n월드컵 결승전\n스페인 아르헨티나\n월드컵 결승전\n0:30' },
+  );
+
+  assert.equal(result.status, 'title_mismatch');
+  assert.equal(result.titlePresent, true);
 });
 
 test('X schedule monitor distinguishes a media-only row from a mismatched title', () => {

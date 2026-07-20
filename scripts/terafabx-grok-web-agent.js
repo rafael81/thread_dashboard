@@ -13,7 +13,6 @@ const INITIAL_BATCH_POLL_CHUNK_SIZE = 4;
 const BATCH_POLL_CHUNK_SIZE = 4;
 const DEBUG = process.env.TERAFABX_GROK_WEB_DEBUG === "true";
 const DEFAULT_SYSTEM_CHROME_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-const DEFAULT_HUMAN_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
 
 function agentBrowserNamespace(session) {
   return `tg-${crypto.createHash("sha1").update(String(session || DEFAULT_SESSION)).digest("hex").slice(0, 12)}`;
@@ -34,13 +33,12 @@ function parseArgs(argv) {
 }
 
 function agentBrowserInvocation(args, options = {}) {
-  const bin = process.env.AGENT_BROWSER_BIN || "npx";
-  const prefix = process.env.AGENT_BROWSER_BIN ? [] : ["--yes", "agent-browser"];
+  const bin = options.bin || process.env.AGENT_BROWSER_BIN || "npx";
+  const prefix = path.basename(String(bin)) === "npx" ? ["--yes", "agent-browser"] : [];
   const session = options.session || DEFAULT_SESSION;
   const namespace = agentBrowserNamespace(session);
   const state = options.state || "";
   const headed = options.headed === true || options.headed === "true";
-  const userAgent = options.userAgent || process.env.TERAFABX_BROWSER_USER_AGENT || process.env.AGENT_BROWSER_USER_AGENT || DEFAULT_HUMAN_USER_AGENT;
   const executablePath = options.executablePath
     || process.env.TERAFABX_BROWSER_EXECUTABLE_PATH
     || process.env.AGENT_BROWSER_EXECUTABLE_PATH
@@ -52,7 +50,6 @@ function agentBrowserInvocation(args, options = {}) {
       "--namespace", namespace,
       "--session", namespace,
       "--headed", headed ? "true" : "false",
-      "--user-agent", userAgent,
       "--args", "--lang=ko-KR,--window-size=1440,900",
       ...(executablePath ? ["--executable-path", executablePath] : []),
       ...(state ? ["--state", state] : []),
@@ -101,7 +98,7 @@ function runAgentBrowser(args, options = {}) {
 
 function closeAgentBrowserSession(session) {
   const bin = process.env.AGENT_BROWSER_BIN || "npx";
-  const prefix = process.env.AGENT_BROWSER_BIN ? [] : ["--yes", "agent-browser"];
+  const prefix = path.basename(String(bin)) === "npx" ? ["--yes", "agent-browser"] : [];
   const namespace = agentBrowserNamespace(session);
   return new Promise((resolve) => {
     execFile(bin, [...prefix, "--namespace", namespace, "--session", namespace, "--headed", "false", "close"], {
@@ -199,6 +196,35 @@ function parseDoneMarker(raw) {
   } catch {
     return null;
   }
+}
+
+function isGrokTitleResponse(title, responseMarker) {
+  const text = String(title || "").trim();
+  const marker = String(responseMarker || "").trim();
+  if (!marker || !text.includes(marker)) return false;
+  return /[\[{]/.test(text)
+    || /"(?:request_?id|index|context_?summary|key_?points|reply)"\s*:/i.test(text);
+}
+
+function normalizeGrokTitleResponse(title, responseMarker) {
+  const text = String(title || "").trim();
+  const marker = String(responseMarker || "").trim();
+  if (!marker || !text.includes(marker)) return "";
+  if (/^[\[{]/.test(text)) return text;
+  const requestId = (text.match(/"request_?id"\s*:\s*"([^"]+)"/i) || [])[1];
+  const indexText = (text.match(/"index"\s*:\s*(\d+)/i) || [])[1];
+  const contextSummary = (text.match(/"context_?summary"\s*:\s*"([\s\S]*?)"\s*,\s*"key_?points"/i) || [])[1];
+  const keyPointsText = (text.match(/"key_?points"\s*:\s*([\s\S]*?)\s*,\s*"reply"\s*:/i) || [])[1];
+  const reply = (text.match(/"reply"\s*:\s*"([\s\S]*?)"(?:\s*-\s*Grok)?\s*$/i) || [])[1];
+  if (!requestId || requestId !== marker || indexText === undefined || !contextSummary || !reply) return "";
+  const keyPoints = Array.from(String(keyPointsText || "").matchAll(/"([^"]+)"/g), (match) => match[1]);
+  return JSON.stringify([{
+    request_id: requestId,
+    index: Number(indexText),
+    context_summary: contextSummary,
+    key_points: keyPoints,
+    reply,
+  }]);
 }
 
 function buildGrokPromptEvalScript(prompt, timeoutMs) {
@@ -501,7 +527,15 @@ function buildGrokReadEvalScript(expectedPrompt = "") {
         return !/^(Grok|History|Today|New chat|새 채팅)$/i.test(text);
       });
     const last = nodes.at(-1);
-    const text = clean(last?.querySelector?.('.response-content-markdown, [class*="markdown" i]')?.innerText || last?.innerText || last?.textContent || '');
+    const nodeText = clean(last?.querySelector?.('.response-content-markdown, [class*="markdown" i]')?.innerText || last?.innerText || last?.textContent || '');
+    // grok.com has shipped layouts where the completed answer is reflected in
+    // document.title before an assistant-message selector becomes available.
+    // Only accept this fallback when it carries this request's unique marker;
+    // the server validates the marker and item count again before enqueueing.
+    const titleText = clean(document.title || '');
+    const normalizedTitleResponse = (${normalizeGrokTitleResponse.toString()})(titleText, responseMarker);
+    const titleHasResponse = Boolean(normalizedTitleResponse);
+    const text = nodeText || normalizedTitleResponse;
     const baseline = window.__terafabxGrokBaseline || { count: 0, text: '' };
     const isGenerating = [...document.querySelectorAll('button')].some((button) => /모델 응답 중지|Stop generating|Stop response/i.test(clean(button.getAttribute('aria-label') || button.innerText || '')));
     const looksNew = text && (nodes.length > Number(baseline.count || 0) || text !== clean(baseline.text || ''));
@@ -519,7 +553,7 @@ function buildGrokReadEvalScript(expectedPrompt = "") {
     }
     const markerMatched = !responseMarker || text.includes(responseMarker);
     const done = Boolean(looksNew && looksComplete && markerMatched && !isGenerating && Number(window.__terafabxGrokStableCount || 0) >= ${RESPONSE_STABLE_POLLS - 1});
-    const payload = { ok: true, stage: 'read', done, response: done ? text : '', textPreview: text.slice(0, 500), count: nodes.length, isGenerating, markerMatched, stableCount: Number(window.__terafabxGrokStableCount || 0), url: location.href, title: document.title };
+    const payload = { ok: true, stage: 'read', done, response: done ? text : '', textPreview: text.slice(0, 500), responseSource: nodeText ? 'dom' : titleHasResponse ? 'title' : 'none', count: nodes.length, isGenerating, markerMatched, stableCount: Number(window.__terafabxGrokStableCount || 0), url: location.href, title: document.title };
     return JSON.stringify(payload);
   })()`;
 }
@@ -872,4 +906,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { DEFAULT_GROK_URL, agentBrowserInvocation, buildGrokBatchCommandChunks, buildGrokBatchCommands, isGrokPromptEcho, namespaceProcessIds, parseDoneMarker, randomHumanDelayMs, runGrokPromptBatch };
+module.exports = { DEFAULT_GROK_URL, agentBrowserInvocation, buildGrokBatchCommandChunks, buildGrokBatchCommands, isGrokPromptEcho, isGrokTitleResponse, namespaceProcessIds, normalizeGrokTitleResponse, parseDoneMarker, randomHumanDelayMs, runGrokPromptBatch };

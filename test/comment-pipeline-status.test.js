@@ -38,7 +38,7 @@ test("comment pipeline distinguishes ready comments from active Grok analysis", 
     workerCount: 5,
   }), {
     status: "running",
-    label: "Grok 분석 중",
+    label: "Grok 문맥·초안 생성 중",
     blocker: null,
   });
 });

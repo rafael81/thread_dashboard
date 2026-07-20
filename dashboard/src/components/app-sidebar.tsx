@@ -7,7 +7,6 @@ import {
   CircleDollarSignIcon,
   SearchIcon,
   Settings2Icon,
-  FileTextIcon,
   ScaleIcon,
   SparklesIcon,
 } from "lucide-react"
@@ -33,7 +32,6 @@ const viewItems = [
   { id: "naver-adpost", title: "애드포스트 수익", icon: <CircleDollarSignIcon /> },
   { id: "automation", title: "자동화", icon: <Settings2Icon /> },
   { id: "inssider-pending", title: "인싸이더 판결중", icon: <ScaleIcon /> },
-  { id: "naver-blog", title: "네이버 블로그", icon: <FileTextIcon /> },
 ]
 
 export function AppSidebar({

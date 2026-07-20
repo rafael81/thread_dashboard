@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 const fs = require("fs");
+const path = require("path");
 const { execFile } = require("child_process");
 
 function parseArgs(argv) {
@@ -29,8 +30,9 @@ function normalizeEvalOutput(raw) {
 
 function runAgentBrowser(cdp, args, timeoutMs = 30000) {
   return new Promise((resolve, reject) => {
-    execFile(process.env.AGENT_BROWSER_BIN || "npx", [
-      ...(process.env.AGENT_BROWSER_BIN ? [] : ["--yes", "agent-browser"]),
+    const bin = process.env.AGENT_BROWSER_BIN || "npx";
+    execFile(bin, [
+      ...(path.basename(String(bin)) === "npx" ? ["--yes", "agent-browser"] : []),
       "--cdp", cdp,
       ...args,
     ], {

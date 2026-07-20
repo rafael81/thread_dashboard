@@ -15,7 +15,6 @@ import {
   TrendingDownIcon,
   TrendingUpIcon,
   UserPlusIcon,
-  FileTextIcon,
   CircleDollarSignIcon,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -370,145 +369,6 @@ function GrokContextBlock({ context }) {
   );
 }
 
-
-function NaverBlogOps({ data, loading, busy, error, onRunAction, onReload }) {
-  const state = data?.state || {};
-  const browser = data?.browser || {};
-  const scheduler = data?.scheduler || {};
-  const events = data?.events || [];
-  const [scheduleText, setScheduleText] = useState((state.schedule || ["08:00", "15:00", "21:00"]).join(", "));
-
-  useEffect(() => {
-    setScheduleText((state.schedule || ["08:00", "15:00", "21:00"]).join(", "));
-  }, [state.schedule]);
-
-  const schedule = scheduleText.split(",").map((item) => item.trim()).filter(Boolean);
-  const disabled = Boolean(busy || loading || scheduler.busy);
-
-  return (
-    <div className="grid gap-4 px-4 lg:px-6">
-      <div className="grid gap-4 lg:grid-cols-4">
-        <Card>
-          <CardHeader className="pb-2">
-            <CardDescription>자체 스케줄러</CardDescription>
-            <CardTitle>{state.enabled ? "ON" : "OFF"}</CardTitle>
-          </CardHeader>
-          <CardContent className="text-sm text-muted-foreground">
-            Hermes cron 미사용 · 다음 {formatDate(state.nextRunAt)}
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader className="pb-2">
-            <CardDescription>작성자</CardDescription>
-            <CardTitle>Gemini Web Only</CardTitle>
-          </CardHeader>
-          <CardContent className="text-sm text-muted-foreground">
-            다른 LLM 본문 작성 차단
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader className="pb-2">
-            <CardDescription>브라우저 프로필</CardDescription>
-            <CardTitle>{browser.running ? "실행 중" : "대기"}</CardTitle>
-          </CardHeader>
-          <CardContent className="text-sm text-muted-foreground">
-            Chrome {browser.port || 9233} · 블로그 {browser.blogTabs || 0} · Gemini {browser.geminiTabs || 0}
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader className="pb-2">
-            <CardDescription>마지막 작업</CardDescription>
-            <CardTitle>{state.lastRun?.status || "-"}</CardTitle>
-          </CardHeader>
-          <CardContent className="truncate text-sm text-muted-foreground">
-            {state.lastRun?.title || state.lastRun?.error || "아직 실행 없음"}
-          </CardContent>
-        </Card>
-      </div>
-
-      {error ? (
-        <Alert variant="destructive">
-          <AlertTitle>네이버 블로그 작업 실패</AlertTitle>
-          <AlertDescription>{error}</AlertDescription>
-        </Alert>
-      ) : null}
-
-      <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_420px]">
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2"><FileTextIcon className="size-5" /> 네이버 블로그 작성 운영</CardTitle>
-            <CardDescription>
-              검색수요 후보 → Gemini Web 초안 → SmartEditor 임시저장 흐름을 이 서버 자체 스케줄러로 운영합니다.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="grid gap-4">
-            <div className="grid gap-2">
-              <label className="text-sm font-medium" htmlFor="naver-schedule">실행 시간(KST, 쉼표 구분)</label>
-              <Input id="naver-schedule" value={scheduleText} onChange={(event) => setScheduleText(event.target.value)} placeholder="08:00, 15:00, 21:00" />
-            </div>
-            <div className="grid gap-2 rounded-lg border p-3 text-sm text-muted-foreground">
-              <div>블로그 ID: <span className="font-medium text-foreground">{state.blogId || "cury8282"}</span></div>
-              <div>모드: <span className="font-medium text-foreground">임시저장 전용 / 발행 금지</span></div>
-              <div>프로필: <span className="font-mono text-xs">{browser.profileDir || state.chrome?.profileDir}</span></div>
-              <div>규칙: 제목 바로 아래 대표 이미지 · 엔터/방송/근황은 실제 이미지 우선 · 완료 후 탭 정리</div>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              <Button disabled={disabled} onClick={() => onRunAction("naver-settings-enable", () => api("/api/naver-blog/settings", { method: "POST", body: JSON.stringify({ enabled: true, schedule }) }), "네이버 블로그 스케줄러 ON")}>ON</Button>
-              <Button variant="outline" disabled={disabled} onClick={() => onRunAction("naver-settings-disable", () => api("/api/naver-blog/settings", { method: "POST", body: JSON.stringify({ enabled: false, schedule }) }), "네이버 블로그 스케줄러 OFF")}>OFF</Button>
-              <Button variant="outline" disabled={disabled} onClick={() => onRunAction("naver-settings-save", () => api("/api/naver-blog/settings", { method: "POST", body: JSON.stringify({ schedule, enabled: state.enabled === true }) }), "스케줄 저장됨")}>스케줄 저장</Button>
-              <Button disabled={disabled} onClick={() => onRunAction("naver-run", () => api("/api/naver-blog/run", { method: "POST", body: JSON.stringify({}) }), "네이버 임시저장 완료")}>{busy === "naver-run" ? <Loader2Icon data-icon="inline-start" className="animate-spin" /> : <FileTextIcon data-icon="inline-start" />} 지금 1회 작성</Button>
-              <Button variant="outline" disabled={disabled} onClick={() => onRunAction("naver-browser", () => api("/api/naver-blog/browser", { method: "POST", body: JSON.stringify({}) }), "전용 브라우저 실행됨")}><ExternalLinkIcon data-icon="inline-start" /> 전용 브라우저</Button>
-              <Button variant="outline" disabled={disabled} onClick={() => onRunAction("naver-cleanup", () => api("/api/naver-blog/cleanup-tabs", { method: "POST", body: JSON.stringify({}) }), "작업 탭 정리됨")}>탭 정리</Button>
-              <Button variant="ghost" disabled={disabled} onClick={onReload}>새로고침</Button>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle>최근 실행</CardTitle>
-            <CardDescription>자체 스케줄러/수동 실행 결과</CardDescription>
-          </CardHeader>
-          <CardContent className="grid gap-3">
-            {(state.recentRuns || []).length ? (state.recentRuns || []).slice(0, 8).map((run) => (
-              <div key={run.id} className="grid gap-1 rounded-lg border p-3 text-sm">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="font-medium">{run.status}</span>
-                  <Badge variant={run.status === "ok" ? "secondary" : "destructive"}>{run.source}</Badge>
-                </div>
-                <div className="text-muted-foreground">{formatDate(run.finishedAt || run.startedAt)}</div>
-                <div className="line-clamp-2">{run.title || run.error || "제목 없음"}</div>
-                {run.logNo ? <div className="font-mono text-xs text-muted-foreground">logNo {run.logNo}</div> : null}
-              </div>
-            )) : (
-              <div className="rounded-lg border p-4 text-sm text-muted-foreground">아직 실행 기록이 없습니다.</div>
-            )}
-          </CardContent>
-        </Card>
-      </div>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>이벤트 로그</CardTitle>
-          <CardDescription>브라우저 실행, 탭 정리, 스케줄러 tick 로그</CardDescription>
-        </CardHeader>
-        <CardContent className="max-h-[360px] overflow-auto rounded-lg border bg-muted/20 p-0">
-          {events.length ? events.slice().reverse().map((event, index) => (
-            <div key={`${event.ts}-${index}`} className="grid gap-1 border-b p-3 text-sm last:border-b-0">
-              <div className="flex items-center justify-between gap-2">
-                <span className="font-medium">{event.type}</span>
-                <span className="text-xs text-muted-foreground">{formatDate(event.ts)}</span>
-              </div>
-              <pre className="overflow-auto whitespace-pre-wrap text-xs text-muted-foreground">{JSON.stringify(event, null, 2)}</pre>
-            </div>
-          )) : (
-            <div className="p-4 text-sm text-muted-foreground">로그 없음</div>
-          )}
-        </CardContent>
-      </Card>
-    </div>
-  );
-}
 
 function CoupangPerformance({ data, loading, range, onRangeChange, onPreset, onReload, busy }) {
   const coupang = data?.coupang || {};
@@ -980,6 +840,8 @@ function AutomationTimelineView({
   ownPostReplyError,
   ownPostReplyStatus,
   commentPipeline,
+  commentDiscovery,
+  onManualXHomeScan,
   todayPostReply,
   onTodayPostReplyAction,
 }) {
@@ -995,7 +857,7 @@ function AutomationTimelineView({
     checking_queue: "큐 확인",
     gemini_profiles: "Gemini 워커 준비",
     grok_context: "Grok 문맥 분석",
-    gemini_batch: "Gemini 생성·심사",
+    gemini_batch: "Gemini 수정·심사",
     queue_ready: "게시 큐 준비",
     batch_partial_failure: "일부 생성 실패",
     blocked: "차단됨",
@@ -1098,6 +960,12 @@ function AutomationTimelineView({
                 <div>최근 종료 {formatDate(commentPipeline?.lastFinishedAt)}</div>
               </div>
             </div>
+            <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+              <span>계정당 댓글 {compact(commentPipeline?.authorDailyLimit)}건/일</span>
+              <span>제한 이월 {compact(commentPipeline?.authorCapDeferredCount)}건</span>
+              <span>내 글당 대댓글 {compact(commentPipeline?.ownRootReplyLimit)}건</span>
+              <span>대댓글 전환 {compact(commentPipeline?.successfulAutoCommentsSinceOwnReply)}/{compact(commentPipeline?.weightedOwnReplyThreshold)}</span>
+            </div>
             <div className="grid gap-3 sm:grid-cols-2">
               <div className="rounded-md border bg-background p-3">
                 <div className="flex items-center justify-between gap-2">
@@ -1116,7 +984,7 @@ function AutomationTimelineView({
               </div>
               <div className="rounded-md border bg-background p-3">
                 <div className="flex items-center justify-between gap-2">
-                  <span className="text-sm font-medium">Gemini 생성·심사 워커</span>
+                  <span className="text-sm font-medium">Gemini 수정·심사 워커</span>
                   <Badge variant={Number(commentPipeline?.gemini?.readyWorkers || 0) === Number(commentPipeline?.gemini?.configuredWorkers || 0) ? "secondary" : "destructive"}>
                     준비 {compact(commentPipeline?.gemini?.readyWorkers)} / {compact(commentPipeline?.gemini?.configuredWorkers)}
                   </Badge>
@@ -1141,6 +1009,56 @@ function AutomationTimelineView({
               <span>실패 {compact(commentPipeline?.lastFailed)}</span>
             </div>
           </div>
+
+          <Card id="comment-discovery">
+            <CardHeader>
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                <div>
+                  <CardTitle>자동댓글 대상 발굴</CardTitle>
+                  <CardDescription>FxTwitter 팔로잉 타임라인을 순환 조회하며 최근 24시간 원글만 후보로 저장합니다.</CardDescription>
+                </div>
+                <div className="flex gap-2">
+                  <Badge variant="outline">최근 24시간</Badge>
+                  <Badge variant={commentDiscovery?.lastStatus === "degraded" ? "destructive" : "secondary"}>
+                    {commentDiscovery?.lastStatus || "대기"}
+                  </Badge>
+                </div>
+              </div>
+            </CardHeader>
+            <CardContent className="grid gap-4">
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                {[
+                  ["팔로잉", commentDiscovery?.followingCount],
+                  ["이번 조회", commentDiscovery?.attemptedCount],
+                  ["최근 후보", commentDiscovery?.candidateCount],
+                  ["후보 저장소", commentDiscovery?.targetBacklogCount],
+                ].map(([label, value]) => (
+                  <div key={label} className="rounded-lg border p-3">
+                    <div className="text-xs text-muted-foreground">{label}</div>
+                    <div className="text-xl font-semibold tabular-nums">{compact(value)}</div>
+                  </div>
+                ))}
+              </div>
+              <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                <span>성공 {compact(commentDiscovery?.succeededCount)}</span>
+                <span>실패 {compact(commentDiscovery?.failedCount)}</span>
+                <span>백오프 {compact(commentDiscovery?.backedOffCount)}</span>
+                <span>다음 계정 위치 {compact(commentDiscovery?.accountCursor)}</span>
+                <span>배치 {compact(commentDiscovery?.batchSize)}개</span>
+                <span>팔로잉 동기화 {formatDate(commentDiscovery?.lastFollowingSyncAt)}</span>
+              </div>
+              {commentDiscovery?.lastError ? (
+                <Alert variant="destructive">
+                  <AlertTitle>발굴 부분 실패</AlertTitle>
+                  <AlertDescription>{commentDiscovery.lastError}</AlertDescription>
+                </Alert>
+              ) : null}
+              <Button type="button" variant="outline" disabled={actionBusy} onClick={onManualXHomeScan}>
+                X 홈 1회 스캔
+              </Button>
+              <p className="text-xs text-muted-foreground">진단 버튼을 누를 때만 Chrome 9224의 X 홈을 1회 열며, 자동 발굴은 X 홈을 사용하지 않습니다.</p>
+            </CardContent>
+          </Card>
 
           <OwnPostReplyControl
             value={ownPostReplyUrl}
@@ -1392,11 +1310,9 @@ function AutomationTimelineView({
 }
 
 function Dashboard() {
-  const initialView = location.pathname.startsWith("/naver-blog")
-    ? "naver-blog"
-    : location.pathname.startsWith("/inssider-pending")
-      ? "inssider-pending"
-      : new URLSearchParams(location.search).get("view") || "discovered";
+  const initialView = location.pathname.startsWith("/inssider-pending")
+    ? "inssider-pending"
+    : new URLSearchParams(location.search).get("view") || "discovered";
   const [view, setView] = useState(initialView);
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -1418,9 +1334,7 @@ function Dashboard() {
 
   async function load(nextView = view, options = {}) {
     setError("");
-    const result = nextView === "naver-blog"
-      ? await api("/api/naver-blog/ops")
-      : nextView === "inssider-pending"
+    const result = nextView === "inssider-pending"
         ? await api("/api/inssider/pending")
         : nextView === "coupang-performance"
           ? { ok: true, coupang: await api(`/api/coupang/performance?startDate=${compactCoupangDate(coupangRange.startDate)}&endDate=${compactCoupangDate(coupangRange.endDate)}`) }
@@ -1439,10 +1353,7 @@ function Dashboard() {
 
   useEffect(() => {
     const url = new URL(location.href);
-    if (view === "naver-blog") {
-      url.pathname = "/naver-blog";
-      url.searchParams.delete("view");
-    } else if (view === "inssider-pending") {
+    if (view === "inssider-pending") {
       url.pathname = "/inssider-pending";
       url.searchParams.delete("view");
     } else if (view === "coupang-performance" || view === "naver-adpost") {
@@ -1794,8 +1705,8 @@ function Dashboard() {
         />
         <SidebarInset>
           <SiteHeader
-            title={view === "naver-blog" ? "네이버 블로그 운영" : view === "inssider-pending" ? "인싸이더 판결중" : view === "automation" ? "자동화 타임라인" : view === "coupang-performance" ? "쿠팡 파트너스 실적" : view === "naver-adpost" ? "네이버 애드포스트 수익" : "Threads 발굴 대시보드"}
-            subtitle={view === "naver-blog" ? "Gemini Web 전용 작성 · 자체 스케줄러 · 전용 Chrome 프로필" : view === "inssider-pending" ? "연애·결혼 / 직장·사회 카테고리의 진행 중인 판결글" : view === "automation" ? "자동댓글 기록 · 날짜별 필터 · 작성 시간 정렬" : view === "coupang-performance" ? "쿠팡 파트너스 월간 실적과 최근 일자별 수수료" : view === "naver-adpost" ? "현재 잔액 · 기간별 수익 · 노출과 클릭 현황" : "좋아요 1000+ · 미디어 포함 · X 수동 검토/예약 워크플로우"}
+            title={view === "inssider-pending" ? "인싸이더 판결중" : view === "automation" ? "자동화 타임라인" : view === "coupang-performance" ? "쿠팡 파트너스 실적" : view === "naver-adpost" ? "네이버 애드포스트 수익" : "Threads 발굴 대시보드"}
+            subtitle={view === "inssider-pending" ? "연애·결혼 / 직장·사회 카테고리의 진행 중인 판결글" : view === "automation" ? "자동댓글 기록 · 날짜별 필터 · 작성 시간 정렬" : view === "coupang-performance" ? "쿠팡 파트너스 월간 실적과 최근 일자별 수수료" : view === "naver-adpost" ? "현재 잔액 · 기간별 수익 · 노출과 클릭 현황" : "좋아요 1000+ · 미디어 포함 · X 수동 검토/예약 워크플로우"}
             autoRefresh={autoRefresh}
             busy={controlsBusy}
             onRefresh={() => runAction("refresh-data", () => load(view), "새로고침 완료")}
@@ -1807,16 +1718,7 @@ function Dashboard() {
           />
           <div className="flex flex-1 flex-col">
             <div className="@container/main flex flex-1 flex-col gap-4 py-4 md:gap-6 md:py-6">
-              {view === "naver-blog" ? (
-                <NaverBlogOps
-                  data={data}
-                  loading={loading}
-                  busy={busy}
-                  error={error}
-                  onRunAction={runAction}
-                  onReload={() => runAction("naver-refresh", () => load("naver-blog"), "새로고침 완료")}
-                />
-              ) : view === "inssider-pending" ? (
+              {view === "inssider-pending" ? (
                 <InssiderPending
                   data={data}
                   loading={loading}
@@ -1889,6 +1791,8 @@ function Dashboard() {
                   onTodayPostReplyAction={runTodayPostReplyAction}
                   ownPostReplyStatus={data?.terafabx?.ownPostReply}
                   commentPipeline={data?.terafabx?.commentPipeline}
+                  commentDiscovery={data?.terafabx?.commentDiscovery}
+                  onManualXHomeScan={() => runTerafabx("x-home-scan", "run")}
                 />
               ) : (
                 <>
@@ -1929,7 +1833,7 @@ function Dashboard() {
                   <CardHeader>
                     <CardTitle>스캔/보강</CardTitle>
                     <CardDescription>
-                      발굴 스캔과 미리보기 보강 작업을 수동 실행합니다.
+                      발굴 스캔, 최근 게시 스타일 자동예약, 미리보기 보강을 제어합니다.
                     </CardDescription>
                   </CardHeader>
                   <CardContent className="grid grid-cols-2 gap-2">
@@ -1959,6 +1863,23 @@ function Dashboard() {
                       <RefreshCcwIcon data-icon="inline-start" />
                       보강
                     </Button>
+                    <Button
+                      className="col-span-2"
+                      variant={summary.autoStyleScheduleEnabled ? "outline" : "default"}
+                      disabled={controlsBusy}
+                      onClick={() =>
+                        runAction("auto-style-schedule", () => api("/api/discovery/auto-style-schedule", {
+                          method: "POST",
+                          body: JSON.stringify({ enabled: !summary.autoStyleScheduleEnabled }),
+                        }), "스타일 자동예약 설정 변경됨")
+                      }
+                    >
+                      {summary.autoStyleScheduleEnabled ? <PauseCircleIcon data-icon="inline-start" /> : <PlayCircleIcon data-icon="inline-start" />}
+                      {summary.autoStyleScheduleEnabled ? "스타일 자동예약 중지" : "스타일 자동예약 시작"}
+                    </Button>
+                    <p className="col-span-2 text-xs text-muted-foreground">
+                      좋아요 1천+ · 미디어 확인 · 스타일 점수 {summary.autoStyleMinScore || 6}+ · 회당 최대 {summary.autoStyleScheduleMaxPerScan || 1}개 · {summary.autoStyleMaxFutureHours || 18}시간 앞까지만 예약
+                    </p>
                     <Button
                       className="col-span-2"
                       disabled={controlsBusy}
@@ -2056,6 +1977,44 @@ function Dashboard() {
                           <p className="text-xs text-muted-foreground">
                             Prefill 최근 실행 {formatDate(data?.terafabx?.commentPrefill?.lastRunAt)}
                           </p>
+                          <div className="mt-2 grid gap-1 rounded-md border bg-muted/20 p-2 text-xs">
+                            <div className="flex flex-wrap items-center gap-2 font-medium">
+                              FxTwitter 팔로잉
+                              <Badge variant="outline">최근 24시간</Badge>
+                              <Badge variant={data?.terafabx?.commentDiscovery?.lastStatus === "degraded" ? "destructive" : "secondary"}>
+                                {data?.terafabx?.commentDiscovery?.lastStatus || "대기"}
+                              </Badge>
+                            </div>
+                            <p className="text-muted-foreground">
+                              팔로잉 {compact(data?.terafabx?.commentDiscovery?.followingCount)}명
+                              {` · 최근 후보 ${compact(data?.terafabx?.commentDiscovery?.candidateCount)}개`}
+                              {` · 저장소 ${compact(data?.terafabx?.commentDiscovery?.targetBacklogCount)}개`}
+                            </p>
+                            <p className="text-muted-foreground">
+                              조회 {compact(data?.terafabx?.commentDiscovery?.attemptedCount)}
+                              {` · 성공 ${compact(data?.terafabx?.commentDiscovery?.succeededCount)}`}
+                              {` · 실패 ${compact(data?.terafabx?.commentDiscovery?.failedCount)}`}
+                              {` · 백오프 ${compact(data?.terafabx?.commentDiscovery?.backedOffCount)}`}
+                            </p>
+                            <p className="text-muted-foreground">
+                              팔로잉 동기화 {formatDate(data?.terafabx?.commentDiscovery?.lastFollowingSyncAt)}
+                              {` · 다음 ${formatDate(data?.terafabx?.commentDiscovery?.nextFollowingSyncAt)}`}
+                            </p>
+                            {data?.terafabx?.commentDiscovery?.lastError ? (
+                              <p className="line-clamp-2 text-destructive" title={data.terafabx.commentDiscovery.lastError}>
+                                {data.terafabx.commentDiscovery.lastError}
+                              </p>
+                            ) : null}
+                            <Button
+                              className="mt-1 w-full"
+                              size="sm"
+                              variant="outline"
+                              disabled={controlsBusy}
+                              onClick={() => runTerafabx("x-home-scan", "run")}
+                            >
+                              X 홈 1회 스캔
+                            </Button>
+                          </div>
                           {data?.terafabx?.commentPrefill?.lastError ? (
                             <p className="line-clamp-2 text-xs text-destructive" title={data.terafabx.commentPrefill.lastError}>
                               {data.terafabx.commentPrefill.lastError}

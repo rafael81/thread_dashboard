@@ -1,3 +1,4 @@
 {
-  "autoDiscoveryEnabled": false
+  "autoDiscoveryEnabled": false,
+  "autoStyleScheduleEnabled": false
 }

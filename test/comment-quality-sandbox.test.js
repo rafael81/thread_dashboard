@@ -50,6 +50,38 @@ test("local quality gate blocks fabricated personal experience", () => {
   assert.equal(assessTerafabxLanguageQuality("옛날 단면과 확실히 달라 보이네요").ok, true);
 });
 
+test("local quality gate identifies counseling empathy and advertising copy from today's audit", () => {
+  const counseling = assessTerafabxLanguageQuality("멀쩡한 글에 성인 라벨이 왜 붙는 건지 당황스러우셨겠어요");
+  assert.ok(counseling.styleWarnings.includes("counseling_empathy_tone"));
+
+  const advertising = assessTerafabxLanguageQuality("화려한 금장식이라 입으면 바로 시선 집중되겠어요");
+  assert.ok(advertising.styleWarnings.includes("promotional_prediction_copy"));
+
+  const reusable = assessTerafabxLanguageQuality("박스 접는 아이디어가 기발하네요");
+  assert.ok(reusable.styleWarnings.includes("reusable_affect_template"));
+});
+
+test("current policy blocks unsupported absolute claims absent from the source", () => {
+  const result = assessTerafabxCurrentCommentPolicy({
+    at: "2026-07-13T00:45:59.000Z",
+    targetText: "운동을 마치고 음료를 마시는 영상",
+    comment: "운동하고 마시면 원래 단맛이 배가되죠",
+    grokContext: {
+      summary: "운동 직후 음료를 마시며 만족하는 짧은 영상이다.",
+      keyPoints: ["운동 직후 음료"],
+      rawPreview: "grok-json",
+      provider: "web-context",
+    },
+    geminiReview: { finalJudge: {
+      passed: true,
+      fatalError: false,
+      dimensions: { context: 40 },
+    } },
+  });
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.includes("unsupported_absolute_claim:원래"));
+});
+
 test("current policy blocks deterministic cliches even when the independent judge misses its flag", () => {
   const comment = "자신감 넘치는 직진 플러팅에 웃음이 터지네요";
   assert.equal(scoreTerafabxClichePenalty(comment).penalty, 16);
@@ -214,6 +246,33 @@ test("a perfect Gemini score cannot override an identified typo", () => {
   assert.equal(result.score, 100);
   assert.equal(result.passed, false);
   assert.deepEqual(result.flaggedQualityIssues, ["language_error", "awkward_korean"]);
+});
+
+test("a perfect Gemini score cannot override deterministic conversational style warnings", () => {
+  const result = parseTerafabxFinalJudge(JSON.stringify({
+    context: 40,
+    naturalness: 25,
+    specificity: 15,
+    concision: 10,
+    non_ai_style: 10,
+    fatal_error: false,
+    language_error: false,
+    awkward_korean: false,
+    translation_tone: false,
+    cliche: false,
+    context_error: false,
+    unsupported_claim: false,
+    cross_post_reusable: false,
+    headline_tone: false,
+    specificity_error: false,
+    source_anchor: "성인 라벨",
+    reason: "자연스럽고 구체적임",
+  }), "멀쩡한 글에 성인 라벨이 왜 붙는 건지 당황스러우셨겠어요", {
+    targetText: "성인 라벨이 잘못 붙어서 글을 지웠다",
+  });
+  assert.equal(result.score, 100);
+  assert.equal(result.passed, false);
+  assert.ok(result.languageQuality.styleWarnings.includes("counseling_empathy_tone"));
 });
 
 test("structured Gemini flags are mandatory only for comments created after rollout", () => {

@@ -1,10 +1,13 @@
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 const test = require("node:test");
 
 const {
   assessTerafabxParentContextMismatch,
   assessTerafabxReplyRelationship,
   buildTerafabxFixedImageReplyRecord,
+  buildTerafabxGrokPreparedReply,
   buildTerafabxOwnPostReplyTarget,
   classifyTerafabxOwnPostReplies,
   isTerafabxAdComment,
@@ -17,6 +20,25 @@ const {
   shouldUseTerafabxQuickIntent,
   terafabxBrowserConcurrency,
   terafabxGrokIndividualRequestCount,
+  terafabxCommentPrefillCandidateLimit,
+  terafabxCommentDiscoveryScanPlan,
+  normalizeTerafabxCommentTargetBacklog,
+  normalizeFxTwitterFollowingAccounts,
+  normalizeFxTwitterFollowingCandidates,
+  terafabxFxTwitterFollowingPlan,
+  terafabxFxTwitterAccountBatch,
+  terafabxFxTwitterRetryAt,
+  syncTerafabxFxTwitterFollowing,
+  collectTerafabxFxTwitterFollowingCandidates,
+  terafabxCommentDiscoveryStatus,
+  terafabxXHomeBackoffUntil,
+  isTerafabxXHomeBackoffActive,
+  terafabxAutoCommentBrowserResources,
+  terafabxAutoCommentDiscoveryOptions,
+  terafabxChromeLaunchArgs,
+  terafabxAutoCommentQuickPostOptions,
+  terafabxCommentPrefillPlan,
+  shouldRunTerafabxContinuousCommentPrefill,
   terafabxGrokIndividualBackoffUntil,
   terafabxCommentPrefillWorkerResources,
   knownTerafabxGrokWebSessions,
@@ -47,6 +69,7 @@ const {
   isTerafabxTransientReplyPageError,
   shouldRetryTerafabxHeadlessReply,
   isTerafabxPendingCommentEligible,
+  quarantineExhaustedTerafabxPendingComments,
   recoverRecentTransientPrefillFailures,
   terafabxPendingCommentFailureDisposition,
   withTerafabxBrowserSetupCleanup,
@@ -54,10 +77,14 @@ const {
   terafabxGeminiPriorityValue,
 } = require("../mirror_server");
 
-test("X home readiness rejects blank and error pages", () => {
+test("X home readiness accepts usable articles even when an error banner is present", () => {
   assert.equal(xPageReadyState({ bodyText: "", articleCount: 0 }, "home").ready, false);
-  assert.equal(xPageReadyState({ bodyText: "Something went wrong", articleCount: 2 }, "home").ready, false);
+  assert.equal(xPageReadyState({ bodyText: "Something went wrong", articleCount: 0 }, "home").ready, false);
+  assert.equal(xPageReadyState({ bodyText: "다시 시도\n정상 게시글", articleCount: 5 }, "home").ready, true);
   assert.equal(xPageReadyState({ bodyText: "홈 타임라인", articleCount: 1 }, "home").ready, true);
+  const limited = xPageReadyState({ bodyText: "", articleCount: 0, rateLimited: true }, "home");
+  assert.equal(limited.ready, false);
+  assert.equal(limited.rateLimited, true);
 });
 
 test("X schedule readiness distinguishes loaded empty state from a blank shell", () => {
@@ -267,15 +294,39 @@ test("own-post reply target carries the parent post context into every review st
   }
 });
 
-test("Grok context prompt does not ask Grok to generate a reply", () => {
+test("Grok context prompt requests context and one reply draft in the same call", () => {
   const prompt = terafabxGrokContextPrompt({
     url: "https://x.com/example/status/1",
     targetText: "주말 출근자들을 응원합니다",
   });
   assert.match(prompt, /X 게시물 1건/);
   assert.match(prompt, /여러 게시물을 묶지 마라/);
-  assert.match(prompt, /공개 답글 후보는 절대 작성하지 마라/);
-  assert.match(prompt, /reply, comment, final_reply 같은 댓글 필드는 출력하지 마라/);
+  assert.match(prompt, /같은 응답에서 공개 답글 초안 1개/);
+  assert.match(prompt, /추가 호출을 요구하지 마라/);
+  assert.match(prompt, /"reply":"댓글 초안"/);
+});
+
+test("Grok context draft becomes the candidate that Gemini reviews", () => {
+  const result = buildTerafabxGrokPreparedReply({
+    ok: true,
+    target: {
+      url: "https://x.com/example/status/1",
+      targetId: "1",
+      targetText: "피자 상자를 접어서 남은 조각 크기에 맞추는 영상",
+    },
+    grokContext: {
+      reply: "남은 조각에 맞춰 상자가 작아지는 게 재밌네요",
+      contextSummary: "남은 피자 조각에 맞게 상자를 접어 부피를 줄이는 영상이다.",
+      keyPoints: ["피자 상자 접기", "남은 조각 보관"],
+      rawPreview: "grok-json",
+      provider: "web-context-batch",
+    },
+  }, { source: "prefill" });
+  assert.equal(result.ok, true);
+  assert.equal(result.prepared.comment, "남은 조각에 맞춰 상자가 작아지는 게 재밌네요");
+  assert.equal(result.prepared.grokComment, result.prepared.comment);
+  assert.match(result.prepared.generator, /grok-draft/);
+  assert.equal(result.prepared.geminiReview.decision, "pending_gemini_review");
 });
 
 test("own-post reply generation fails closed without parent post text", () => {
@@ -429,6 +480,13 @@ test("one invalid Gemini batch reply is isolated without rejecting valid sibling
   assert.match(rows[1].reason, /금지\/저품질 표현/);
 });
 
+test("Gemini batch JSON repairs unescaped quotation marks inside string values", () => {
+  const judged = parseTerafabxGeminiBatchFinalJudge('[{"index":0,"context":40,"naturalness":25,"specificity":15,"concision":10,"non_ai_style":10,"fatal_error":false,"language_error":false,"awkward_korean":false,"translation_tone":false,"cliche":false,"context_error":false,"unsupported_claim":false,"cross_post_reusable":false,"headline_tone":false,"specificity_error":false,"source_anchor":"인수 제안 "불충분" 판단","reason":"문맥에 맞음"}]', [{ finalReply: "인수 제안이 부족하다고 본 모양이네요", target: { targetText: '인수 제안 "불충분" 판단' } }]);
+
+  assert.equal(judged[0].sourceAnchor, '인수 제안 "불충분" 판단');
+  assert.equal(judged[0].passed, true);
+});
+
 test("reply permalink targeting matches only the exact status article", () => {
   const targetId = "2075755636374261849";
 
@@ -511,22 +569,69 @@ test("X account verification trusts only authenticated account UI", () => {
   assert.equal(isVerifiedXAccountState({ profileHref: "https://x.com/someone-else" }, "terafabXai"), false);
 });
 
-test("an uncertain reply submission is quarantined instead of retried", () => {
+test("an uncertain reply submission stays preserved pending verification", () => {
   const error = new Error("reply verification timed out after submit");
   error.code = "TERAFABX_REPLY_SUBMISSION_UNCERTAIN";
   assert.equal(isTerafabxReplySubmissionUncertain(error), true);
-  assert.deepEqual(terafabxPendingCommentFailureDisposition({ attempts: 0 }, error, 3), {
-    attempts: 1,
-    submissionUncertain: true,
-    removeFromPending: true,
-    failedReason: "submission_uncertain",
-  });
-  assert.deepEqual(terafabxPendingCommentFailureDisposition({ attempts: 0 }, new Error("browser did not open"), 3), {
+  const result = terafabxPendingCommentFailureDisposition({ attempts: 0 }, error, 3);
+  assert.equal(result.attempts, 1);
+  assert.equal(result.submissionUncertain, true);
+  assert.equal(result.removeFromPending, false);
+  assert.equal(result.failedReason, null);
+  assert.equal(result.verificationRequired, true);
+  const ordinaryFailure = terafabxPendingCommentFailureDisposition({ attempts: 0 }, new Error("browser did not open"), 3);
+  assert.deepEqual(ordinaryFailure, {
     attempts: 1,
     submissionUncertain: false,
     removeFromPending: false,
     failedReason: null,
+    nextAttemptAt: ordinaryFailure.nextAttemptAt,
   });
+});
+
+test("technical retry exhaustion keeps a quality-approved draft pending with cooldown", () => {
+  const result = terafabxPendingCommentFailureDisposition(
+    { attempts: 2, geminiReview: { finalJudge: { passed: true } } },
+    new Error("browser did not open"),
+    3,
+  );
+
+  assert.equal(result.attempts, 3);
+  assert.equal(result.removeFromPending, false);
+  assert.equal(result.failedReason, null);
+  assert.ok(Date.parse(result.nextAttemptAt) > Date.now());
+});
+
+test("retry count cleanup preserves quality-approved pending drafts", () => {
+  const draft = {
+    source: "prefill",
+    targetUrl: "https://x.com/example/status/123",
+    targetText: "강아지가 장난감을 꼭 안고 잠든 장면",
+    comment: "장난감을 꼭 안고 잠든 모습이 귀엽네요",
+    queuedAt: "2026-07-12T00:00:00.000Z",
+    attempts: 99,
+    grokContext: {
+      contextSummary: "강아지가 좋아하는 장난감을 꼭 안은 채 편안하게 잠든 영상이다.",
+      keyPoints: ["강아지", "장난감", "잠든 모습"],
+      rawPreview: '{"context_summary":"강아지가 장난감을 안고 잠든 영상"}',
+      provider: "web-context",
+    },
+    geminiReview: {
+      finalJudge: {
+        score: 100,
+        passed: true,
+        fatalError: false,
+        dimensions: { context: 40 },
+      },
+    },
+  };
+  const state = { pendingCommentPosts: [draft], commentHistory: [], failedPendingCommentPosts: [] };
+
+  const result = quarantineExhaustedTerafabxPendingComments(state);
+
+  assert.equal(result.count, 0);
+  assert.equal(result.remainingCount, 1);
+  assert.equal(state.pendingCommentPosts[0], draft);
 });
 
 test("a blank X reply page is retried with a cooldown instead of being exhausted rapidly", () => {
@@ -554,6 +659,7 @@ test("headless reply retries one pre-submit transient browser failure only", () 
 
 test("a pending comment remains ineligible until its retry cooldown expires", () => {
   const nowMs = Date.parse("2026-07-13T15:00:00.000Z");
+  assert.equal(isTerafabxPendingCommentEligible({ verificationRequired: true }, nowMs), false);
   assert.equal(isTerafabxPendingCommentEligible({ nextAttemptAt: "2026-07-13T15:10:00.000Z" }, nowMs), false);
   assert.equal(isTerafabxPendingCommentEligible({ nextAttemptAt: "2026-07-13T14:59:59.000Z" }, nowMs), true);
   assert.equal(isTerafabxPendingCommentEligible({}, nowMs), true);
@@ -649,11 +755,379 @@ test("browser-heavy TerafabX workers keep five-way concurrency", () => {
   assert.equal(terafabxBrowserConcurrency(1, 10), 1);
 });
 
+test("auto comments keep a twenty-item ready buffer with five parallel producers", () => {
+  assert.equal(typeof terafabxCommentPrefillPlan, "function");
+  assert.deepEqual(terafabxCommentPrefillPlan({ pendingCount: 0, dailyRemaining: 500 }), {
+    target: 20,
+    missing: 5,
+    workerCount: 5,
+  });
+  assert.deepEqual(terafabxCommentPrefillPlan({ pendingCount: 18, dailyRemaining: 500 }), {
+    target: 20,
+    missing: 2,
+    workerCount: 2,
+  });
+  assert.deepEqual(terafabxCommentPrefillPlan({ pendingCount: 20, dailyRemaining: 500 }), {
+    target: 20,
+    missing: 0,
+    workerCount: 0,
+  });
+});
+
+test("comment discovery deep-scrolls once and persists a deduplicated reservoir", () => {
+  assert.deepEqual(terafabxCommentDiscoveryScanPlan(), {
+    maxScrolls: 60,
+    stagnantLimit: 6,
+    maxCandidates: 200,
+    backlogLimit: 300,
+  });
+  assert.deepEqual(normalizeTerafabxCommentTargetBacklog([
+    { url: "https://x.com/a/status/1", text: "first" },
+    { url: "https://x.com/a/status/1", text: "duplicate" },
+    { url: "https://x.com/b/status/2", text: "second" },
+    { url: "not-an-x-status", text: "invalid" },
+  ], { excludedUrls: ["https://x.com/b/status/2"] }), [
+    { url: "https://x.com/a/status/1", text: "first" },
+  ]);
+});
+
+test("FxTwitter following discovery normalizes accounts and recent root posts", () => {
+  assert.deepEqual(normalizeFxTwitterFollowingAccounts([
+    { id: "1", screen_name: "Alice", name: "Alice", protected: false },
+    { id: "1", screen_name: "alice", name: "duplicate", protected: false },
+    { id: "2", screen_name: "private_user", name: "Private", protected: true },
+    { id: "3", screen_name: "terafabXai", name: "Self", protected: false },
+    { id: "4", screen_name: "", name: "Invalid", protected: false },
+  ]), [
+    { id: "1", handle: "Alice", name: "Alice", protected: false },
+  ]);
+
+  const now = Date.parse("2026-07-19T15:00:00.000Z");
+  assert.deepEqual(normalizeFxTwitterFollowingCandidates([
+    {
+      id: "11",
+      url: "https://x.com/Alice/status/11",
+      text: "recent root",
+      created_timestamp: Math.floor(Date.parse("2026-07-19T14:00:00.000Z") / 1000),
+      author: { screen_name: "Alice" },
+      replying_to: null,
+    },
+    {
+      id: "12",
+      url: "https://x.com/Alice/status/12",
+      text: "old",
+      created_timestamp: Math.floor(Date.parse("2026-07-18T14:59:59.999Z") / 1000),
+      author: { screen_name: "Alice" },
+      replying_to: null,
+    },
+    {
+      id: "13",
+      url: "https://x.com/Alice/status/13",
+      text: "reply",
+      created_timestamp: Math.floor(Date.parse("2026-07-19T14:00:00.000Z") / 1000),
+      author: { screen_name: "Alice" },
+      replying_to: { screen_name: "someone", status: "9" },
+    },
+  ], { handle: "Alice", now }), [
+    {
+      url: "https://x.com/Alice/status/11",
+      text: "recent root",
+      discoveredAt: "2026-07-19T15:00:00.000Z",
+      source: "fxtwitter-following-statuses",
+    },
+  ]);
+});
+
+test("FxTwitter following plan uses a 24-hour window, six-hour cache, and capped retry", () => {
+  const now = Date.parse("2026-07-19T15:00:00.000Z");
+  assert.deepEqual(terafabxFxTwitterFollowingPlan({
+    now,
+    lastFollowingSyncAt: "2026-07-19T08:59:59.999Z",
+    accountCount: 68,
+    concurrency: 50,
+  }), {
+    cutoffAt: "2026-07-18T15:00:00.000Z",
+    cutoffSeconds: Math.floor(Date.parse("2026-07-18T15:00:00.000Z") / 1000),
+    refreshFollowing: true,
+    accountCount: 68,
+    concurrency: 5,
+  });
+  assert.equal(terafabxFxTwitterRetryAt(1, now), "2026-07-19T15:05:00.000Z");
+  assert.equal(terafabxFxTwitterRetryAt(99, now), "2026-07-19T21:00:00.000Z");
+});
+
+test("FxTwitter following timelines are consumed in bounded rotating batches", () => {
+  const accounts = ["Alice", "Bob", "Carol"].map((handle, index) => ({ id: String(index + 1), handle }));
+  assert.deepEqual(terafabxFxTwitterAccountBatch(accounts, { cursor: 0, batchSize: 2 }), {
+    accounts: [accounts[0], accounts[1]],
+    cursor: 0,
+    nextCursor: 2,
+    totalCount: 3,
+  });
+  assert.deepEqual(terafabxFxTwitterAccountBatch(accounts, { cursor: 2, batchSize: 2 }), {
+    accounts: [accounts[2], accounts[0]],
+    cursor: 2,
+    nextCursor: 1,
+    totalCount: 3,
+  });
+});
+
+test("FxTwitter following sync paginates once per unique cursor and keeps cached data on failure", async () => {
+  const now = Date.parse("2026-07-19T15:00:00.000Z");
+  const cursors = [];
+  const result = await syncTerafabxFxTwitterFollowing({
+    state: { fxTwitterFollowingAccounts: [] },
+    now,
+    persist: false,
+    fetchPage: async ({ cursor }) => {
+      cursors.push(cursor || null);
+      return cursor
+        ? { results: [{ id: "2", screen_name: "Bob", name: "Bob" }], cursor: { bottom: "next" } }
+        : { results: [{ id: "1", screen_name: "Alice", name: "Alice" }], cursor: { bottom: "next" } };
+    },
+  });
+  assert.deepEqual(cursors, [null, "next"]);
+  assert.deepEqual(result.accounts.map((item) => item.handle), ["Alice", "Bob"]);
+  assert.equal(result.status, "ok");
+
+  const cached = await syncTerafabxFxTwitterFollowing({
+    state: {
+      fxTwitterFollowingAccounts: [{ id: "1", handle: "Alice", name: "Alice", protected: false }],
+      fxTwitterFollowingLastSyncAt: "2026-07-19T08:00:00.000Z",
+    },
+    now,
+    persist: false,
+    fetchPage: async () => { throw new Error("FxTwitter unavailable"); },
+  });
+  assert.equal(cached.status, "degraded");
+  assert.equal(cached.accounts[0].handle, "Alice");
+  assert.match(cached.error, /FxTwitter unavailable/);
+});
+
+test("FxTwitter following sync stops when a new cursor contains no new accounts", async () => {
+  let page = 0;
+  const result = await syncTerafabxFxTwitterFollowing({
+    state: { fxTwitterFollowingAccounts: [] },
+    now: Date.parse("2026-07-19T15:00:00.000Z"),
+    persist: false,
+    fetchPage: async () => {
+      page += 1;
+      return {
+        results: [{ id: "1", screen_name: "Alice", name: "Alice" }],
+        cursor: { bottom: `changing-cursor-${page}` },
+      };
+    },
+  });
+  assert.equal(page, 2);
+  assert.deepEqual(result.accounts.map((item) => item.handle), ["Alice"]);
+});
+
+test("FxTwitter timeline partial failure preserves successful recent candidates", async () => {
+  const now = Date.parse("2026-07-19T15:00:00.000Z");
+  const result = await collectTerafabxFxTwitterFollowingCandidates({
+    state: {
+      fxTwitterFollowingAccounts: [
+        { id: "1", handle: "Alice", name: "Alice", protected: false },
+        { id: "2", handle: "Bob", name: "Bob", protected: false },
+      ],
+      fxTwitterFollowingLastSyncAt: "2026-07-19T14:00:00.000Z",
+      fxTwitterFollowingSyncByHandle: {},
+    },
+    now,
+    persist: false,
+    fetchStatuses: async ({ handle }) => {
+      if (handle === "Bob") throw new Error("Bob timeline failed");
+      return {
+        results: [{
+          id: "11",
+          url: "https://x.com/Alice/status/11",
+          text: "recent root",
+          created_timestamp: Math.floor(Date.parse("2026-07-19T14:00:00.000Z") / 1000),
+          author: { screen_name: "Alice" },
+          replying_to: null,
+        }],
+      };
+    },
+  });
+  assert.equal(result.status, "degraded");
+  assert.equal(result.attemptedCount, 2);
+  assert.equal(result.succeededCount, 1);
+  assert.equal(result.failedCount, 1);
+  assert.equal(result.candidates.length, 1);
+  assert.equal(result.candidates[0].url, "https://x.com/Alice/status/11");
+  assert.match(result.syncByHandle.Bob.lastError, /Bob timeline failed/);
+  assert.equal(result.syncByHandle.Bob.retryAt, "2026-07-19T15:05:00.000Z");
+});
+
+test("FxTwitter timeline collection attempts only the current rotating batch", async () => {
+  const now = Date.parse("2026-07-19T15:00:00.000Z");
+  const accounts = Array.from({ length: 105 }, (_, index) => ({
+    id: String(index + 1),
+    handle: `user${index + 1}`,
+    name: `User ${index + 1}`,
+    protected: false,
+  }));
+  const attempted = [];
+  const result = await collectTerafabxFxTwitterFollowingCandidates({
+    state: {
+      fxTwitterFollowingAccounts: accounts,
+      fxTwitterFollowingLastSyncAt: "2026-07-19T14:00:00.000Z",
+      fxTwitterFollowingSyncByHandle: {},
+      fxTwitterFollowingAccountCursor: 100,
+    },
+    now,
+    persist: false,
+    fetchStatuses: async ({ handle }) => {
+      attempted.push(handle);
+      return { results: [] };
+    },
+  });
+  assert.equal(result.attemptedCount, 100);
+  assert.deepEqual(attempted.slice(0, 5), ["user101", "user102", "user103", "user104", "user105"]);
+  assert.equal(result.statePatch.fxTwitterFollowingAccountCursor, 95);
+});
+
+test("comment discovery status reports FxTwitter cache and cycle diagnostics", () => {
+  const status = terafabxCommentDiscoveryStatus({
+    fxTwitterFollowingAccounts: [{ id: "1", handle: "Alice", name: "Alice", protected: false }],
+    fxTwitterFollowingLastSyncAt: "2026-07-19T14:00:00.000Z",
+    fxTwitterFollowingNextSyncAt: "2026-07-19T20:00:00.000Z",
+    fxTwitterFollowingSyncByHandle: { Alice: { retryAt: "2026-07-19T16:00:00.000Z" } },
+    fxTwitterCommentDiscoveryLastRunAt: "2026-07-19T15:00:00.000Z",
+    fxTwitterCommentDiscoveryStatus: "degraded",
+    fxTwitterCommentDiscoveryError: "one failed",
+    fxTwitterCommentDiscoveryAttempted: 10,
+    fxTwitterCommentDiscoverySucceeded: 9,
+    fxTwitterCommentDiscoveryFailed: 1,
+    fxTwitterCommentDiscoveryBackedOff: 1,
+    fxTwitterCommentDiscoveryCandidates: 40,
+    commentTargetBacklog: [{ url: "https://x.com/Alice/status/11", text: "candidate" }],
+    lastManualXHomeScanAt: null,
+  }, Date.parse("2026-07-19T15:30:00.000Z"));
+  assert.deepEqual(status, {
+    mode: "fxtwitter-following",
+    windowHours: 24,
+    followingCount: 1,
+    accountCursor: 0,
+    batchSize: 100,
+    lastFollowingSyncAt: "2026-07-19T14:00:00.000Z",
+    nextFollowingSyncAt: "2026-07-19T20:00:00.000Z",
+    lastRunAt: "2026-07-19T15:00:00.000Z",
+    lastStatus: "degraded",
+    lastError: "one failed",
+    attemptedCount: 10,
+    succeededCount: 9,
+    failedCount: 1,
+    backedOffCount: 1,
+    candidateCount: 40,
+    targetBacklogCount: 1,
+    lastManualXHomeScanAt: null,
+    lastManualXHomeScanStatus: null,
+    lastManualXHomeScanError: null,
+    xHomeBackoffActive: false,
+    xHomeRetryAt: null,
+  });
+});
+
+test("automation route exposes X home scan as a run-only diagnostic job", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "mirror_server.js"), "utf8");
+  const route = source.slice(
+    source.indexOf('if (req.method === "POST" && req.url === "/api/terafabx/automation")'),
+    source.indexOf('if (req.method === "POST" && req.url === "/api/terafabx/affiliate-comment")'),
+  );
+  assert.match(route, /"x-home-scan"/);
+  assert.match(route, /runTerafabxManualXHomeScan/);
+  assert.match(route, /x-home-scan은 수동 run만 지원합니다/);
+});
+
+test("X home HTTP 429 creates a thirty-minute discovery backoff", () => {
+  const now = Date.parse("2026-07-19T13:40:00.000Z");
+  const retryAt = terafabxXHomeBackoffUntil("X home 사용량 제한 HTTP 429 code 1003", now);
+  assert.equal(retryAt, "2026-07-19T14:10:00.000Z");
+  assert.equal(isTerafabxXHomeBackoffActive({ lastCommentDiscoveryRetryAt: retryAt }, now), true);
+  assert.equal(isTerafabxXHomeBackoffActive({ lastCommentDiscoveryRetryAt: retryAt }, Date.parse(retryAt) + 1), false);
+  assert.equal(terafabxXHomeBackoffUntil("ordinary failure", now), null);
+});
+
+test("auto comment discovery uses disposable tabs on the shared 9224 browser", () => {
+  assert.equal(typeof terafabxAutoCommentBrowserResources, "function");
+  const resources = terafabxAutoCommentBrowserResources();
+  assert.deepEqual(Object.keys(resources).sort(), ["legacy", "writer"]);
+  assert.deepEqual(terafabxAutoCommentDiscoveryOptions(), {
+    port: 9224,
+    lock: "global-9224",
+    disposableTab: true,
+  });
+  assert.equal(resources.writer.port, 9238);
+});
+
+test("automatic comment discovery uses FxTwitter and never opens X home", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "mirror_server.js"), "utf8");
+  const block = source.slice(
+    source.indexOf("async function discoverTerafabxCommentTargetsUnlocked"),
+    source.indexOf("async function discoverTerafabxCommentTargets("),
+  );
+  assert.match(block, /collectTerafabxFxTwitterFollowingCandidates/);
+  assert.match(block, /commentTargetBacklog/);
+  assert.doesNotMatch(block, /x\.com\/home/);
+  assert.doesNotMatch(block, /newIsolatedPageForPort/);
+  assert.doesNotMatch(block, /waitForXPageReady/);
+});
+
+test("manual X home scan is isolated behind the 9224 disposable diagnostic path", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "mirror_server.js"), "utf8");
+  const block = source.slice(
+    source.indexOf("async function runTerafabxManualXHomeScan"),
+    source.indexOf("async function discoverTerafabxCommentTargetsUnlocked"),
+  );
+  assert.match(block, /withTerafabxLock\(/);
+  assert.match(block, /newIsolatedPageForPort\(CHROME_PORT/);
+  assert.match(block, /verifyXAccount\(page\)/);
+  assert.match(block, /page\.navigate\("https:\/\/x\.com\/home"/);
+  assert.match(block, /finally/);
+  assert.match(block, /await page\.close\(\)/);
+});
+
+test("TerafabX Chrome launches use the installed browser's native user agent", () => {
+  assert.equal(typeof terafabxChromeLaunchArgs, "function");
+  for (const headless of [true, false]) {
+    const args = terafabxChromeLaunchArgs({ port: 9299, profileDir: "/tmp/terafabx-native-ua", headless });
+    assert.equal(args.some((arg) => arg.startsWith("--user-agent=")), false);
+  }
+});
+
+test("automatic pending comments always use the persistent quick writer path", () => {
+  assert.equal(typeof terafabxAutoCommentQuickPostOptions, "function");
+  assert.deepEqual(terafabxAutoCommentQuickPostOptions(), {
+    headless: true,
+    quick: true,
+    autoCommentWriter: true,
+    cleanupHeadless: false,
+    lockAction: "auto-comment-writer",
+  });
+});
+
+test("continuous prefill runs independently while the writer is consuming", () => {
+  assert.equal(typeof shouldRunTerafabxContinuousCommentPrefill, "function");
+  assert.equal(shouldRunTerafabxContinuousCommentPrefill({ enabled: true, pendingCount: 4, targetCount: 20, prefillBusy: false, writerBusy: true }), true);
+  assert.equal(shouldRunTerafabxContinuousCommentPrefill({ enabled: true, pendingCount: 20, targetCount: 20, prefillBusy: false, writerBusy: true }), false);
+  assert.equal(shouldRunTerafabxContinuousCommentPrefill({ enabled: true, pendingCount: 4, targetCount: 20, prefillBusy: true, writerBusy: false }), false);
+  assert.equal(shouldRunTerafabxContinuousCommentPrefill({ enabled: true, pendingCount: 4, targetCount: 20, prefillBusy: false, xHomeBackoffActive: true }), true);
+  assert.equal(shouldRunTerafabxContinuousCommentPrefill({ enabled: false, pendingCount: 0, targetCount: 20, prefillBusy: false, writerBusy: false }), false);
+});
+
 test("Grok prefill selects exactly one context request at a time", () => {
   assert.equal(terafabxGrokIndividualRequestCount(180), 1);
   assert.equal(terafabxGrokIndividualRequestCount(1), 1);
   assert.equal(terafabxGrokIndividualRequestCount(0), 0);
   assert.equal(terafabxGrokIndividualBackoffUntil(Date.parse("2026-07-14T00:00:00.000Z")), "2026-07-14T00:10:00.000Z");
+});
+
+test("comment prefill keeps fallback candidates for safety rejections", () => {
+  assert.equal(terafabxCommentPrefillCandidateLimit(1), 5);
+  assert.equal(terafabxCommentPrefillCandidateLimit(5), 9);
+  assert.equal(terafabxCommentPrefillCandidateLimit(20), 12);
+  assert.equal(terafabxCommentPrefillCandidateLimit(0), 0);
 });
 
 test("five comment prefill workers use distinct Grok sessions, Gemini ports, and profiles", () => {
