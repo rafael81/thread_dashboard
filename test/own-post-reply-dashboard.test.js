@@ -1,4 +1,6 @@
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 const test = require("node:test");
 
 test("dashboard normalizes only @terafabXai status URLs", async () => {
@@ -20,6 +22,7 @@ test("dashboard batch payload keeps verified reply operating limits", async () =
     limit: 200,
     delayMinMs: 10_000,
     delayMaxMs: 20_000,
+    ignoreRootCap: true,
   });
   assert.throws(() => buildOwnPostReplyPayload("batch", "https://x.com/other/status/123"), /@terafabXai/);
 });
@@ -65,4 +68,37 @@ test("dashboard shows a queued batch so the user never needs to press twice", as
   assert.equal(state.queueActive, true);
   assert.equal(state.queueStageLabel, "대기 중");
   assert.equal(state.pendingManualCount, 1);
+});
+
+test("posted table renders reply completion with direct-scan provenance", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "dashboard", "src", "components", "data-table.tsx"), "utf8");
+  assert.match(source, /header: "대댓글 완료율"/);
+  assert.match(source, /예약 갱신 · 전체 댓글 기준/);
+  assert.match(source, /직접 전체수집 기준/);
+  assert.match(source, /X 전체 답글 수 기준/);
+  assert.match(source, /completion\.completedCount/);
+});
+
+test("posted table keeps its page during refresh and exposes the real X post link", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "dashboard", "src", "components", "data-table.tsx"), "utf8");
+  assert.match(source, /autoResetPageIndex: false/);
+  assert.match(source, /setPagination\(\(current\) => \(\{ \.\.\.current, pageIndex: 0 \}\)\)/);
+  assert.match(source, /href=\{row\.original\.xPostUrl\}/);
+  assert.match(source, />\s*X 게시글\s*</);
+  assert.match(source, />\s*Threads 원문\s*</);
+});
+
+test("automation dashboard exposes a dedicated cancellable own-post comment-heart control", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "dashboard", "src", "main.jsx"), "utf8");
+  assert.match(source, /<CardTitle>내 글 댓글 자동하트<\/CardTitle>/);
+  assert.match(source, /자동하트 OFF·즉시 중단/);
+  assert.match(source, /\/api\/terafabx\/own-post-heart/);
+  assert.match(source, /onOwnPostHeartAction/);
+});
+
+test("legacy today-post reply controls and endpoint are removed", () => {
+  const dashboard = fs.readFileSync(path.join(__dirname, "..", "dashboard", "src", "main.jsx"), "utf8");
+  const server = fs.readFileSync(path.join(__dirname, "..", "mirror_server.js"), "utf8");
+  assert.doesNotMatch(dashboard, /오늘 게시글 대댓글 순회|today-post-reply|todayPostReply/);
+  assert.doesNotMatch(server, /\/api\/terafabx\/today-post-reply|terafabxTodayPostReplyBusy|maybeRunTerafabxTodayPostReplyAutomation/);
 });

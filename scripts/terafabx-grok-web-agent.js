@@ -13,9 +13,51 @@ const INITIAL_BATCH_POLL_CHUNK_SIZE = 4;
 const BATCH_POLL_CHUNK_SIZE = 4;
 const DEBUG = process.env.TERAFABX_GROK_WEB_DEBUG === "true";
 const DEFAULT_SYSTEM_CHROME_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+const DEFAULT_OWNED_PROFILE_ROOT = process.env.TERAFABX_GROK_BROWSER_PROFILE_ROOT
+  || path.join(process.cwd(), ".data", "agent-browser", "grok-profiles");
+const DEFAULT_OWNED_RUNTIME_ROOT = process.env.TERAFABX_GROK_BROWSER_RUNTIME_ROOT
+  || path.join(process.cwd(), ".data", "agent-browser", "grok-runtime");
+const activeAgentBrowserChildren = new Set();
+let activeSession = null;
+let signalShutdownStarted = false;
 
 function agentBrowserNamespace(session) {
   return `tg-${crypto.createHash("sha1").update(String(session || DEFAULT_SESSION)).digest("hex").slice(0, 12)}`;
+}
+
+function agentBrowserProfileDir(session, options = {}) {
+  const profileRoot = path.resolve(options.profileRoot || DEFAULT_OWNED_PROFILE_ROOT);
+  return path.join(profileRoot, agentBrowserNamespace(session));
+}
+
+function agentBrowserOwnedRuntimeDir(session, options = {}) {
+  const runtimeRoot = path.resolve(options.runtimeRoot || DEFAULT_OWNED_RUNTIME_ROOT);
+  return path.join(runtimeRoot, agentBrowserNamespace(session));
+}
+
+function isOwnedGrokProfileDir(profileDir) {
+  return /^tg-[0-9a-f]{12}$/.test(path.basename(path.resolve(String(profileDir || ""))));
+}
+
+function ownedGrokBrowserPidsFromPs(raw, ownedDir, currentPid = process.pid, options = {}) {
+  const exactOwnedDir = path.resolve(String(ownedDir || ""));
+  if (!isOwnedGrokProfileDir(exactOwnedDir)) return [];
+  const allowDescendants = options.allowDescendants === true;
+  const ownedPrefix = `${exactOwnedDir}${path.sep}`;
+  return Array.from(new Set(String(raw || "").split(/\r?\n/).flatMap((line) => {
+    const match = line.trim().match(/^(\d+)\s+(\d+)\s+([\s\S]+)$/);
+    if (!match) return [];
+    const pid = Number(match[1]);
+    const command = match[3];
+    if (pid <= 1 || pid === currentPid) return [];
+    if (!/Google Chrome(?: Helper)?/.test(command)) return [];
+    const userDataDir = (command.match(/--user-data-dir=([^\s]+(?:\s(?!-{1,2})[^\s]+)*)/) || [])[1] || "";
+    const resolvedUserDataDir = path.resolve(userDataDir);
+    const owned = resolvedUserDataDir === exactOwnedDir
+      || (allowDescendants && resolvedUserDataDir.startsWith(ownedPrefix));
+    if (!owned) return [];
+    return [pid];
+  }))).sort((left, right) => right - left);
 }
 
 function parseArgs(argv) {
@@ -37,6 +79,8 @@ function agentBrowserInvocation(args, options = {}) {
   const prefix = path.basename(String(bin)) === "npx" ? ["--yes", "agent-browser"] : [];
   const session = options.session || DEFAULT_SESSION;
   const namespace = agentBrowserNamespace(session);
+  const profileDir = agentBrowserProfileDir(session, options);
+  const runtimeDir = agentBrowserOwnedRuntimeDir(session, options);
   const state = options.state || "";
   const headed = options.headed === true || options.headed === "true";
   const executablePath = options.executablePath
@@ -45,11 +89,19 @@ function agentBrowserInvocation(args, options = {}) {
     || (fs.existsSync(DEFAULT_SYSTEM_CHROME_PATH) ? DEFAULT_SYSTEM_CHROME_PATH : "");
   return {
     bin,
+    namespace,
+    profileDir,
+    runtimeDir,
     args: [
       ...prefix,
       "--namespace", namespace,
       "--session", namespace,
       "--headed", headed ? "true" : "false",
+      // agent-browser rejects storage_state together with a persistent
+      // profile. Grok needs the saved login state, so state-backed runs use
+      // the namespace-owned ephemeral browser; profile-only runs retain the
+      // deterministic project-owned directory for cleanup.
+      ...(!state && !options.resume ? ["--profile", profileDir] : []),
       "--args", "--lang=ko-KR,--window-size=1440,900",
       ...(executablePath ? ["--executable-path", executablePath] : []),
       ...(state ? ["--state", state] : []),
@@ -64,8 +116,13 @@ function randomHumanDelayMs(random, minMs, maxMs) {
 }
 
 function runAgentBrowser(args, options = {}) {
-  const { bin, args: finalArgs } = agentBrowserInvocation(args, options);
+  const {
+    bin,
+    args: finalArgs,
+    runtimeDir,
+  } = agentBrowserInvocation(args, options);
   const timeout = Number(options.timeoutMs || options.timeout || 120000);
+  fs.mkdirSync(runtimeDir, { recursive: true });
   if (DEBUG) {
     const safeArgs = finalArgs.map((arg, index) => {
       if (finalArgs[index - 1] === "inserttext") return `<text:${String(arg).length}>`;
@@ -75,15 +132,26 @@ function runAgentBrowser(args, options = {}) {
     process.stderr.write(`[agent-browser] ${bin} ${safeArgs.join(" ")}\n`);
   }
   return new Promise((resolve, reject) => {
-    execFile(bin, finalArgs, {
+    const child = execFile(bin, finalArgs, {
       cwd: options.cwd || process.cwd(),
+      detached: true,
       env: {
         ...process.env,
+        // A state-backed agent-browser cannot use --profile. Constrain its
+        // otherwise random agent-browser-chrome-* directory to a project-owned
+        // namespace so it remains discoverable after daemon/parent crashes.
+        TMPDIR: runtimeDir,
+        TMP: runtimeDir,
+        TEMP: runtimeDir,
         AGENT_BROWSER_DEFAULT_TIMEOUT: String(Math.max(timeout, 25000)),
       },
       timeout,
       maxBuffer: 8 * 1024 * 1024,
     }, (error, stdout = "", stderr = "") => {
+      activeAgentBrowserChildren.delete(child);
+      if (error?.killed || error?.signal) {
+        signalAgentBrowserProcessGroup(child, "SIGKILL");
+      }
       const output = `${stdout || ""}${stderr ? `\n${stderr}` : ""}`.trim();
       if (error) {
         error.message = `${error.message}${output ? `\n${output}` : ""}`;
@@ -93,24 +161,68 @@ function runAgentBrowser(args, options = {}) {
       if (DEBUG && stdout) process.stderr.write(`[agent-browser:stdout] ${String(stdout).slice(0, 500)}\n`);
       resolve(String(stdout || "").trim());
     });
+    activeAgentBrowserChildren.add(child);
   });
 }
 
-function closeAgentBrowserSession(session) {
+function signalAgentBrowserProcessGroup(child, signal = "SIGTERM") {
+  const pid = Number(child?.pid || 0);
+  if (!pid) return false;
+  try {
+    process.kill(-pid, signal);
+    return true;
+  } catch {
+    try {
+      child.kill(signal);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+function namespaceHasRuntimeArtifacts(namespace) {
+  const runtimeDir = namespaceRuntimeDir(namespace);
+  try {
+    return fs.readdirSync(runtimeDir).some((name) => (
+      name === `${namespace}.sock`
+      || name === `${namespace}.pid`
+      || name === `${namespace}.engine`
+    ));
+  } catch {
+    return false;
+  }
+}
+
+async function closeAgentBrowserSession(session) {
   const bin = process.env.AGENT_BROWSER_BIN || "npx";
   const prefix = path.basename(String(bin)) === "npx" ? ["--yes", "agent-browser"] : [];
   const namespace = agentBrowserNamespace(session);
-  return new Promise((resolve) => {
-    execFile(bin, [...prefix, "--namespace", namespace, "--session", namespace, "--headed", "false", "close"], {
-      timeout: 15000,
-      maxBuffer: 1024 * 1024,
-    }, () => resolve());
-  }).then(async () => {
+  const profileDir = agentBrowserProfileDir(session);
+  const runtimeDir = agentBrowserOwnedRuntimeDir(session);
+  fs.mkdirSync(runtimeDir, { recursive: true });
+  const requestedClose = namespaceHasRuntimeArtifacts(namespace);
+  if (requestedClose) {
+    await new Promise((resolve) => {
+      execFile(bin, [...prefix, "--namespace", namespace, "--session", namespace, "--headed", "false", "close"], {
+        timeout: 15000,
+        maxBuffer: 1024 * 1024,
+        env: {
+          ...process.env,
+          TMPDIR: runtimeDir,
+          TMP: runtimeDir,
+          TEMP: runtimeDir,
+        },
+      }, () => resolve());
+    });
     // The close command can return just before its daemon exits. Give it a
     // short grace period so forced cleanup cannot race the next runner.
-    await sleep(1500);
-    await forceCleanupAgentBrowserNamespace(namespace);
-  });
+    await sleep(500);
+  }
+  return {
+    requestedClose,
+    ...(await forceCleanupAgentBrowserNamespace(namespace, profileDir, runtimeDir)),
+  };
 }
 
 function namespaceProcessIds(raw) {
@@ -135,13 +247,40 @@ function listNamespaceProcessIds(namespace) {
   });
 }
 
-async function forceCleanupAgentBrowserNamespace(namespace) {
-  let pids = await listNamespaceProcessIds(namespace);
+function listOwnedGrokBrowserProcessIds(profileDir, runtimeDir) {
+  return new Promise((resolve) => {
+    execFile("ps", ["-axo", "pid=,ppid=,command="], {
+      timeout: 5000,
+      maxBuffer: 4 * 1024 * 1024,
+    }, (_error, stdout = "") => resolve(Array.from(new Set([
+      ...ownedGrokBrowserPidsFromPs(stdout, profileDir),
+      ...ownedGrokBrowserPidsFromPs(stdout, runtimeDir, process.pid, { allowDescendants: true }),
+    ]))));
+  });
+}
+
+async function terminateProcessIds(pids = []) {
   for (const pid of pids) {
     try { process.kill(pid, "SIGTERM"); } catch {}
   }
   if (pids.length) await sleep(500);
-  pids = await listNamespaceProcessIds(namespace);
+  return pids;
+}
+
+async function forceCleanupAgentBrowserNamespace(
+  namespace,
+  profileDir = agentBrowserProfileDir(namespace),
+  ownedRuntimeDir = agentBrowserOwnedRuntimeDir(namespace),
+) {
+  let pids = Array.from(new Set([
+    ...(await listNamespaceProcessIds(namespace)),
+    ...(await listOwnedGrokBrowserProcessIds(profileDir, ownedRuntimeDir)),
+  ]));
+  await terminateProcessIds(pids);
+  pids = Array.from(new Set([
+    ...(await listNamespaceProcessIds(namespace)),
+    ...(await listOwnedGrokBrowserProcessIds(profileDir, ownedRuntimeDir)),
+  ]));
   for (const pid of pids) {
     try { process.kill(pid, "SIGKILL"); } catch {}
   }
@@ -149,6 +288,44 @@ async function forceCleanupAgentBrowserNamespace(namespace) {
   for (const suffix of ["sock", "pid", "engine", "stream", "version"]) {
     try { fs.rmSync(path.join(runtimeDir, `${namespace}.${suffix}`), { force: true }); } catch {}
   }
+  try { fs.rmSync(profileDir, { recursive: true, force: true }); } catch {}
+  try { fs.rmSync(ownedRuntimeDir, { recursive: true, force: true }); } catch {}
+  const remainingPids = Array.from(new Set([
+    ...(await listNamespaceProcessIds(namespace)),
+    ...(await listOwnedGrokBrowserProcessIds(profileDir, ownedRuntimeDir)),
+  ]));
+  return {
+    namespace,
+    profileDir,
+    runtimeDir: ownedRuntimeDir,
+    killedPids: pids,
+    remainingPids,
+  };
+}
+
+async function cleanupOwnedGrokBrowserProfiles(
+  profileRoot = DEFAULT_OWNED_PROFILE_ROOT,
+  runtimeRoot = DEFAULT_OWNED_RUNTIME_ROOT,
+) {
+  const resolvedRoot = path.resolve(profileRoot);
+  const resolvedRuntimeRoot = path.resolve(runtimeRoot);
+  const namespaces = new Set();
+  for (const root of [resolvedRoot, resolvedRuntimeRoot]) {
+    let entries = [];
+    try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch {}
+    for (const entry of entries) {
+      if (entry.isDirectory() && /^tg-[0-9a-f]{12}$/.test(entry.name)) namespaces.add(entry.name);
+    }
+  }
+  const results = [];
+  for (const namespace of namespaces) {
+    results.push(await forceCleanupAgentBrowserNamespace(
+      namespace,
+      path.join(resolvedRoot, namespace),
+      path.join(resolvedRuntimeRoot, namespace),
+    ));
+  }
+  return results;
 }
 
 function sleep(ms) {
@@ -225,6 +402,43 @@ function normalizeGrokTitleResponse(title, responseMarker) {
     key_points: keyPoints,
     reply,
   }]);
+}
+
+function buildGrokHistoryRecoveryEvalScript(responseMarker) {
+  return `(() => {
+    const marker = ${JSON.stringify(String(responseMarker || ""))};
+    if (!marker) return JSON.stringify({ ok: false, response: '', href: '' });
+    const response = [...document.querySelectorAll('main p, main article, main [data-message-author-role="assistant"]')]
+      .map((node) => (node.innerText || node.textContent || '').trim())
+      .filter((text) => text.includes(marker) && /"context_?summary"\\s*:/.test(text) && /"reply"\\s*:/.test(text))
+      .sort((left, right) => left.length - right.length)
+      .find((text) => {
+        try {
+          const parsed = JSON.parse(text.replace(/^\x60\x60\x60(?:json)?\\s*/i, '').replace(/\\s*\x60\x60\x60$/, ''));
+          return parsed?.request_id === marker && parsed?.context_summary && parsed?.reply;
+        } catch { return false; }
+      }) || '';
+    const hrefs = [...new Set([...document.querySelectorAll('a[href*="/c/"]')]
+      .map((node) => node.href || node.getAttribute('href') || '')
+      .filter(Boolean))].slice(0, 5);
+    return JSON.stringify({ ok: Boolean(response), response, href: hrefs[0] || '', hrefs });
+  })()`;
+}
+
+async function recoverGrokResponseFromHistory(prompt, options, url) {
+  const marker = (String(prompt || '').match(/gctx-[0-9a-f-]{12,}/i) || [])[0] || '';
+  if (!marker) return '';
+  await runAgentBrowser(['open', url], { ...options, state: '', resume: true, timeoutMs: 30000 });
+  await sleep(6500);
+  let recovered = await evalJson(buildGrokHistoryRecoveryEvalScript(marker), { ...options, state: '', resume: true, timeoutMs: 15000 });
+  const hrefs = Array.isArray(recovered?.hrefs) ? recovered.hrefs : [recovered?.href].filter(Boolean);
+  for (const href of hrefs) {
+    if (recovered?.ok) break;
+    await runAgentBrowser(['open', href], { ...options, state: '', resume: true, timeoutMs: 30000 });
+    await sleep(3500);
+    recovered = await evalJson(buildGrokHistoryRecoveryEvalScript(marker), { ...options, state: '', resume: true, timeoutMs: 15000 });
+  }
+  return recovered?.ok ? String(recovered.response || '').trim() : '';
 }
 
 function buildGrokPromptEvalScript(prompt, timeoutMs) {
@@ -626,6 +840,7 @@ async function runGrokPromptBatch(prompt, options, url) {
       output = await runAgentBrowser(chunks[chunkIndex], {
         ...options,
         state: chunkIndex === 0 ? options.state : "",
+        resume: chunkIndex > 0,
         timeoutMs: Math.min(timeoutMs + 60000, 90000),
       });
     } catch (error) {
@@ -641,7 +856,13 @@ async function runGrokPromptBatch(prompt, options, url) {
       .map((line) => parseBatchEvalJson(line))
       .filter(Boolean);
     const failed = parsedResults.find((item) => item.ok === false);
-    if (failed) throw new Error(`Grok Web batch 실패(${failed.stage || "unknown"}): ${JSON.stringify(failed).slice(0, 1200)}`);
+    if (failed) {
+      if (failed.stage === 'chrome_error') {
+        const recovered = await recoverGrokResponseFromHistory(prompt, options, url).catch(() => '');
+        if (recovered) return acceptGrokResponse(recovered, prompt);
+      }
+      throw new Error(`Grok Web batch 실패(${failed.stage || "unknown"}): ${JSON.stringify(failed).slice(0, 1200)}`);
+    }
     const done = parsedResults.filter((item) => item.done && item.response).at(-1);
     if (done) return acceptGrokResponse(done.response, prompt);
     last = parsedResults.at(-1) || last;
@@ -862,12 +1083,24 @@ async function waitForGrokResponse(options, baseline = {}) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  if (args["cleanup-session"]) {
+    const session = args["cleanup-session"];
+    await closeAgentBrowserSession(session);
+    process.stdout.write(JSON.stringify({ ok: true, cleanupSession: session }));
+    return;
+  }
+  if (args["cleanup-orphans"] === "true") {
+    const results = await cleanupOwnedGrokBrowserProfiles();
+    process.stdout.write(JSON.stringify({ ok: true, cleanedProfiles: results.length, results }));
+    return;
+  }
   const promptPath = args.prompt;
   const outPath = args.out;
   if (!promptPath) throw new Error("--prompt 경로가 필요합니다.");
   if (!outPath) throw new Error("--out 경로가 필요합니다.");
   const prompt = fs.readFileSync(promptPath, "utf8");
   const session = args.session || process.env.TERAFABX_GROK_WEB_SESSION || DEFAULT_SESSION;
+  activeSession = session;
   const state = args.state || process.env.TERAFABX_GROK_WEB_STATE_PATH || "";
   const timeoutMs = Number(args.timeout || args["timeout-ms"] || DEFAULT_TIMEOUT_MS);
   const url = args.url || process.env.TERAFABX_GROK_WEB_URL || DEFAULT_GROK_URL;
@@ -890,20 +1123,76 @@ async function main() {
       outPath,
       responseLength: response.length,
     }));
+  } catch (error) {
+    const screenshotPath = args["error-screenshot"] || "";
+    if (screenshotPath) {
+      try {
+        fs.mkdirSync(path.dirname(screenshotPath), { recursive: true });
+        await runAgentBrowser(["screenshot", screenshotPath], {
+          ...options,
+          state: "",
+          resume: true,
+          timeoutMs: 15000,
+        });
+        if (fs.existsSync(screenshotPath)) error.screenshotPath = screenshotPath;
+      } catch (screenshotError) {
+        error.screenshotError = screenshotError.message;
+      }
+    }
+    if (error.screenshotPath) error.message = `${error.message}\n오류 화면: ${error.screenshotPath}`;
+    else if (error.screenshotError) error.message = `${error.message}\n오류 화면 캡처 실패: ${error.screenshotError}`;
+    throw error;
   } finally {
     await closeAgentBrowserSession(session).catch(() => {});
+    activeSession = null;
   }
 }
 
 if (require.main === module) {
-  process.once("SIGTERM", () => {
-    process.stderr.write(`[grok_runner_signal] pid=${process.pid} signal=SIGTERM\n`);
-    process.exit(143);
-  });
+  const handleSignal = (signal, exitCode) => {
+    if (signalShutdownStarted) return;
+    signalShutdownStarted = true;
+    process.stderr.write(`[grok_runner_signal] pid=${process.pid} signal=${signal}\n`);
+    for (const child of activeAgentBrowserChildren) {
+      signalAgentBrowserProcessGroup(child, "SIGTERM");
+    }
+    const forceTimer = setTimeout(() => {
+      for (const child of activeAgentBrowserChildren) {
+        signalAgentBrowserProcessGroup(child, "SIGKILL");
+      }
+    }, 3000);
+    closeAgentBrowserSession(activeSession || DEFAULT_SESSION)
+      .catch(() => {})
+      .finally(() => {
+        clearTimeout(forceTimer);
+        process.exit(exitCode);
+      });
+  };
+  process.once("SIGTERM", () => handleSignal("SIGTERM", 143));
+  process.once("SIGINT", () => handleSignal("SIGINT", 130));
   main().catch((error) => {
     process.stderr.write(`${error.stack || error.message}\n`);
     process.exit(1);
   });
 }
 
-module.exports = { DEFAULT_GROK_URL, agentBrowserInvocation, buildGrokBatchCommandChunks, buildGrokBatchCommands, isGrokPromptEcho, isGrokTitleResponse, namespaceProcessIds, normalizeGrokTitleResponse, parseDoneMarker, randomHumanDelayMs, runGrokPromptBatch };
+module.exports = {
+  DEFAULT_GROK_URL,
+  agentBrowserInvocation,
+  agentBrowserOwnedRuntimeDir,
+  agentBrowserProfileDir,
+  buildGrokBatchCommandChunks,
+  buildGrokBatchCommands,
+  buildGrokHistoryRecoveryEvalScript,
+  closeAgentBrowserSession,
+  cleanupOwnedGrokBrowserProfiles,
+  isGrokPromptEcho,
+  isGrokTitleResponse,
+  namespaceHasRuntimeArtifacts,
+  namespaceProcessIds,
+  normalizeGrokTitleResponse,
+  ownedGrokBrowserPidsFromPs,
+  parseDoneMarker,
+  randomHumanDelayMs,
+  runGrokPromptBatch,
+};

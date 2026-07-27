@@ -20,6 +20,7 @@ import {
 import { toast } from "sonner";
 
 import { AppSidebar } from "@/components/app-sidebar";
+import { AutomationLiveBoard } from "@/components/automation-live-board";
 import { ChartAreaInteractive } from "@/components/chart-area-interactive";
 import { DataTable } from "@/components/data-table";
 import { SiteHeader } from "@/components/site-header";
@@ -824,6 +825,7 @@ function OwnPostReplyControl({
 function AutomationTimelineView({
   comments,
   reviewComments,
+  timelinePage,
   availableDates,
   automationDate,
   onAutomationDateChange,
@@ -841,175 +843,34 @@ function AutomationTimelineView({
   ownPostReplyStatus,
   commentPipeline,
   commentDiscovery,
+  liveSnapshot,
+  liveConnectionState,
+  commentEnabled,
+  onToggleCommentAutomation,
   onManualXHomeScan,
-  todayPostReply,
-  onTodayPostReplyAction,
+  ownPostHeart,
+  onOwnPostHeartAction,
 }) {
-  const scopeLabel = metrics.isAll ? "전체 기간" : metrics.isToday ? "오늘" : metrics.date;
-  const pipelineStatus = commentPipeline?.status || "idle";
-  const pipelineBadgeVariant = pipelineStatus === "blocked"
-    ? "destructive"
-    : pipelineStatus === "ready" || pipelineStatus === "running"
-      ? "secondary"
-      : "outline";
-  const stageLabels = {
-    idle: "대기",
-    checking_queue: "큐 확인",
-    gemini_profiles: "Gemini 워커 준비",
-    grok_context: "Grok 문맥 분석",
-    gemini_batch: "Gemini 수정·심사",
-    queue_ready: "게시 큐 준비",
-    batch_partial_failure: "일부 생성 실패",
-    blocked: "차단됨",
-  };
   return (
     <div className="grid gap-4 px-4 lg:px-6">
-      <Card>
-        <CardHeader className="gap-3">
-          <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-            <div className="grid gap-1">
-              <CardTitle>자동화 타임라인</CardTitle>
-              <CardDescription>
-                모든 지표와 목록을 같은 날짜 기준으로 확인합니다.
-              </CardDescription>
-            </div>
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-              <Select value={automationDate} onValueChange={onAutomationDateChange}>
-                <SelectTrigger className="w-full sm:w-[160px]" size="sm" aria-label="댓글 날짜 선택">
-                  <SelectValue placeholder="날짜" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectGroup>
-                    <SelectItem value="all">전체 날짜</SelectItem>
-                    {availableDates.map((date) => (
-                      <SelectItem key={date} value={date}>{date}</SelectItem>
-                    ))}
-                  </SelectGroup>
-                </SelectContent>
-              </Select>
-              <ToggleGroup
-                type="single"
-                value={automationSort}
-                onValueChange={(value) => value && onAutomationSortChange(value)}
-                variant="outline"
-                size="sm"
-                aria-label="댓글 시간 정렬"
-              >
-                <ToggleGroupItem value="desc">최신순</ToggleGroupItem>
-                <ToggleGroupItem value="asc">오래된순</ToggleGroupItem>
-              </ToggleGroup>
-            </div>
-          </div>
-        </CardHeader>
-        <CardContent className="grid gap-4">
-          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
-            <div className="rounded-lg border bg-muted/40 p-3">
-              <div className="text-sm text-muted-foreground">{scopeLabel} 자동댓글</div>
-              <div className="text-2xl font-semibold tabular-nums">
-                {compact(metrics.commentCount)}{metrics.isToday ? ` / ${compact(metrics.dailyTarget)}` : ""}
-              </div>
-              <div className="text-xs text-muted-foreground">
-                {metrics.isToday
-                  ? `남은 ${compact(metrics.remaining)} · 현재 간격 ${compact(Math.round(metrics.intervalMs / 1000))}초`
-                  : "실제 X 게시 완료 기준"}
-              </div>
-            </div>
-            <div className="rounded-lg border p-3">
-              <div className="text-sm text-muted-foreground">{scopeLabel} 검수작성</div>
-              <div className="text-2xl font-semibold tabular-nums">{compact(metrics.reviewCount)}</div>
-              <div className="text-xs text-muted-foreground">
-                게시 {compact(metrics.postedReviewCount)} · 대기 {compact(metrics.pendingReviewCount)} · 오류 {compact(metrics.errorReviewCount)}
-              </div>
-            </div>
-            <div className="rounded-lg border p-3">
-              <div className="text-sm text-muted-foreground">{scopeLabel} 심사 평균</div>
-              <div className="text-2xl font-semibold tabular-nums">
-                {metrics.qualityCount ? `${compact(metrics.qualityAverage)}점` : "-"}
-              </div>
-              <div className="text-xs text-muted-foreground">심사 완료 {compact(metrics.qualityCount)}개</div>
-            </div>
-            <div className="rounded-lg border p-3">
-              <div className="text-sm text-muted-foreground">{scopeLabel} 하트</div>
-              <div className="text-2xl font-semibold tabular-nums">{compact(metrics.heartCount)}</div>
-              <div className="text-xs text-muted-foreground">작업 {compact(metrics.heartRunCount)}회 합계</div>
-            </div>
-            <div className="rounded-lg border p-3">
-              <div className="text-sm text-muted-foreground">{scopeLabel} 표시 항목</div>
-              <div className="text-2xl font-semibold tabular-nums">{compact(metrics.displayCount)}</div>
-              <div className="text-xs text-muted-foreground">
-                게시 {compact(metrics.commentCount)} · 검수대기 {compact(metrics.pendingReviewCount)}
-              </div>
-            </div>
-          </div>
+      <AutomationLiveBoard
+        liveSnapshot={liveSnapshot}
+        connectionState={liveConnectionState}
+        comments={comments}
+        reviewComments={reviewComments}
+        pipeline={commentPipeline}
+        metrics={metrics}
+        enabled={commentEnabled}
+        actionBusy={actionBusy}
+        onToggleEnabled={onToggleCommentAutomation}
+        automationDate={automationDate}
+        availableDates={availableDates}
+        onAutomationDateChange={onAutomationDateChange}
+        automationSort={automationSort}
+        onAutomationSortChange={onAutomationSortChange}
+      />
 
-          <div className={`grid gap-4 rounded-lg border p-4 ${pipelineStatus === "blocked" ? "border-destructive/40 bg-destructive/5" : "bg-muted/20"}`} aria-live="polite">
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-              <div className="grid gap-1">
-                <div className="flex flex-wrap items-center gap-2 font-medium">
-                  <SparklesIcon className="size-4" />
-                  자동댓글 파이프라인
-                  <Badge variant={pipelineBadgeVariant}>{commentPipeline?.label || "대기"}</Badge>
-                  <Badge variant="outline">단계: {stageLabels[commentPipeline?.stage] || commentPipeline?.stage || "대기"}</Badge>
-                </div>
-                <p className="text-sm text-muted-foreground">
-                  댓글 대기 {compact(commentPipeline?.pendingCount)} / 목표 {commentPipeline?.unlimited ? "무제한" : compact(commentPipeline?.targetCount)} · {commentPipeline?.unlimited ? "계속 보충" : `부족 ${compact(commentPipeline?.missingCount)}`}
-                </p>
-              </div>
-              <div className="text-xs text-muted-foreground sm:text-right">
-                <div>최근 시도 {formatDate(commentPipeline?.lastStartedAt)}</div>
-                <div>최근 종료 {formatDate(commentPipeline?.lastFinishedAt)}</div>
-              </div>
-            </div>
-            <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-              <span>계정당 댓글 {compact(commentPipeline?.authorDailyLimit)}건/일</span>
-              <span>제한 이월 {compact(commentPipeline?.authorCapDeferredCount)}건</span>
-              <span>내 글당 대댓글 {compact(commentPipeline?.ownRootReplyLimit)}건</span>
-              <span>대댓글 전환 {compact(commentPipeline?.successfulAutoCommentsSinceOwnReply)}/{compact(commentPipeline?.weightedOwnReplyThreshold)}</span>
-            </div>
-            <div className="grid gap-3 sm:grid-cols-2">
-              <div className="rounded-md border bg-background p-3">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-sm font-medium">Grok 문맥 워커</span>
-                  <Badge variant={Number(commentPipeline?.grok?.activeSessionCount || 0) > 0 ? "secondary" : "outline"}>
-                    활성 {compact(commentPipeline?.grok?.activeSessionCount)} / {compact(commentPipeline?.grok?.configuredWorkers)}
-                  </Badge>
-                </div>
-                <p className="mt-1 text-xs text-muted-foreground">
-                  {commentPipeline?.grok?.waitingOnGemini
-                    ? "Gemini 워커 준비 전이라 작업 시작 대기 중"
-                    : commentPipeline?.grok?.stateReady
-                      ? `로그인 상태 준비됨 · ${formatDate(commentPipeline?.grok?.stateUpdatedAt)}`
-                      : "Grok 로그인 상태 파일 없음"}
-                </p>
-              </div>
-              <div className="rounded-md border bg-background p-3">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-sm font-medium">Gemini 수정·심사 워커</span>
-                  <Badge variant={Number(commentPipeline?.gemini?.readyWorkers || 0) === Number(commentPipeline?.gemini?.configuredWorkers || 0) ? "secondary" : "destructive"}>
-                    준비 {compact(commentPipeline?.gemini?.readyWorkers)} / {compact(commentPipeline?.gemini?.configuredWorkers)}
-                  </Badge>
-                </div>
-                <p className="mt-1 text-xs text-muted-foreground">
-                  {commentPipeline?.gemini?.missingWorkers?.length
-                    ? `미준비 워커: ${commentPipeline.gemini.missingWorkers.join(", ")}`
-                    : "모든 워커 프로필 준비됨"}
-                </p>
-              </div>
-            </div>
-            {commentPipeline?.blocker || commentPipeline?.lastError ? (
-              <Alert variant="destructive">
-                <AlertTitle>현재 차단 원인</AlertTitle>
-                <AlertDescription>{commentPipeline?.blocker || commentPipeline?.lastError}</AlertDescription>
-              </Alert>
-            ) : null}
-            <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-              <span>최근 요청 {compact(commentPipeline?.lastRequested)}</span>
-              <span>대상 선택 {compact(commentPipeline?.lastSelected)}</span>
-              <span>큐 추가 {compact(commentPipeline?.lastQueued)}</span>
-              <span>실패 {compact(commentPipeline?.lastFailed)}</span>
-            </div>
-          </div>
-
+      <div className="grid gap-4">
           <Card id="comment-discovery">
             <CardHeader>
               <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
@@ -1070,66 +931,70 @@ function AutomationTimelineView({
             status={ownPostReplyStatus}
           />
 
-          <Card>
+          <Card id="own-post-heart">
             <CardHeader>
               <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
                 <div>
-                  <CardTitle>오늘 게시글 대댓글 순회</CardTitle>
-                  <CardDescription>오늘 작성한 원글을 찾아 인증 계정의 직접 대댓글에 하트와 대댓글을 답니다.</CardDescription>
+                  <CardTitle>내 글 댓글 자동하트</CardTitle>
+                  <CardDescription>오늘 작성한 내 원글에 달린 다른 사람의 직접 댓글만 하트 처리합니다.</CardDescription>
                 </div>
-                <Badge variant={todayPostReply?.lastStatus === "complete" ? "secondary" : todayPostReply?.lastStatus === "error" ? "destructive" : "outline"}>
-                  {todayPostReply?.busy ? "실행 중" : todayPostReply?.manualRequested ? "대기 중" : todayPostReply?.lastStatus || "대기"}
+                <Badge variant={ownPostHeart?.lastStatus === "error" || ownPostHeart?.lastStatus === "backoff" ? "destructive" : ownPostHeart?.enabled ? "secondary" : "outline"}>
+                  {ownPostHeart?.cancelling ? "중단 중" : ownPostHeart?.busy ? "실행 중" : ownPostHeart?.enabled ? "ON" : "OFF"}
                 </Badge>
               </div>
             </CardHeader>
             <CardContent className="grid gap-4">
               <div className="flex flex-wrap gap-2">
-                <Button type="button" disabled={todayPostReply?.busy || todayPostReply?.manualRequested} onClick={() => onTodayPostReplyAction("run")}>
-                  {todayPostReply?.busy || todayPostReply?.manualRequested ? <Loader2Icon data-icon="inline-start" className="animate-spin" /> : <HeartIcon data-icon="inline-start" />}
-                  지금 순회
+                <Button
+                  type="button"
+                  disabled={actionBusy || ownPostHeart?.busy || ownPostHeart?.xBackoff?.active}
+                  onClick={() => onOwnPostHeartAction("run")}
+                >
+                  {ownPostHeart?.busy ? <Loader2Icon data-icon="inline-start" className="animate-spin" /> : <HeartIcon data-icon="inline-start" />}
+                  지금 1회
                 </Button>
-                <Button type="button" variant="outline" onClick={() => onTodayPostReplyAction(todayPostReply?.enabled ? "disable" : "enable")}>
-                  10분 자동 순회 {todayPostReply?.enabled ? "끄기" : "켜기"}
+                <Button
+                  type="button"
+                  variant={ownPostHeart?.enabled ? "destructive" : "outline"}
+                  disabled={actionBusy && !ownPostHeart?.busy}
+                  onClick={() => onOwnPostHeartAction(ownPostHeart?.enabled || ownPostHeart?.busy ? "disable" : "enable")}
+                >
+                  {ownPostHeart?.enabled || ownPostHeart?.busy ? "자동하트 OFF·즉시 중단" : "10분 자동하트 ON"}
                 </Button>
               </div>
               <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
                 {[
-                  ["오늘 원글", todayPostReply?.summary?.rootPostCount],
-                  ["확인 원글", todayPostReply?.summary?.checkedRootCount],
-                  ["게시", todayPostReply?.summary?.postedCount],
-                  ["남은 대상", todayPostReply?.summary?.remainingEligibleCount],
-                  ["재시도 오류", todayPostReply?.summary?.retryableErrorCount],
-                ].map(([label, value]) => <div key={label} className="rounded-lg border p-3"><div className="text-xs text-muted-foreground">{label}</div><div className="text-xl font-semibold tabular-nums">{compact(value)}</div></div>)}
-              </div>
-              <div className="rounded-lg border bg-muted/20 p-4">
-                <div className="mb-2 font-medium">완료 조건</div>
-                <div className="grid gap-1 text-sm">
-                  {(todayPostReply?.completion?.conditions || []).map((condition) => (
-                    <div key={condition.key} className={condition.met ? "text-foreground" : "text-muted-foreground"}>
-                      {condition.met ? "✓" : "○"} {condition.label}
-                    </div>
-                  ))}
-                </div>
+                  ["내 원글", ownPostHeart?.summary?.rootPostCount],
+                  ["대상 댓글", ownPostHeart?.summary?.targetCount],
+                  ["신규 하트", ownPostHeart?.summary?.likedCount],
+                  ["이미 하트", ownPostHeart?.summary?.alreadyLikedCount],
+                  ["실패", ownPostHeart?.summary?.failedCount],
+                ].map(([label, value]) => (
+                  <div key={label} className="rounded-lg border p-3">
+                    <div className="text-xs text-muted-foreground">{label}</div>
+                    <div className="text-xl font-semibold tabular-nums">{compact(value)}</div>
+                  </div>
+                ))}
               </div>
               <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-                <span>Grok 전용: {todayPostReply?.resources?.grokSessionPrefix || "-"}</span>
-                <span>Gemini 전용 포트: {todayPostReply?.resources?.geminiPortBase || "-"}~</span>
-                <span>Gemini 실행기 {todayPostReply?.resources?.geminiScriptReady ? "준비됨" : "없음"}</span>
-                <span>자동댓글 워커 공유 안 함</span>
-                <span>X 쓰기만 직렬화</span>
-                <span>최근 실행 {formatDate(todayPostReply?.lastRunAt)}</span>
+                <span>최근 실행 {formatDate(ownPostHeart?.lastRunAt)}</span>
+                <span>다음 실행 {ownPostHeart?.enabled ? formatDate(ownPostHeart?.nextRunAt) : "-"}</span>
+                <span>X 전용 포트 9240</span>
+                <span>내 계정 작성 댓글 제외</span>
               </div>
-              {todayPostReply?.summary?.selfHealingActions?.length ? (
-                <div className="rounded-lg border bg-muted/20 p-3 text-sm">
-                  <div className="font-medium">자가개선 로그</div>
-                  {todayPostReply.summary.selfHealingActions.map((action, index) => (
-                    <div key={`${action.type}-${index}`} className="mt-1 text-muted-foreground">
-                      {action.type === "gemini_script_fallback" ? "✓ 누락된 외부 Gemini 실행기를 로컬 fallback으로 복구" : `○ 반복 오류 차단: ${action.error || action.reason}`}
-                    </div>
-                  ))}
-                </div>
+              {ownPostHeart?.xBackoff?.active ? (
+                <Alert variant="destructive">
+                  <AlertTitle>X 접근 일시 중단</AlertTitle>
+                  <AlertDescription>
+                    {ownPostHeart.xBackoff.error || "X 사용량 제한 또는 빈 로딩 화면 감지"} · 재개 예정 {formatDate(ownPostHeart.xBackoff.retryAt)}
+                  </AlertDescription>
+                </Alert>
+              ) : ownPostHeart?.lastError ? (
+                <Alert variant="destructive">
+                  <AlertTitle>최근 자동하트 오류</AlertTitle>
+                  <AlertDescription>{ownPostHeart.lastError}</AlertDescription>
+                </Alert>
               ) : null}
-              {todayPostReply?.lastError ? <Alert variant="destructive"><AlertTitle>미완료 사유</AlertTitle><AlertDescription>{todayPostReply.lastError}</AlertDescription></Alert> : null}
             </CardContent>
           </Card>
 
@@ -1138,7 +1003,8 @@ function AutomationTimelineView({
               <div className="grid gap-1">
                 <div className="font-medium">작성된 댓글 검수 큐</div>
                 <div className="text-sm text-muted-foreground">
-                  인증 팔로워 최신글 기준 · 5분마다 최대 5개 · 동시 5개 · {automationDate === "all" ? "전체 날짜" : automationDate} · 검수대기 {compact(reviewComments.length)}개
+                  인증 팔로워 최신글 기준 · 5분마다 최대 5개 · 동시 5개 · {automationDate === "all" ? "전체 날짜" : automationDate} · 검수대기 {compact(metrics.pendingReviewCount)}개
+                  {timelinePage?.truncated ? ` · 최근 ${compact(reviewComments.length)}개 표시` : ""}
                 </div>
               </div>
               <div className="flex flex-wrap gap-2">
@@ -1248,7 +1114,8 @@ function AutomationTimelineView({
             <div className="border-b p-4">
               <div className="font-medium">게시 완료 댓글 타임라인</div>
               <div className="text-sm text-muted-foreground">
-                실제 X에 작성된 자동댓글 · {automationDate === "all" ? "전체 날짜" : automationDate} · {compact(comments.length)}개
+                실제 X에 작성된 자동댓글 · {automationDate === "all" ? "전체 날짜" : automationDate} · 전체 {compact(metrics.commentCount)}개
+                {timelinePage?.truncated ? ` · 최근 ${compact(comments.length)}개 표시` : ""}
               </div>
             </div>
             {comments.length ? (
@@ -1303,8 +1170,7 @@ function AutomationTimelineView({
               </div>
             )}
           </div>
-        </CardContent>
-      </Card>
+      </div>
     </div>
   );
 }
@@ -1331,6 +1197,8 @@ function Dashboard() {
   const [error, setError] = useState("");
   const [automationDate, setAutomationDate] = useState(() => formatKstDateKey());
   const [automationSort, setAutomationSort] = useState("desc");
+  const [automationLiveSnapshot, setAutomationLiveSnapshot] = useState(null);
+  const [automationLiveConnection, setAutomationLiveConnection] = useState("idle");
 
   async function load(nextView = view, options = {}) {
     setError("");
@@ -1340,7 +1208,7 @@ function Dashboard() {
           ? { ok: true, coupang: await api(`/api/coupang/performance?startDate=${compactCoupangDate(coupangRange.startDate)}&endDate=${compactCoupangDate(coupangRange.endDate)}`) }
           : nextView === "naver-adpost"
             ? { ok: true, adpost: await api(`/api/naver-adpost/revenue?startDate=${compactCoupangDate(adpostRange.startDate)}&endDate=${compactCoupangDate(adpostRange.endDate)}${options.force ? "&refresh=1" : ""}`) }
-          : await api(`/api/discovery/dashboard?view=${encodeURIComponent(nextView)}`);
+          : await api(`/api/discovery/dashboard?view=${encodeURIComponent(nextView)}${nextView === "automation" ? `&date=${encodeURIComponent(options.automationDate || automationDate)}` : ""}`);
     setData(result);
     setTitleEdits((current) => Object.fromEntries((result.rows || []).map((row) => [
       row.canonicalUrl,
@@ -1369,7 +1237,7 @@ function Dashboard() {
       setError(err.message);
       setLoading(false);
     });
-  }, [view, coupangRange.startDate, coupangRange.endDate, adpostRange.startDate, adpostRange.endDate]);
+  }, [view, automationDate, coupangRange.startDate, coupangRange.endDate, adpostRange.startDate, adpostRange.endDate]);
 
   useEffect(() => {
     if (!autoRefresh) return undefined;
@@ -1377,7 +1245,34 @@ function Dashboard() {
       load(view).catch(() => undefined);
     }, 30000);
     return () => clearInterval(timer);
-  }, [autoRefresh, view]);
+  }, [autoRefresh, view, automationDate]);
+
+  useEffect(() => {
+    if (view !== "automation") {
+      setAutomationLiveConnection("idle");
+      return undefined;
+    }
+    setAutomationLiveConnection("connecting");
+    const source = new EventSource("/api/discovery/automation-stream");
+    const onSnapshot = (event) => {
+      try {
+        setAutomationLiveSnapshot(JSON.parse(event.data));
+        setAutomationLiveConnection("connected");
+      } catch {
+        setAutomationLiveConnection("reconnecting");
+      }
+    };
+    const onStreamError = () => setAutomationLiveConnection("reconnecting");
+    source.onopen = () => setAutomationLiveConnection("connected");
+    source.onerror = () => setAutomationLiveConnection("reconnecting");
+    source.addEventListener("snapshot", onSnapshot);
+    source.addEventListener("stream-error", onStreamError);
+    return () => {
+      source.removeEventListener("snapshot", onSnapshot);
+      source.removeEventListener("stream-error", onStreamError);
+      source.close();
+    };
+  }, [view]);
 
   const summary = data?.summary || {};
   const rows = data?.rows || [];
@@ -1394,17 +1289,33 @@ function Dashboard() {
     ...(automation.availableDates || []),
     ...heartTimeline.map((item) => item.date).filter(Boolean),
   ])).sort((a, b) => b.localeCompare(a)), [automation.availableDates, heartTimeline, todayDate]);
-  const automationMetrics = useMemo(() => buildAutomationScopeMetrics({
-    date: automationDate,
-    todayDate,
-    comments: commentTimeline,
-    pendingReviews: commentReviewQueue,
-    postedReviews: postedCommentReviewQueue,
-    errorReviews: errorCommentReviewQueue,
-    heartTimeline,
-    dailyTarget: data?.terafabx?.comment?.daily?.dailyTarget || 500,
-    intervalMs: data?.terafabx?.comment?.intervalMs || 0,
-  }), [automationDate, todayDate, commentTimeline, commentReviewQueue, postedCommentReviewQueue, errorCommentReviewQueue, heartTimeline, data?.terafabx?.comment]);
+  const automationMetrics = useMemo(() => {
+    const clientMetrics = buildAutomationScopeMetrics({
+      date: automationDate,
+      todayDate,
+      comments: commentTimeline,
+      pendingReviews: commentReviewQueue,
+      postedReviews: postedCommentReviewQueue,
+      errorReviews: errorCommentReviewQueue,
+      heartTimeline,
+      dailyTarget: data?.terafabx?.comment?.daily?.dailyTarget || 1000,
+      intervalMs: data?.terafabx?.comment?.daily?.requiredIntervalMs || 0,
+    });
+    const serverMetrics = automation.scopeMetrics?.date === automationDate
+      ? automation.scopeMetrics
+      : null;
+    if (!serverMetrics) return clientMetrics;
+    const commentCount = Number(serverMetrics.commentCount || 0);
+    return {
+      ...clientMetrics,
+      ...serverMetrics,
+      comments: clientMetrics.comments,
+      pendingReviews: clientMetrics.pendingReviews,
+      remaining: clientMetrics.isToday
+        ? Math.max(0, clientMetrics.dailyTarget - commentCount)
+        : null,
+    };
+  }, [automationDate, todayDate, commentTimeline, commentReviewQueue, postedCommentReviewQueue, errorCommentReviewQueue, heartTimeline, automation.scopeMetrics, data?.terafabx?.comment]);
   const selectedComments = automationMetrics.comments;
   const selectedReviewComments = automationMetrics.pendingReviews;
   const sortedComments = useMemo(() => (
@@ -1421,12 +1332,6 @@ function Dashboard() {
       return automationSort === "asc" ? left - right : right - left;
     })
   ), [automationSort, selectedReviewComments]);
-
-  useEffect(() => {
-    if (automationDate !== "all" && availableDates.length && !availableDates.includes(automationDate)) {
-      setAutomationDate("all");
-    }
-  }, [automationDate, availableDates]);
 
   async function runAction(label, fn, success = "완료됨") {
     setBusy(label);
@@ -1478,31 +1383,68 @@ function Dashboard() {
     }
   }
 
+  async function requestDiscoveryAutoSchedule(row, textOverride, origin) {
+    const url = row.canonicalUrl;
+    await api("/api/discovery/auto-schedule-async", {
+      method: "POST",
+      body: JSON.stringify({
+        url,
+        text: rowText(row, textOverride),
+        origin,
+      }),
+    });
+    setData((current) => current?.rows ? {
+      ...current,
+      rows: current.rows.map((item) => item.canonicalUrl === url
+        ? { ...item, status: "queued_schedule", canPost: false, lastError: null }
+        : item),
+    } : current);
+  }
+
   async function queueDiscoveryAutoSchedule(row, textOverride) {
     const url = row.canonicalUrl;
     setAutoScheduleSubmitting((current) => current.includes(url) ? current : [...current, url]);
     setError("");
     try {
-      await api("/api/discovery/auto-schedule-async", {
-        method: "POST",
-        body: JSON.stringify({
-          url,
-          text: rowText(row, textOverride),
-          origin: "dashboard_auto_schedule",
-        }),
-      });
-      setData((current) => current?.rows ? {
-        ...current,
-        rows: current.rows.map((item) => item.canonicalUrl === url
-          ? { ...item, status: "queued_schedule", canPost: false, lastError: null }
-          : item),
-      } : current);
+      await requestDiscoveryAutoSchedule(row, textOverride, "dashboard_auto_schedule");
       toast.success("자동 예약 큐에 추가됨");
     } catch (err) {
       setError(err.message);
       toast.error(err.message);
     } finally {
       setAutoScheduleSubmitting((current) => current.filter((item) => item !== url));
+    }
+  }
+
+  async function queueDiscoveryAutoScheduleBatch(selectedRows) {
+    const rowsToQueue = selectedRows.filter((row) => row.canPost && !autoScheduleSubmitting.includes(row.canonicalUrl));
+    const urls = rowsToQueue.map((row) => row.canonicalUrl);
+    if (!urls.length) return;
+    setAutoScheduleSubmitting((current) => Array.from(new Set([...current, ...urls])));
+    setError("");
+    const failed = [];
+    let accepted = 0;
+    try {
+      for (const row of rowsToQueue) {
+        try {
+          await requestDiscoveryAutoSchedule(
+            row,
+            titleEdits[row.canonicalUrl] ?? row.textPreview,
+            "dashboard_batch_auto_schedule",
+          );
+          accepted += 1;
+        } catch (err) {
+          failed.push({ row, error: err.message });
+        }
+      }
+      if (accepted) toast.success(`${accepted}건 자동 예약 큐에 추가됨`);
+      if (failed.length) {
+        const message = `${failed.length}건 접수 실패 · ${failed.map((item) => item.row.author || item.row.canonicalUrl).join(", ")}`;
+        setError(message);
+        toast.error(message);
+      }
+    } finally {
+      setAutoScheduleSubmitting((current) => current.filter((item) => !urls.includes(item)));
     }
   }
 
@@ -1550,14 +1492,18 @@ function Dashboard() {
     }
   }
 
-  async function runTodayPostReplyAction(action) {
-    await runAction(`today-post-reply-${action}`, async () => {
-      await api("/api/terafabx/today-post-reply", {
+  async function runOwnPostHeartAction(action) {
+    await runAction(`own-post-heart-${action}`, async () => {
+      await api("/api/terafabx/own-post-heart", {
         method: "POST",
         body: JSON.stringify({ action }),
       });
       await load(view);
-    }, action === "run" ? "오늘 게시글 대댓글 순회를 시작했습니다" : "오늘 게시글 대댓글 자동화 상태를 변경했습니다");
+    }, action === "disable"
+      ? "내 글 댓글 자동하트를 중단했습니다"
+      : action === "enable"
+        ? "내 글 댓글 자동하트를 켰습니다"
+        : "내 글 댓글 하트 순회를 완료했습니다");
   }
 
   async function runTerafabxReviewAction(item, action) {
@@ -1641,6 +1587,7 @@ function Dashboard() {
         }), "X 예약됨")
       }
       onAutoSchedule={queueDiscoveryAutoSchedule}
+      onBatchAutoSchedule={queueDiscoveryAutoScheduleBatch}
       onCancelSchedule={(row) =>
         runAction(`cancel-schedule-${row.canonicalUrl}`, () => api("/api/discovery/cancel-schedule", {
           method: "POST",
@@ -1705,8 +1652,8 @@ function Dashboard() {
         />
         <SidebarInset>
           <SiteHeader
-            title={view === "inssider-pending" ? "인싸이더 판결중" : view === "automation" ? "자동화 타임라인" : view === "coupang-performance" ? "쿠팡 파트너스 실적" : view === "naver-adpost" ? "네이버 애드포스트 수익" : "Threads 발굴 대시보드"}
-            subtitle={view === "inssider-pending" ? "연애·결혼 / 직장·사회 카테고리의 진행 중인 판결글" : view === "automation" ? "자동댓글 기록 · 날짜별 필터 · 작성 시간 정렬" : view === "coupang-performance" ? "쿠팡 파트너스 월간 실적과 최근 일자별 수수료" : view === "naver-adpost" ? "현재 잔액 · 기간별 수익 · 노출과 클릭 현황" : "좋아요 1000+ · 미디어 포함 · X 수동 검토/예약 워크플로우"}
+            title={view === "inssider-pending" ? "인싸이더 판결중" : view === "automation" ? "자동화 운영" : view === "coupang-performance" ? "쿠팡 파트너스 실적" : view === "naver-adpost" ? "네이버 애드포스트 수익" : "Threads 발굴 대시보드"}
+            subtitle={view === "inssider-pending" ? "연애·결혼 / 직장·사회 카테고리의 진행 중인 판결글" : view === "automation" ? "실시간 파이프라인 · 자동댓글 기록 · 병목 상태" : view === "coupang-performance" ? "쿠팡 파트너스 월간 실적과 최근 일자별 수수료" : view === "naver-adpost" ? "현재 잔액 · 기간별 수익 · 노출과 클릭 현황" : "좋아요 1000+ · 미디어 포함 · X 수동 검토/예약 워크플로우"}
             autoRefresh={autoRefresh}
             busy={controlsBusy}
             onRefresh={() => runAction("refresh-data", () => load(view), "새로고침 완료")}
@@ -1770,6 +1717,7 @@ function Dashboard() {
                 <AutomationTimelineView
                   comments={sortedComments}
                   reviewComments={sortedReviewComments}
+                  timelinePage={automation.timelinePage}
                   availableDates={availableDates}
                   automationDate={automationDate}
                   onAutomationDateChange={setAutomationDate}
@@ -1787,11 +1735,15 @@ function Dashboard() {
                   onOwnPostReplyAction={runOwnPostReplyAction}
                   ownPostReplyResult={ownPostReplyResult}
                   ownPostReplyError={ownPostReplyError}
-                  todayPostReply={data?.terafabx?.todayPostReply}
-                  onTodayPostReplyAction={runTodayPostReplyAction}
+                  ownPostHeart={data?.terafabx?.ownPostHeart}
+                  onOwnPostHeartAction={runOwnPostHeartAction}
                   ownPostReplyStatus={data?.terafabx?.ownPostReply}
                   commentPipeline={data?.terafabx?.commentPipeline}
                   commentDiscovery={data?.terafabx?.commentDiscovery}
+                  liveSnapshot={automationLiveSnapshot}
+                  liveConnectionState={automationLiveConnection}
+                  commentEnabled={data?.terafabx?.comment?.enabled}
+                  onToggleCommentAutomation={(nextEnabled) => runTerafabx("comment", nextEnabled ? "enable" : "disable")}
                   onManualXHomeScan={() => runTerafabx("x-home-scan", "run")}
                 />
               ) : (
@@ -1966,8 +1918,9 @@ function Dashboard() {
                             최근 {data?.terafabx?.comment?.lastComment || "-"}
                           </p>
                           <p className="text-xs text-muted-foreground">
-                            오늘 {compact(data?.terafabx?.comment?.daily?.postedToday)} / {compact(data?.terafabx?.comment?.daily?.dailyTarget || 500)}개
-                            {` · 남은 ${compact(data?.terafabx?.comment?.daily?.remaining)} · 간격 ${compact(Math.round(Number(data?.terafabx?.comment?.intervalMs || 0) / 1000))}초`}
+                            오늘 {compact(data?.terafabx?.comment?.daily?.postedToday)} / {compact(data?.terafabx?.comment?.daily?.dailyTarget || 1000)}개
+                            {` · 남은 ${compact(data?.terafabx?.comment?.daily?.remaining)} · 목표 간격 ${compact(Math.round(Number(data?.terafabx?.comment?.daily?.requiredIntervalMs || 0) / 1000))}초`}
+                            {` · 예상 ${compact(data?.terafabx?.comment?.daily?.projectedTotal)}개`}
                           </p>
                           <p className={`text-xs ${data?.terafabx?.commentPrefill?.quotaLimited ? "text-destructive" : "text-muted-foreground"}`}>
                             Prefill {compact(data?.terafabx?.comment?.pendingPostCount)}개

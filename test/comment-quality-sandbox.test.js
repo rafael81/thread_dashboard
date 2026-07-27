@@ -4,6 +4,8 @@ const assert = require("node:assert/strict");
 const {
   assessTerafabxCurrentCommentPolicy,
   assessTerafabxLanguageQuality,
+  assessTerafabxOwnPostReplyWriteQuality,
+  assessTerafabxTechnicalGrounding,
   auditTerafabxPrefillQuality,
   parseTerafabxFinalJudge,
   scoreTerafabxClichePenalty,
@@ -40,6 +42,14 @@ test("local quality gate blocks repeated reaction stems", () => {
   assert.equal(assessTerafabxLanguageQuality("엄마 반응이 예상보다 커서 유쾌해요").ok, true);
 });
 
+test("local quality gate blocks geometric adjectives attached to an entire expression", () => {
+  const result = assessTerafabxLanguageQuality("나올 때 표정 진짜 뾰족하네");
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.includes("unnatural_geometric_expression_collocation"));
+  assert.equal(assessTerafabxLanguageQuality("나올 때 입이 진짜 뾰족하네").ok, true);
+  assert.equal(assessTerafabxLanguageQuality("나올 때 눈매가 날카롭네").ok, true);
+});
+
 test("local quality gate blocks fabricated personal experience", () => {
   const result = assessTerafabxLanguageQuality("옛날 맛이랑 확실히 달라지긴 했더라고요");
   assert.equal(result.ok, false);
@@ -47,6 +57,7 @@ test("local quality gate blocks fabricated personal experience", () => {
   assert.ok(assessTerafabxLanguageQuality("습도만 낮아져도 살 것 같더라").errors.includes("fabricated_personal_experience"));
   assert.ok(assessTerafabxLanguageQuality("인중 늘어날까 봐 안 따라 했는데 꿀팁이네요").errors.includes("fabricated_personal_experience"));
   assert.ok(assessTerafabxLanguageQuality("시간 지나도 한결같고 편한 사람이 남더라고").errors.includes("fabricated_personal_experience"));
+  assert.ok(assessTerafabxLanguageQuality("진짜 지나칠 뻔했는데 조심해야겠네요").errors.includes("fabricated_personal_experience"));
   assert.equal(assessTerafabxLanguageQuality("옛날 단면과 확실히 달라 보이네요").ok, true);
 });
 
@@ -59,6 +70,64 @@ test("local quality gate identifies counseling empathy and advertising copy from
 
   const reusable = assessTerafabxLanguageQuality("박스 접는 아이디어가 기발하네요");
   assert.ok(reusable.styleWarnings.includes("reusable_affect_template"));
+});
+
+test("technical metaphor gate blocks invented system jargon while allowing source-grounded terms", () => {
+  const unsupported = assessTerafabxTechnicalGrounding(
+    "출력 설정 오류 마스크 씌워놓은 거 같네",
+    "c(at)f(ace)-94 마스크 입 주변만 하얀 고양이",
+  );
+  assert.equal(unsupported.ok, false);
+  assert.deepEqual(unsupported.unsupportedGroups, ["출력", "설정", "오류"]);
+
+  const grounded = assessTerafabxTechnicalGrounding(
+    "출력 설정 오류가 또 떴네",
+    "프린터 출력 설정 오류가 계속 뜬다",
+  );
+  assert.equal(grounded.ok, true);
+  assert.deepEqual(grounded.unsupportedGroups, []);
+});
+
+test("durable X writer rechecks technical grounding before posting", () => {
+  const quality = assessTerafabxOwnPostReplyWriteQuality({
+    queuedAt: "2026-07-27T04:00:00.000Z",
+    source: "own_post_full_coverage",
+    candidate: {
+      text: "c(at)f(ace)-94 마스크🥹🥹",
+    },
+    target: {
+      targetText: "c(at)f(ace)-94 마스크🥹🥹",
+      rootPostText: "입 주변만 하얀 고양이 영상",
+    },
+    prepared: {
+      comment: "출력 설정 오류 마스크 씌워놓은 거 같네",
+      grokContext: {
+        summary: "검은 고양이의 입 주변만 하얀 무늬를 마스크에 빗댄 댓글이다.",
+        keyPoints: ["고양이", "입 주변 흰 무늬", "마스크 비유"],
+        rawPreview: "grok-json",
+        provider: "web-context",
+      },
+      geminiReview: {
+        finalJudge: {
+          passed: true,
+          fatalError: false,
+          qualityFlagsComplete: true,
+          flaggedQualityIssues: [],
+          dimensions: { context: 40 },
+        },
+      },
+    },
+  });
+  assert.equal(quality.ok, false);
+  assert.ok(quality.errors.includes("unsupported_technical_metaphor:출력,설정,오류"));
+});
+
+test("durable X writer preserves fixed emoji replies for image-only comments", () => {
+  const quality = assessTerafabxOwnPostReplyWriteQuality({
+    target: { imageOnly: true },
+    prepared: { comment: "❤️", generator: "web-context+fixed-image-only-emoji" },
+  });
+  assert.deepEqual(quality, { ok: true, errors: [], fixedEmoji: true });
 });
 
 test("current policy blocks unsupported absolute claims absent from the source", () => {

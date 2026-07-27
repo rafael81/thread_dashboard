@@ -29,6 +29,7 @@ export function buildOwnPostReplyPayload(action, value) {
       limit: 200,
       delayMinMs: 10_000,
       delayMaxMs: 20_000,
+      ignoreRootCap: true,
     };
   }
   return payload;

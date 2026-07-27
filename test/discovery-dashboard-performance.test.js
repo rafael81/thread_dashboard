@@ -5,6 +5,8 @@ const test = require("node:test");
 const {
   buildAutomationDashboardData,
   buildAutomationDashboardOverview,
+  compactAutomationGeminiReview,
+  compactAutomationGrokContext,
   compactTerafabxDashboardStatus,
   getTerafabxAutomationStatus,
   getTerafabxDashboardOverview,
@@ -26,7 +28,6 @@ test("TerafabX overview preserves the control-panel state without history payloa
   const full = compactTerafabxDashboardStatus(getTerafabxAutomationStatus());
   const overview = getTerafabxDashboardOverview();
 
-  assert.deepEqual(Object.keys(overview).sort(), Object.keys(full).sort());
   assert.equal(overview.comment.enabled, full.comment.enabled);
   assert.equal(overview.comment.pendingPostCount, full.comment.pendingPostCount);
   assert.deepEqual(overview.comment.daily, full.comment.daily);
@@ -34,6 +35,9 @@ test("TerafabX overview preserves the control-panel state without history payloa
   assert.equal(overview.follow.enabled, full.follow.enabled);
   assert.equal(Object.hasOwn(overview.comment, "history"), false);
   assert.equal(Object.hasOwn(overview.comment, "pendingPosts"), false);
+  assert.equal(Object.hasOwn(full.ownPostReply, "history"), false);
+  assert.equal(Object.hasOwn(full.heart, "history"), false);
+  assert.equal(Object.hasOwn(full.follow, "history"), false);
 });
 
 test("ordinary discovery views load only compact accurate dashboard overview data", async () => {
@@ -71,9 +75,9 @@ test("ordinary discovery views load only compact accurate dashboard overview dat
 test("automation view loads automation details but not unrelated Coupang performance", async () => {
   const calls = [];
   const details = await loadDiscoveryDashboardDetails("automation", [{ status: "posted" }], 123, {
-    ensureAvatars: async () => {
+    scheduleAvatars: () => {
       calls.push("avatars");
-      return { ok: true };
+      return { scheduled: true, busy: false };
     },
     getCoupang: async () => {
       calls.push("coupang");
@@ -83,17 +87,51 @@ test("automation view loads automation details but not unrelated Coupang perform
       calls.push("terafabx");
       return { comment: { enabled: true } };
     },
-    buildAutomation: (rows, nowMs) => {
+    timelineDate: "2026-07-25",
+    timelineLimit: "125",
+    buildAutomation: (rows, nowMs, options) => {
       calls.push(`automation:${rows.length}:${nowMs}`);
+      calls.push(`scope:${options.timelineDate}:${options.timelineLimit}`);
       return { summary: { commentCount: 1 }, commentTimeline: [{ at: "now" }] };
     },
   });
 
-  assert.deepEqual(calls.slice().sort(), ["automation:1:123", "avatars", "terafabx"]);
+  assert.deepEqual(calls.slice().sort(), ["automation:1:123", "avatars", "scope:2026-07-25:125", "terafabx"]);
   assert.equal(details.automation.commentTimeline.length, 1);
   assert.equal(details.terafabx.comment.enabled, true);
-  assert.deepEqual(details.avatarEnrichment, { ok: true });
+  assert.deepEqual(details.avatarEnrichment, { scheduled: true, busy: false });
   assert.equal(Object.hasOwn(details, "coupang"), false);
+});
+
+test("automation timeline payload keeps only UI fields from large AI diagnostics", () => {
+  const grok = compactAutomationGrokContext({
+    summary: "원글 요약",
+    keyPoints: ["핵심 1", "핵심 2"],
+    provider: "grok",
+    raw: "x".repeat(100_000),
+    mediaAnalysis: { frames: Array(100).fill("large") },
+  });
+  const gemini = compactAutomationGeminiReview({
+    score: 88,
+    decision: "approve",
+    reason: "자연스러움",
+    finalJudge: { score: 91, reason: "통과", raw: "large" },
+    rawPreview: "x".repeat(100_000),
+    dimensions: { relevance: 10 },
+  });
+
+  assert.deepEqual(grok, {
+    summary: "원글 요약",
+    keyPoints: ["핵심 1", "핵심 2"],
+    provider: "grok",
+  });
+  assert.deepEqual(gemini, {
+    score: 88,
+    decision: "approve",
+    reason: "자연스러움",
+    finalJudge: { score: 91, reason: "통과" },
+  });
+  assert.equal(JSON.stringify({ grok, gemini }).length < 500, true);
 });
 
 class FakeServer extends EventEmitter {

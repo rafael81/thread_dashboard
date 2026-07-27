@@ -6,18 +6,38 @@ const test = require("node:test");
 const {
   assessTerafabxParentContextMismatch,
   assessTerafabxReplyRelationship,
+  findTerafabxOwnReplyToTarget,
+  recoverTerafabxUncertainReply,
   buildTerafabxFixedImageReplyRecord,
   buildTerafabxGrokPreparedReply,
   buildTerafabxOwnPostReplyTarget,
+  cachedTerafabxOwnPostRootContext,
+  analyzeTerafabxOwnPostRootContext,
+  parseTerafabxDirectContext,
+  isConfirmedTerafabxGrokContext,
   classifyTerafabxOwnPostReplies,
   isTerafabxAdComment,
+  isTerafabxOwnPostSpamReply,
   terafabxAdCommentReason,
   isTerafabxSkippableOwnPostReplyTargetError,
   isTerafabxImageOnlyReply,
+  isTerafabxGifOnlyReply,
   isTerafabxGeminiWorkTab,
   randomTerafabxOwnPostReplyDelayMs,
+  terafabxOwnPostReplyWriterDesiredGapMs,
+  terafabxOwnPostReplyWriterDelayMs,
+  createSerialTaskQueue,
+  createPullTaskPool,
   runFixedWorkerPool,
+  runFixedWorkerPipeline,
+  allocateTerafabxOwnPostReplyWorkers,
+  normalizeTerafabxOwnPostReplyWriteQueue,
   shouldUseTerafabxQuickIntent,
+  attemptTerafabxReplyHeart,
+  terafabxOwnPostReplyXWriteBackoff,
+  isTerafabxXRateLimitError,
+  isTerafabxXAccessCircuitBreakerError,
+  terafabxGlobalXBackoff,
   terafabxBrowserConcurrency,
   terafabxGrokIndividualRequestCount,
   terafabxCommentPrefillCandidateLimit,
@@ -25,6 +45,17 @@ const {
   normalizeTerafabxCommentTargetBacklog,
   normalizeFxTwitterFollowingAccounts,
   normalizeFxTwitterFollowingCandidates,
+  isTerafabxOwnPostFullCoverageMode,
+  normalizeTerafabxOwnRootStatus,
+  normalizeTerafabxOwnPostCoverageBacklog,
+  rankTerafabxOwnPostCoverageBacklog,
+  selectTerafabxOwnPostCoveragePhase,
+  buildTerafabxOwnPostReplyCompletionMetrics,
+  enrichDiscoveryRowsWithReplyCompletion,
+  selectTerafabxReplyCountRefreshTargets,
+  runTerafabxReplyCountRefresh,
+  prefetchTerafabxOwnPostCoverageContexts,
+  discoverTerafabxOwnPostCoverageCycle,
   terafabxFxTwitterFollowingPlan,
   terafabxFxTwitterAccountBatch,
   terafabxFxTwitterRetryAt,
@@ -43,7 +74,9 @@ const {
   terafabxCommentPrefillWorkerResources,
   knownTerafabxGrokWebSessions,
   terafabxOwnPostReplyBatchLimit,
+  terafabxOwnPostReplyRootCapCompletion,
   normalizeFxTwitterV2Status,
+  fetchFxTwitterConversation,
   flattenFxTwitterConversationReplies,
   normalizeTerafabxOwnPostReplyManualQueue,
   terafabxOwnPostReplyQueueItemForUrl,
@@ -56,8 +89,10 @@ const {
   parseTerafabxFinalJudge,
   parseTerafabxGeminiBatchFinalJudge,
   parseTerafabxGeminiBatchReview,
+  selectTerafabxReviewCandidate,
   terafabxGrokContextPrompt,
   terafabxGeminiBatchFinalJudgePrompt,
+  compactTerafabxStateForStorage,
   terafabxGeminiBatchReviewPrompt,
   terafabxGeminiBatchGeneratePrompt,
   terafabxGeminiReviewPrompt,
@@ -75,7 +110,504 @@ const {
   withTerafabxBrowserSetupCleanup,
   xPageReadyState,
   terafabxGeminiPriorityValue,
+  mergeTerafabxRepairedBatchResult,
 } = require("../mirror_server");
+
+function xStatusUrlAt(timestampMs, sequence = 1n) {
+  const id = ((BigInt(timestampMs) - 1288834974657n) << 22n) + BigInt(sequence);
+  return `https://x.com/terafabXai/status/${id}`;
+}
+
+test("direct Codex media context is accepted only after media verification", () => {
+  const parsed = parseTerafabxDirectContext(JSON.stringify({
+    context_summary: "주황색 고양이가 커튼 레일 사이에 올라가 배가 눌린 장면을 장난스럽게 보여주는 게시물이다.",
+    key_points: ["고양이가 높은 커튼 레일에 올라감"],
+    observed_media: ["영상에서 고양이가 자세를 바꾸며 움직임"],
+    uncertainties: ["실제로 끼어 움직이지 못하는지는 불확실"],
+    verified_media: true,
+  }));
+  assert.equal(parsed.provider, "direct-codex-context");
+  assert.equal(isConfirmedTerafabxGrokContext(parsed), true);
+  assert.throws(() => parseTerafabxDirectContext(JSON.stringify({
+    context_summary: "텍스트만 확인했고 첨부 영상은 확인하지 못한 분석 결과다.",
+    key_points: ["영상 확인 실패"],
+    verified_media: false,
+  })), /미디어 검증/);
+});
+
+test("own-post root context falls back from Grok Web to direct media analysis", async () => {
+  const calls = [];
+  const result = await analyzeTerafabxOwnPostRootContext(
+    "https://x.com/terafabXai/status/9999999999999999999",
+    { rootPost: { text: "고양이가 커튼 위에 올라간 영상" } },
+    {
+      skipCache: true,
+      persistCache: false,
+      analyzeGrok: async () => {
+        calls.push("grok");
+        throw new Error("Grok Web quota");
+      },
+      analyzeDirect: async () => {
+        calls.push("direct");
+        return {
+          contextSummary: "고양이가 커튼 레일 위에서 몸을 움직이고 배가 레일 사이로 나온 장면을 확인했다.",
+          keyPoints: ["영상 대표 프레임에서 고양이 움직임 확인"],
+          rawPreview: '{"verified_media":true}',
+          provider: "direct-codex-context",
+        };
+      },
+    },
+  );
+  assert.deepEqual(calls, ["grok", "direct"]);
+  assert.equal(result.provider, "direct-codex-context");
+});
+
+test("an uncertain X submission is recovered from the target reply conversation", async () => {
+  const targetUrl = "https://x.com/example/status/1234567890123456789";
+  const recovered = await recoverTerafabxUncertainReply(targetUrl, "확인된 답글", {
+    fetchConversation: async (url, options) => {
+      assert.equal(url, targetUrl);
+      assert.equal(options.rankingMode, "recency");
+      return {
+        tweets: [{
+          url: "https://x.com/terafabXai/status/2234567890123456789",
+          authorHandle: "terafabXai",
+          replyingToStatus: "1234567890123456789",
+          text: "확인된 답글",
+        }],
+      };
+    },
+  });
+  assert.equal(recovered.url, "https://x.com/terafabXai/status/2234567890123456789");
+});
+
+test("automatic comment mode is the full own-post reply coverage pipeline", () => {
+  assert.equal(isTerafabxOwnPostFullCoverageMode({ commentMode: "own_post_full_coverage" }), true);
+  assert.equal(isTerafabxOwnPostFullCoverageMode({ commentMode: "external_timeline" }), false);
+  assert.equal(normalizeTerafabxOwnRootStatus({
+    id: "1234567890123456789",
+    url: "https://x.com/terafabXai/status/1234567890123456789",
+    author: { screen_name: "terafabXai" },
+    replies: 7,
+    replying_to: null,
+  }).replies, 7);
+  assert.equal(normalizeTerafabxOwnRootStatus({
+    id: "2234567890123456789",
+    url: "https://x.com/terafabXai/status/2234567890123456789",
+    author: { screen_name: "terafabXai" },
+    replying_to: { status: "1234567890123456789" },
+  }), null);
+});
+
+test("full coverage discovery paginates and preserves reply-bearing roots in the backlog", async () => {
+  const now = Date.parse("2026-07-23T12:00:00.000Z");
+  const recentCreatedAt = "2026-07-22T12:00:00.000Z";
+  const cursors = [];
+  const pages = [
+    {
+      roots: [
+        { url: "https://x.com/terafabXai/status/1234567890123456789", replies: 2, createdAt: recentCreatedAt },
+        { url: "https://x.com/terafabXai/status/2234567890123456789", replies: 0, createdAt: recentCreatedAt },
+      ],
+      nextCursor: "page-2",
+      exhausted: false,
+    },
+    {
+      roots: [{ url: "https://x.com/terafabXai/status/3234567890123456789", replies: 1, createdAt: recentCreatedAt }],
+      nextCursor: "",
+      exhausted: true,
+    },
+  ];
+  const result = await discoverTerafabxOwnPostCoverageCycle({
+    ownPostCoverageCursor: "",
+    ownPostCoverageBacklog: [{ url: "https://x.com/terafabXai/status/4234567890123456789", replies: 4, createdAt: recentCreatedAt }],
+  }, {
+    now,
+    maxPages: 5,
+    fetchPage: async ({ cursor }) => {
+      cursors.push(cursor);
+      return pages[cursors.length - 1];
+    },
+  });
+  assert.deepEqual(cursors, ["", "page-2"]);
+  assert.equal(result.completedPass, true);
+  assert.equal(result.nextCursor, "");
+  assert.deepEqual(normalizeTerafabxOwnPostCoverageBacklog(result.backlog).map((item) => item.url), [
+    "https://x.com/terafabXai/status/4234567890123456789",
+    "https://x.com/terafabXai/status/1234567890123456789",
+    "https://x.com/terafabXai/status/3234567890123456789",
+  ]);
+});
+
+test("full coverage drops roots older than 72 hours and stops profile pagination at the boundary", async () => {
+  const now = Date.parse("2026-07-23T12:00:00.000Z");
+  const result = await discoverTerafabxOwnPostCoverageCycle({
+    ownPostCoverageCursor: "",
+    ownPostCoverageBacklog: [
+      { url: "https://x.com/terafabXai/status/1234567890123456789", replies: 8, createdAt: "2026-07-19T11:59:59.000Z" },
+    ],
+  }, {
+    now,
+    maxPages: 5,
+    fetchPage: async () => ({
+      roots: [
+        { url: "https://x.com/terafabXai/status/2234567890123456789", replies: 2, createdAt: "2026-07-22T12:00:00.000Z" },
+        { url: "https://x.com/terafabXai/status/3234567890123456789", replies: 3, createdAt: "2026-07-20T11:59:59.000Z" },
+      ],
+      nextCursor: "must-not-be-used",
+      exhausted: false,
+    }),
+  });
+  assert.equal(result.completedPass, true);
+  assert.equal(result.nextCursor, "");
+  assert.equal(result.pageCount, 1);
+  assert.deepEqual(result.backlog.map((item) => item.url), [
+    "https://x.com/terafabXai/status/2234567890123456789",
+  ]);
+});
+
+test("full coverage prioritizes the newest root before estimated unanswered volume and prefetches contexts in parallel", async () => {
+  const roots = [
+    { url: "https://x.com/terafabXai/status/1234567890123456789", replies: 10, createdAt: "2026-07-22T12:00:00.000Z" },
+    { url: "https://x.com/terafabXai/status/2234567890123456789", replies: 6, createdAt: "2026-07-23T12:00:00.000Z" },
+  ];
+  const ranked = rankTerafabxOwnPostCoverageBacklog(roots, {
+    ownPostReplyHistory: Array.from({ length: 8 }, (_, index) => ({
+      rootPostUrl: roots[0].url,
+      targetUrl: `https://x.com/replier/status/${3234567890123456789n + BigInt(index)}`,
+      replyUrl: `https://x.com/terafabXai/status/${4234567890123456789n + BigInt(index)}`,
+    })),
+  });
+  assert.equal(ranked[0].url, roots[1].url);
+  let active = 0;
+  let maxActive = 0;
+  const prefetched = await prefetchTerafabxOwnPostCoverageContexts(roots, {
+    concurrency: 2,
+    persist: false,
+    collectConversation: async (url) => ({
+      candidates: [{ id: parseInt(url.slice(-4), 10) }],
+      rootPost: { text: "원글" },
+    }),
+    analyzeContext: async (url) => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      active -= 1;
+      return {
+        contextSummary: `${url} 원글의 텍스트와 첨부 미디어 문맥을 충분히 확인한 결과입니다.`,
+        keyPoints: ["미디어 장면 확인"],
+        rawPreview: '{"verified_media":true}',
+        provider: "direct-codex-context",
+      };
+    },
+  });
+  assert.equal(prefetched.filter((item) => item.ok).length, 2);
+  assert.equal(maxActive, 2);
+});
+
+test("full coverage revisits the stalest checked root so recent roots cannot starve the three-day backlog", () => {
+  const older = { url: "https://x.com/terafabXai/status/2080000000000000001", replies: 5, createdAt: "2026-07-22T12:00:00.000Z" };
+  const newer = { url: "https://x.com/terafabXai/status/2081000000000000001", replies: 5, createdAt: "2026-07-23T12:00:00.000Z" };
+  const neverChecked = { url: "https://x.com/terafabXai/status/2082000000000000001", replies: 1, createdAt: "2026-07-24T12:00:00.000Z" };
+  const ranked = rankTerafabxOwnPostCoverageBacklog([newer, older, neverChecked], {
+    ownPostReplyCoverage: {
+      [older.url]: { checkedAt: "2026-07-25T00:00:00.000Z" },
+      [newer.url]: { checkedAt: "2026-07-25T01:00:00.000Z" },
+    },
+  });
+  assert.deepEqual(ranked.map((item) => item.url), [
+    neverChecked.url,
+    older.url,
+    newer.url,
+  ]);
+});
+
+test("coverage workers stay globally capped while following the candidate distribution", () => {
+  const concentrated = allocateTerafabxOwnPostReplyWorkers([
+    { snapshot: { candidates: Array.from({ length: 20 }) } },
+    { snapshot: { candidates: [] } },
+  ], 5);
+  assert.deepEqual(concentrated.map((item) => item.concurrency), [5, 0]);
+
+  const split = allocateTerafabxOwnPostReplyWorkers([
+    { snapshot: { candidates: Array.from({ length: 20 }) } },
+    { snapshot: { candidates: Array.from({ length: 4 }) } },
+    { snapshot: { candidates: [{ id: 1 }] } },
+  ], 5);
+  assert.equal(split.reduce((sum, item) => sum + item.concurrency, 0), 5);
+  assert.deepEqual(split.map((item) => item.concurrency), [3, 1, 1]);
+  assert.deepEqual(split.map((item) => item.workerOffset), [0, 3, 4]);
+});
+
+test("global pull queue keeps five workers busy and lets each free worker take the next comment", async () => {
+  let active = 0;
+  let maxActive = 0;
+  const workersSeen = new Set();
+  const completed = [];
+  const pool = createPullTaskPool(5);
+  const tasks = Array.from({ length: 20 }, (_, item) => pool.enqueue(async (workerIndex) => {
+    workersSeen.add(workerIndex);
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    await new Promise((resolve) => setTimeout(resolve, item < 5 ? 8 : 1));
+    completed.push(item);
+    active -= 1;
+    return item;
+  }));
+
+  assert.deepEqual(await Promise.all(tasks), Array.from({ length: 20 }, (_, index) => index));
+  assert.equal(maxActive, 5);
+  assert.equal(workersSeen.size, 5);
+  assert.equal(completed.length, 20);
+  assert.equal(pool.stats.workerCount, 5);
+  assert.equal(pool.stats.completed, 20);
+  assert.equal(pool.stats.depth, 0);
+  assert.equal(pool.stats.active, 0);
+
+  assert.equal(await pool.enqueue(async () => "picked-immediately"), "picked-immediately");
+  assert.equal(pool.stats.completed, 21);
+});
+
+test("approved own-post replies remain intact in the unlimited durable X write queue", () => {
+  const rows = Array.from({ length: 40 }, (_, index) => ({
+    id: `write-${index}`,
+    targetUrl: `https://x.com/person${index}/status/${2081000000000000000n + BigInt(index)}`,
+    rootUrl: "https://x.com/terafabXai/status/2080000000000000000",
+    status: "queued",
+    queuedAt: new Date(1_000 + index).toISOString(),
+    prepared: { comment: `승인 초안 ${index}` },
+    target: { url: `https://x.com/person${index}/status/${2081000000000000000n + BigInt(index)}` },
+  }));
+  rows.push({
+    ...rows[0],
+    status: "queued",
+    retryAt: "2026-07-27T02:45:00.000Z",
+    lastError: "X 계정 검증 사용량 제한 HTTP 429 code 1003",
+  });
+
+  const normalized = normalizeTerafabxOwnPostReplyWriteQueue(rows);
+  assert.equal(normalized.length, 40);
+  const retried = normalized.find((item) => item.targetUrl === rows[0].targetUrl);
+  assert.equal(retried.prepared.comment, "승인 초안 0");
+  assert.equal(retried.retryAt, "2026-07-27T02:45:00.000Z");
+  assert.match(retried.lastError, /429 code 1003/);
+});
+
+test("posted-row reply completion deduplicates target history and maps the matching X root", () => {
+  const rootUrl = "https://x.com/terafabXai/status/2080548541588795858";
+  const targetA = "https://x.com/alice/status/2080548541588795859";
+  const targetB = "https://x.com/bob/status/2080548541588795860";
+  const state = {
+    commentHistory: [
+      { rootPostUrl: rootUrl, rootPostText: "토끼가 수영한다는 사실", targetUrl: targetA, replyUrl: "https://x.com/terafabXai/status/1" },
+      { rootPostUrl: rootUrl, rootPostText: "토끼가 수영한다는 사실", targetUrl: targetB, replyUrl: "https://x.com/terafabXai/status/2" },
+    ],
+    ownPostReplyHistory: [
+      { rootPostUrl: rootUrl, rootPostText: "토끼가 수영한다는 사실", targetUrl: targetA, replyUrl: "https://x.com/terafabXai/status/1" },
+    ],
+    ownPostCoverageBacklog: [{ url: rootUrl, replies: 10, createdAt: "2026-07-24T07:00:01.000Z" }],
+    ownPostReplyCoverage: {
+      [rootUrl]: {
+        rootPostText: "토끼가 수영한다는 사실",
+        checkedAt: "2026-07-25T00:00:00.000Z",
+        fullScan: true,
+        remainingEligibleCount: 1,
+        totalEligibleCount: 3,
+        directReplyCount: 3,
+        rawReplyCount: 10,
+      },
+    },
+  };
+  const metric = buildTerafabxOwnPostReplyCompletionMetrics(state).get(rootUrl);
+  assert.equal(metric.completedCount, 2);
+  assert.equal(metric.totalCount, 3);
+  assert.equal(metric.percentage, 66.7);
+  assert.equal(metric.exact, true);
+
+  const [row] = enrichDiscoveryRowsWithReplyCompletion([{
+    canonicalUrl: "https://www.threads.com/@example/post/abc",
+    textPreview: "토끼가\n수영한다는 사실",
+    status: "posted",
+    postedAt: "2026-07-24T07:00:00.000Z",
+  }], state);
+  assert.equal(row.xPostUrl, rootUrl);
+  assert.equal(row.replyCompletion.percentage, 66.7);
+});
+
+test("reply-count refresh selects never-checked and stalest posted roots first", () => {
+  const now = Date.parse("2026-07-26T12:00:00.000Z");
+  const neverChecked = xStatusUrlAt(now - 2 * 60 * 60 * 1000, 1n);
+  const stale = xStatusUrlAt(now - 24 * 60 * 60 * 1000, 2n);
+  const fresh = xStatusUrlAt(now - 60 * 60 * 1000, 3n);
+  const olderThanThreeDays = xStatusUrlAt(now - (3 * 24 * 60 * 60 * 1000) - 1, 4n);
+  const targets = selectTerafabxReplyCountRefreshTargets({
+    ownPostReplyCoverage: {
+      [stale]: {
+        checkedAt: "2026-07-26T08:00:00.000Z",
+        countRefreshCheckedAt: "2026-07-26T09:00:00.000Z",
+      },
+      [fresh]: {
+        checkedAt: "2026-07-26T08:00:00.000Z",
+        countRefreshCheckedAt: "2026-07-26T11:55:00.000Z",
+      },
+      [olderThanThreeDays]: {
+        checkedAt: "2026-07-20T08:00:00.000Z",
+      },
+    },
+  }, [{
+    status: "posted",
+    postUrl: neverChecked,
+  }], {
+    now,
+    staleMs: 15 * 60 * 1000,
+    limit: 10,
+  });
+  assert.deepEqual(targets.map((item) => item.url), [neverChecked, stale]);
+  assert.equal(targets.some((item) => item.url === olderThanThreeDays), false);
+});
+
+test("scheduled reply-count refresh persists complete conversations and preserves failed snapshots", async () => {
+  const now = Date.parse("2026-07-26T12:00:00.000Z");
+  const successRoot = xStatusUrlAt(now - 2 * 60 * 60 * 1000, 1n);
+  const failedRoot = xStatusUrlAt(now - 24 * 60 * 60 * 1000, 2n);
+  let state = {
+    commentHistory: [],
+    ownPostReplyHistory: [],
+    ownPostCoverageBacklog: [],
+    ownPostReplyCoverage: {
+      [successRoot]: {
+        checkedAt: "2026-07-25T00:00:00.000Z",
+        totalEligibleCount: 1,
+      },
+      [failedRoot]: {
+        checkedAt: "2026-07-25T00:00:00.000Z",
+        totalEligibleCount: 7,
+        rootPostText: "기존 스냅샷",
+      },
+    },
+  };
+  const result = await runTerafabxReplyCountRefresh({
+    now,
+    staleMs: 0,
+    limit: 10,
+    concurrency: 2,
+    historyEntries: [],
+    loadState: () => state,
+    saveState: (patch) => {
+      state = { ...state, ...patch };
+      return state;
+    },
+    collectConversation: async (url) => {
+      if (url === failedRoot) throw new Error("temporary API failure");
+      return {
+        postUrl: successRoot,
+        rootPost: { url: successRoot, text: "새 원글", replyCount: 4 },
+        rows: [],
+        directReplies: [{}, {}, {}, {}],
+        alreadyReplied: [{ url: "https://x.com/alice/status/1" }],
+        candidates: [{ url: "https://x.com/bob/status/2" }, { url: "https://x.com/carol/status/3" }],
+        collectionSource: "fxtwitter-v2-conversation",
+        partial: false,
+        truncated: false,
+      };
+    },
+  });
+  assert.equal(result.updatedCount, 1);
+  assert.equal(result.failedCount, 1);
+  assert.equal(state.ownPostReplyCoverage[successRoot].totalEligibleCount, 3);
+  assert.equal(state.ownPostReplyCoverage[successRoot].countRefreshScheduled, true);
+  assert.equal(state.ownPostReplyCoverage[successRoot].countRefreshCheckedAt, "2026-07-26T12:00:00.000Z");
+  assert.equal(state.ownPostReplyCoverage[failedRoot].totalEligibleCount, 7);
+  assert.equal(state.ownPostReplyCoverage[failedRoot].rootPostText, "기존 스냅샷");
+  const successMetric = buildTerafabxOwnPostReplyCompletionMetrics(state).get(successRoot);
+  assert.equal(successMetric.totalCount, 3);
+  assert.equal(successMetric.scheduled, true);
+  assert.equal(successMetric.source, "scheduled-full-conversation");
+});
+
+test("own-post manual batch completes cleanly when the root reply cap is already reached", () => {
+  assert.equal(terafabxOwnPostReplyRootCapCompletion({ allowed: true, limit: 2, used: 1 }), null);
+  assert.deepEqual(
+    terafabxOwnPostReplyRootCapCompletion({ allowed: false, limit: 2, used: 2 }, "2026-07-23T00:00:00.000Z"),
+    {
+      status: "completed",
+      stage: "completed",
+      stageLabel: "완료 · 게시글당 2건 제한",
+      completedAt: "2026-07-23T00:00:00.000Z",
+      candidateCount: 0,
+      preparedCount: 0,
+      reviewedCount: 0,
+      postedCount: 0,
+      rejectedCount: 0,
+      error: null,
+    },
+  );
+});
+
+test("manual batch queue preserves root-cap and verification-scope overrides", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "mirror_server.js"), "utf8");
+  const enqueueBlock = source.slice(
+    source.indexOf("function enqueueTerafabxOwnPostReplyBatch"),
+    source.indexOf("function updateTerafabxOwnPostReplyQueueItem"),
+  );
+  const runnerBlock = source.slice(
+    source.indexOf("async function runNextTerafabxOwnPostReplyManualQueueItem"),
+    source.indexOf("async function runTerafabxOwnPostReplyAllMonitored"),
+  );
+  assert.match(enqueueBlock, /ignoreRootCap: options\.ignoreRootCap === true/);
+  assert.match(enqueueBlock, /verifiedOnly: options\.verifiedOnly !== false/);
+  assert.match(enqueueBlock, /deepScan: options\.deepScan === true/);
+  assert.match(enqueueBlock, /candidateUrls: Array\.from\(new Set/);
+  assert.match(runnerBlock, /ignoreRootCap: item\.options\?\.ignoreRootCap === true/);
+  assert.match(runnerBlock, /verifiedOnly: item\.options\?\.verifiedOnly !== false/);
+  assert.match(runnerBlock, /deepScan: item\.options\?\.deepScan === true/);
+  assert.match(runnerBlock, /candidateUrls: item\.options\?\.candidateUrls \|\| \[\]/);
+});
+
+test("deep own-post discovery fails closed on a blank X page", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "mirror_server.js"), "utf8");
+  assert.match(source, /X 깊은 댓글 순회가 빈 화면을 반환했습니다\. 0건 완료로 처리하지 않습니다\./);
+});
+
+test("automatic full coverage uses one five-worker global pull queue and never launches X catch-up", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "mirror_server.js"), "utf8");
+  const cycle = source.slice(
+    source.indexOf("async function runTerafabxOwnPostFullCoverageCycle"),
+    source.indexOf("function terafabxOwnPostHeartTargets"),
+  );
+  assert.match(cycle, /apiFirst: true/);
+  assert.match(cycle, /apiOnly: true/);
+  assert.match(cycle, /fullScan: false/);
+  assert.match(cycle, /xCatchupRequestedCount: 0/);
+  assert.match(cycle, /xCatchupRemoved: true/);
+  assert.match(cycle, /selectTerafabxOwnPostCoveragePhase/);
+  assert.match(cycle, /createPullTaskPool\(globalGeminiWorkerCount/);
+  assert.match(cycle, /producerPool: globalProducerPool/);
+  assert.match(cycle, /scheduling: "global_pull_queue"/);
+  assert.doesNotMatch(cycle, /allocation\.concurrency <= 0/);
+  assert.doesNotMatch(cycle, /skipped: "deferred_worker_capacity"/);
+  assert.match(cycle, /Promise\.all\(contextualized\.map/);
+  assert.match(cycle, /discoverySnapshot: entry\.snapshot/);
+  assert.match(cycle, /reconcileTerafabxOwnPostReplyCoverageSnapshot\(entry\.snapshot, batch\)/);
+  assert.doesNotMatch(cycle, /xResourceKind: "ownScan"/);
+  assert.doesNotMatch(cycle, /ensureTerafabxIsolatedXBrowser\("ownScan"\)/);
+  assert.doesNotMatch(cycle, /scanPhase: "x_catchup"/);
+  assert.doesNotMatch(cycle, /directScan/);
+  assert.doesNotMatch(cycle, /const recheck = await collectConversation/);
+});
+
+test("coverage phase selection migrates legacy X catch-up rows to API-only collection", () => {
+  const roots = [
+    { url: "https://x.com/terafabXai/status/2081000000000000001", replies: 10, scanPhase: "x_catchup" },
+    { url: "https://x.com/terafabXai/status/2080000000000000001", replies: 1, scanPhase: "api" },
+  ];
+  const apiPlan = selectTerafabxOwnPostCoveragePhase(roots, {}, 5);
+  assert.equal(apiPlan.collectionPhase, "api");
+  assert.equal(apiPlan.roots.length, 2);
+  assert.ok(apiPlan.roots.every((root) => root.scanPhase === "api"));
+  assert.equal(apiPlan.apiPendingCount, 2);
+  assert.equal(apiPlan.xCatchupPendingCount, 0);
+});
 
 test("X home readiness accepts usable articles even when an error banner is present", () => {
   assert.equal(xPageReadyState({ bodyText: "", articleCount: 0 }, "home").ready, false);
@@ -118,6 +650,56 @@ test("FxTwitter v2 conversation rows preserve direct and nested reply relationsh
   assert.equal(rows[0].authorVerified, true);
   assert.equal(rows[1].replyingToStatus, "101");
   assert.equal(rows[1].text, "그러게요");
+});
+
+test("FxEmbed conversation pagination survives one empty page and deduplicates reply ids", async () => {
+  const requests = [];
+  const pages = [
+    {
+      code: 200,
+      status: {
+        id: "100",
+        url: "https://x.com/terafabXai/status/100",
+        text: "원글",
+        author: { screen_name: "terafabXai" },
+      },
+      replies: [{ id: "101", url: "https://x.com/alice/status/101", author: { screen_name: "alice" } }],
+      cursor: { bottom: "cursor-1" },
+    },
+    {
+      code: 200,
+      status: { id: "100" },
+      replies: [{ id: "101", url: "https://x.com/alice/status/101", author: { screen_name: "alice" } }],
+      cursor: { bottom: "cursor-2" },
+    },
+    {
+      code: 200,
+      status: { id: "100" },
+      replies: [{ id: "102", url: "https://x.com/bob/status/102", author: { screen_name: "bob" } }],
+      cursor: {},
+    },
+  ];
+  const result = await fetchFxTwitterConversation(
+    "https://x.com/terafabXai/status/100",
+    {
+      rankingMode: "likes",
+      excludeAuthor: true,
+      maxPages: 30,
+      fetchJson: async (url) => {
+        requests.push(new URL(url));
+        return pages.shift();
+      },
+    },
+  );
+  assert.equal(result.pageCount, 3);
+  assert.equal(result.collectedReplyCount, 2);
+  assert.equal(result.partial, false);
+  assert.equal(result.truncated, false);
+  assert.deepEqual(result.tweets.slice(1).map((item) => item.id), ["101", "102"]);
+  assert.equal(requests[0].searchParams.get("ranking_mode"), "likes");
+  assert.equal(requests[0].searchParams.get("exclude_author"), "true");
+  assert.equal(requests[1].searchParams.get("cursor"), "cursor-1");
+  assert.equal(requests[2].searchParams.get("cursor"), "cursor-2");
 });
 
 test("manual own-post reply queue survives restart and resolves the latest item per post", () => {
@@ -243,7 +825,7 @@ test("verified image-only direct replies use the fixed heart emoji rule", () => 
   });
   assert.throws(
     () => buildTerafabxFixedImageReplyRecord(target, { manual: true, source: "own_post_reply" }),
-    /Grok 상세 문맥 분석 성공 기록/,
+    /검증된 상세 문맥 분석 성공 기록/,
   );
   const record = buildTerafabxFixedImageReplyRecord(target, {
     manual: true,
@@ -259,6 +841,62 @@ test("verified image-only direct replies use the fixed heart emoji rule", () => 
   assert.equal(record.comment, "❤️");
   assert.equal(record.generator, "web-context+fixed-image-only-emoji");
   assert.equal(record.geminiReview.decision, "fixed_image_only_emoji");
+});
+
+test("GIF-only direct replies use the fixed heart emoji without Gemini review", () => {
+  const gifReply = {
+    id: "120",
+    url: "https://x.com/verified/status/120",
+    authorHandle: "verified",
+    authorVerified: true,
+    text: "",
+    imageCount: 0,
+    videoCount: 1,
+    gifCount: 1,
+    replyingToStatus: "100",
+  };
+  const result = classifyTerafabxOwnPostReplies({
+    rootUrl,
+    requiredHandle: "terafabXai",
+    verifiedOnly: false,
+    tweets: [gifReply],
+  });
+  assert.deepEqual(result.candidates.map((item) => item.id), ["120"]);
+  assert.equal(isTerafabxGifOnlyReply(result.candidates[0]), true);
+
+  const target = buildTerafabxOwnPostReplyTarget(result.candidates[0], {
+    postUrl: rootUrl,
+    rootPost: { url: rootUrl, text: "봉 사이에 낀 고양이" },
+  });
+  const record = buildTerafabxFixedImageReplyRecord(target, {
+    manual: true,
+    source: "own_post_reply",
+    grokContext: {
+      contextSummary: "Grok이 부모 원글과 GIF 댓글의 관계를 확인했다.",
+      keyPoints: ["고양이 장면에 대한 GIF 반응"],
+      rawPreview: '{"context_summary":"ok","key_points":["gif"]}',
+      provider: "web-context",
+    },
+  });
+  assert.equal(target.gifOnly, true);
+  assert.equal(record.comment, "❤️");
+  assert.equal(record.generator, "web-context+fixed-gif-only-emoji");
+  assert.equal(record.geminiReview.decision, "fixed_gif_only_emoji");
+});
+
+test("a genuine own-post reaction is not spam only because the author profile is promotional", () => {
+  assert.equal(isTerafabxOwnPostSpamReply({
+    text: "ㅋㅋㅋㅋ치명적",
+    authorDescription: "#선팔 #맞팔 언제든 환영",
+  }), false);
+  assert.equal(isTerafabxOwnPostSpamReply({
+    text: "(^_^)",
+    authorDescription: "telegram.me/example",
+  }), true);
+  assert.equal(isTerafabxOwnPostSpamReply({
+    text: "지금 구매는 링크로 문의해 주세요",
+    authorDescription: "",
+  }), true);
 });
 
 test("missing own-post reply targets are skippable without stopping the batch", () => {
@@ -327,6 +965,16 @@ test("Grok context draft becomes the candidate that Gemini reviews", () => {
   assert.equal(result.prepared.grokComment, result.prepared.comment);
   assert.match(result.prepared.generator, /grok-draft/);
   assert.equal(result.prepared.geminiReview.decision, "pending_gemini_review");
+});
+
+test("Gemini generated reply overrides the empty reply field in shared Grok context", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "mirror_server.js"), "utf8");
+  const block = source.slice(
+    source.indexOf("async function generateTerafabxReplyWithGeminiFallback"),
+    source.indexOf("async function generateTerafabxReplyWithGrok"),
+  );
+  assert.match(block, /\{ \.\.\.context, \.\.\.parseTerafabxGeminiGeneratedReply\(raw\) \}/);
+  assert.doesNotMatch(block, /\{ \.\.\.parseTerafabxGeminiGeneratedReply\(raw\), \.\.\.context \}/);
 });
 
 test("own-post reply generation fails closed without parent post text", () => {
@@ -433,8 +1081,46 @@ test("own-post batch Gemini review keeps rewrite separate from independent scori
   assert.match(judgePrompt, /독립 묶음 최종 심사자/);
   assert.match(judgePrompt, /context 0~40/);
   assert.match(judgePrompt, /unsupported_claim/);
+  assert.match(judgePrompt, /semantic_role_error/);
+  assert.match(judgePrompt, /direct_response_error/);
+  assert.match(judgePrompt, /logical_leap_error/);
+  assert.match(judgePrompt, /출력 설정 오류 마스크/);
+  assert.match(judgePrompt, /댓글의 모든 내용어/);
   assert.match(judgePrompt, /상담 기록 같은 격식체 추측 공감/);
-  assert.match(judgePrompt, /최종 심사 대상 댓글: 진짜 있으면 한번 신어보고 싶네요/);
+  assert.match(judgePrompt, /원래 Gemini 후보: 진짜 있으면 한번 신어보고 싶네요/);
+  assert.match(judgePrompt, /검수 재작성 후보: 진짜 있으면 한번 신어보고 싶네요/);
+  assert.match(judgePrompt, /preferred_variant/);
+});
+
+test("own-post batch quality repair preserves candidate metadata for posting history", () => {
+  const original = {
+    ok: false,
+    candidate: { authorHandle: "verified_fan" },
+    target: { url: "https://x.com/verified_fan/status/120" },
+    prepared: { comment: "old" },
+  };
+  const repaired = {
+    ok: true,
+    target: { url: "https://x.com/verified_fan/status/120" },
+    prepared: { comment: "repaired" },
+  };
+  const merged = mergeTerafabxRepairedBatchResult(original, repaired);
+  assert.equal(merged.candidate.authorHandle, "verified_fan");
+  assert.equal(merged.prepared.comment, "repaired");
+});
+
+test("own-post root Grok context is reused by status id across retries", () => {
+  const context = {
+    contextSummary: "주황 고양이가 높은 빨래건조대 봉 사이에 올라갔다가 몸과 뱃살이 끼인 장면이다.",
+    keyPoints: ["고양이", "봉 사이", "가벼운 유머"],
+    provider: "web-context",
+  };
+  const cached = cachedTerafabxOwnPostRootContext({
+    ownPostRootContextCache: {
+      "2079562035264892947": { context },
+    },
+  }, "https://x.com/terafabXai/status/2079562035264892947");
+  assert.deepEqual(cached, context);
 });
 
 test("comment prefill batches generation and rewrite without self scoring", () => {
@@ -459,7 +1145,7 @@ test("own-post batch Gemini JSON parsing preserves review and final judge gates"
   assert.equal(reviewed[0].finalReply, "물 위를 걷는 느낌이라 더 신기하네요");
   assert.equal(reviewed[0].decision, "rewrite");
 
-  const judged = parseTerafabxGeminiBatchFinalJudge('[{"index":0,"context":38,"naturalness":24,"specificity":14,"concision":9,"non_ai_style":9,"fatal_error":false,"language_error":false,"awkward_korean":false,"translation_tone":false,"cliche":false,"context_error":false,"unsupported_claim":false,"cross_post_reusable":false,"headline_tone":false,"specificity_error":false,"source_anchor":"물 위를 걷는","reason":"문맥과 자연스러움이 좋음"}]', [{ finalReply: reviewed[0].finalReply, target: { targetText: "물 위를 걷는 장면" } }]);
+  const judged = parseTerafabxGeminiBatchFinalJudge('[{"index":0,"context":38,"naturalness":24,"specificity":14,"concision":9,"non_ai_style":9,"fatal_error":false,"language_error":false,"awkward_korean":false,"translation_tone":false,"cliche":false,"context_error":false,"unsupported_claim":false,"cross_post_reusable":false,"headline_tone":false,"specificity_error":false,"semantic_role_error":false,"direct_response_error":false,"logical_leap_error":false,"source_anchor":"물 위를 걷는","reason":"문맥과 자연스러움이 좋음"}]', [{ finalReply: reviewed[0].finalReply, target: { targetText: "물 위를 걷는 장면" } }]);
   assert.equal(judged[0].score, 94);
   assert.equal(judged[0].passed, true);
 
@@ -467,6 +1153,64 @@ test("own-post batch Gemini JSON parsing preserves review and final judge gates"
     () => parseTerafabxGeminiBatchReview('[{"index":1,"final_reply":"좋네요","decision":"keep"}]', [0]),
     /index 오류|결과 누락/,
   );
+});
+
+test("review regression guard restores the cleaner Gemini candidate", () => {
+  const selected = selectTerafabxReviewCandidate({
+    target: {
+      targetText: "나올 때 입 모양이 너무 귀엽다",
+      rootPostText: "문틈에서 얼굴을 내미는 고양이",
+    },
+    prepared: {
+      comment: "문틈에서 얼굴 내미는 순간이 귀엽네",
+    },
+  }, {
+    decision: "rewrite",
+    finalReply: "나올 때 표정 진짜 뾰족하네",
+  });
+
+  assert.equal(selected.regressionPrevented, true);
+  assert.equal(selected.preselectedVariant, "original");
+  assert.equal(selected.finalReply, "문틈에서 얼굴 내미는 순간이 귀엽네");
+  assert.ok(selected.reviewedIssues.includes("language:unnatural_geometric_expression_collocation"));
+});
+
+test("batch final judge can prefer the original candidate over a worse rewrite", () => {
+  const judged = parseTerafabxGeminiBatchFinalJudge(JSON.stringify([{
+    index: 0,
+    preferred_variant: "original",
+    context: 40,
+    naturalness: 25,
+    specificity: 15,
+    concision: 10,
+    non_ai_style: 10,
+    fatal_error: false,
+    language_error: false,
+    awkward_korean: false,
+    translation_tone: false,
+    cliche: false,
+    context_error: false,
+    unsupported_claim: false,
+    cross_post_reusable: false,
+    headline_tone: false,
+    specificity_error: false,
+    semantic_role_error: false,
+    direct_response_error: false,
+    logical_leap_error: false,
+    source_anchor: "문틈",
+    reason: "원래 후보가 더 자연스럽다",
+  }]), [{
+    originalReply: "문틈에서 얼굴 내미는 순간이 귀엽네",
+    reviewedReply: "나올 때 표정 진짜 뾰족하네",
+    target: {
+      targetText: "나올 때 입 모양이 너무 귀엽다",
+      rootPostText: "문틈에서 얼굴을 내미는 고양이",
+    },
+  }]);
+
+  assert.equal(judged[0].preferredVariant, "original");
+  assert.equal(judged[0].finalReply, "문틈에서 얼굴 내미는 순간이 귀엽네");
+  assert.equal(judged[0].passed, true);
 });
 
 test("one invalid Gemini batch reply is isolated without rejecting valid siblings", () => {
@@ -481,10 +1225,74 @@ test("one invalid Gemini batch reply is isolated without rejecting valid sibling
 });
 
 test("Gemini batch JSON repairs unescaped quotation marks inside string values", () => {
-  const judged = parseTerafabxGeminiBatchFinalJudge('[{"index":0,"context":40,"naturalness":25,"specificity":15,"concision":10,"non_ai_style":10,"fatal_error":false,"language_error":false,"awkward_korean":false,"translation_tone":false,"cliche":false,"context_error":false,"unsupported_claim":false,"cross_post_reusable":false,"headline_tone":false,"specificity_error":false,"source_anchor":"인수 제안 "불충분" 판단","reason":"문맥에 맞음"}]', [{ finalReply: "인수 제안이 부족하다고 본 모양이네요", target: { targetText: '인수 제안 "불충분" 판단' } }]);
+  const judged = parseTerafabxGeminiBatchFinalJudge('[{"index":0,"context":40,"naturalness":25,"specificity":15,"concision":10,"non_ai_style":10,"fatal_error":false,"language_error":false,"awkward_korean":false,"translation_tone":false,"cliche":false,"context_error":false,"unsupported_claim":false,"cross_post_reusable":false,"headline_tone":false,"specificity_error":false,"semantic_role_error":false,"direct_response_error":false,"logical_leap_error":false,"source_anchor":"인수 제안 "불충분" 판단","reason":"문맥에 맞음"}]', [{ finalReply: "인수 제안이 부족하다고 본 모양이네요", target: { targetText: '인수 제안 "불충분" 판단' } }]);
 
   assert.equal(judged[0].sourceAnchor, '인수 제안 "불충분" 판단');
   assert.equal(judged[0].passed, true);
+});
+
+test("semantic role inversion is a fail-closed final-judge error", () => {
+  const judged = parseTerafabxGeminiBatchFinalJudge(JSON.stringify([{
+    index: 0,
+    context: 20,
+    naturalness: 20,
+    specificity: 10,
+    concision: 10,
+    non_ai_style: 10,
+    fatal_error: false,
+    language_error: false,
+    awkward_korean: false,
+    translation_tone: false,
+    cliche: false,
+    context_error: false,
+    unsupported_claim: false,
+    cross_post_reusable: false,
+    headline_tone: false,
+    specificity_error: false,
+    semantic_role_error: true,
+    direct_response_error: true,
+    logical_leap_error: true,
+    source_anchor: "앵무새가 기본적으로 온도가 높은가",
+    reason: "체온이 높은 동물을 체온계라는 측정 도구처럼 취급함",
+  }]), [{
+    finalReply: "체온계 대신 품고 출근해야겠네",
+    target: {
+      rootPostText: "ㅋㅋㅋㅋ 앵무생을 키우자 회사원들은",
+      targetText: "와우 앵무새가 기본적으로 온도가 높은가 보군요?~",
+    },
+  }]);
+
+  assert.equal(judged[0].passed, false);
+  assert.deepEqual(judged[0].flaggedQualityIssues, [
+    "semantic_role_error",
+    "direct_response_error",
+    "logical_leap_error",
+  ]);
+});
+
+test("persisted automation history drops duplicated raw AI payloads but keeps quality decisions", () => {
+  const compacted = compactTerafabxStateForStorage({
+    commentHistory: [{
+      comment: "구체적인 댓글",
+      grokContext: { summary: "문맥", rawPreview: "large-grok-raw" },
+      geminiReview: {
+        score: 95,
+        finalJudge: {
+          score: 95,
+          passed: true,
+          qualityFlags: { semantic_role_error: false },
+          rawPreview: "large-judge-raw",
+          raw: { repeated: "batch-payload" },
+        },
+      },
+    }],
+  });
+
+  assert.equal(compacted.commentHistory[0].grokContext.rawPreview, undefined);
+  assert.equal(compacted.commentHistory[0].geminiReview.finalJudge.rawPreview, undefined);
+  assert.equal(compacted.commentHistory[0].geminiReview.finalJudge.raw, undefined);
+  assert.equal(compacted.commentHistory[0].geminiReview.finalJudge.score, 95);
+  assert.equal(compacted.commentHistory[0].geminiReview.finalJudge.passed, true);
 });
 
 test("reply permalink targeting matches only the exact status article", () => {
@@ -527,10 +1335,110 @@ test("reply verification requires the exact parent status relationship", () => {
   }, targetUrl).ok, false);
 });
 
+test("API fallback finds an own reply by exact parent and text", () => {
+  const targetUrl = "https://x.com/source/status/321";
+  const result = findTerafabxOwnReplyToTarget([
+    {
+      id: "900",
+      url: "https://x.com/terafabXai/status/900",
+      authorHandle: "terafabXai",
+      replyingToStatus: "321",
+      text: "❤️",
+    },
+    {
+      id: "901",
+      url: "https://x.com/terafabXai/status/901",
+      authorHandle: "terafabXai",
+      replyingToStatus: "999",
+      text: "❤️",
+    },
+  ], targetUrl, "❤️");
+  assert.equal(result.id, "900");
+  assert.equal(findTerafabxOwnReplyToTarget([], targetUrl, "❤️"), null);
+});
+
 test("own-post batch delay is an inclusive 10 to 20 second random interval", () => {
   assert.equal(randomTerafabxOwnPostReplyDelayMs(() => 0), 10_000);
   assert.equal(randomTerafabxOwnPostReplyDelayMs(() => 0.999999999), 20_000);
   assert.equal(randomTerafabxOwnPostReplyDelayMs(() => 0.5), 15_000);
+});
+
+test("automatic full coverage has no artificial writer delay", () => {
+  assert.equal(terafabxOwnPostReplyWriterDesiredGapMs({
+    manual: false,
+    source: "own_post_full_coverage",
+    random: () => 0.5,
+  }), 0);
+  assert.equal(terafabxOwnPostReplyWriterDelayMs({
+    lastCompletedAtMs: 31_000,
+    desiredGapMs: 0,
+    nowMs: 31_001,
+  }), 0);
+  assert.equal(terafabxOwnPostReplyWriterDesiredGapMs({
+    manual: true,
+    source: "own_post_full_coverage",
+    random: () => 0.5,
+    minDelayMs: 10_000,
+    maxDelayMs: 20_000,
+  }), 15_000);
+});
+
+test("parallel Gemini producers feed exactly one failure-isolated X writer", async () => {
+  const writerQueue = createSerialTaskQueue();
+  const writerTasks = [];
+  const produced = [];
+  const written = [];
+  let activeProducers = 0;
+  let maxActiveProducers = 0;
+  let activeWriters = 0;
+  let maxActiveWriters = 0;
+
+  await runFixedWorkerPipeline(
+    Array.from({ length: 10 }, (_, index) => index),
+    5,
+    async (item) => {
+      activeProducers += 1;
+      maxActiveProducers = Math.max(maxActiveProducers, activeProducers);
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      activeProducers -= 1;
+      return item;
+    },
+    (item) => {
+      produced.push(item);
+      writerTasks.push(writerQueue.enqueue(async () => {
+        activeWriters += 1;
+        maxActiveWriters = Math.max(maxActiveWriters, activeWriters);
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        written.push(item);
+        activeWriters -= 1;
+        if (item === 4) throw new Error("isolated writer failure");
+      }).catch(() => null));
+    },
+  );
+
+  assert.equal(maxActiveProducers, 5);
+  assert.equal(produced.length, 10);
+  await Promise.all(writerTasks);
+  assert.equal(maxActiveWriters, 1);
+  assert.deepEqual(written, produced);
+  assert.equal(writerQueue.depth, 0);
+});
+
+test("own-post reply pipeline performs Gemini review in parallel workers and queues only X writes", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "mirror_server.js"), "utf8");
+  const batch = source.slice(
+    source.indexOf("async function runTerafabxOwnPostReplyBatch"),
+    source.indexOf("async function runNextTerafabxOwnPostReplyManualQueueItem"),
+  );
+  assert.match(batch, /runFixedWorkerPipeline\(candidates, workerCount, prepareCandidate, enqueuePreparedForX\)/);
+  assert.match(batch, /deferGeminiReview: false/);
+  assert.match(batch, /enqueueTerafabxOwnPostReplyWriteRecord\(durableRecord/);
+  assert.match(batch, /durableQueueDepth/);
+  assert.match(batch, /xWriterConcurrency: 1/);
+  assert.match(batch, /geminiWorkersRemainAvailable: true/);
+  assert.doesNotMatch(batch, /writerStopped/);
+  assert.doesNotMatch(batch, /writer_stopped_after_error/);
+  assert.doesNotMatch(batch, /reviewTerafabxPreparedReplyBatchWithGemini\(reviewableResults/);
 });
 
 test("quick intent submission is disabled because it cannot prove reply context before posting", () => {
@@ -657,6 +1565,53 @@ test("headless reply retries one pre-submit transient browser failure only", () 
   assert.equal(shouldRetryTerafabxHeadlessReply(uncertain, 1, { headless: true }), false);
 });
 
+test("own-post X writer backoff suppresses repeated blank-page retries until its retry time", () => {
+  const retryAt = "2026-07-26T10:00:00.000Z";
+  const state = {
+    ownPostReplyXWriteBackoffUntil: retryAt,
+    ownPostReplyXWriteBackoffError: "target root 검증 실패",
+  };
+  assert.deepEqual(terafabxOwnPostReplyXWriteBackoff(state, Date.parse("2026-07-26T09:59:59.000Z")), {
+    active: true,
+    retryAt,
+    error: "target root 검증 실패",
+  });
+  assert.equal(terafabxOwnPostReplyXWriteBackoff(state, Date.parse(retryAt)).active, false);
+});
+
+test("global X circuit breaker recognizes rate limits and blank authenticated shells", () => {
+  assert.equal(isTerafabxXRateLimitError(new Error("X schedule 사용량 제한 HTTP 429 code 1003")), true);
+  const blank = new Error("현재 X 화면에서 로그인 계정 DOM 검증에 실패했습니다.");
+  blank.code = "TERAFABX_X_ACCOUNT_VERIFY_FAILED";
+  assert.equal(isTerafabxXAccessCircuitBreakerError(blank), true);
+
+  const retryAt = "2026-07-26T10:30:00.000Z";
+  const state = {
+    xGlobalBackoffUntil: retryAt,
+    xGlobalBackoffError: "HTTP 429",
+    xGlobalBackoffSource: "own_post_heart",
+  };
+  assert.deepEqual(terafabxGlobalXBackoff(state, Date.parse("2026-07-26T10:00:00.000Z")), {
+    active: true,
+    retryAt,
+    error: "HTTP 429",
+    source: "own_post_heart",
+  });
+  assert.equal(terafabxGlobalXBackoff(state, Date.parse(retryAt)).active, false);
+});
+
+test("X account verification requires account-switcher DOM evidence and never trusts the route URL", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "mirror_server.js"), "utf8");
+  const block = source.slice(
+    source.indexOf("async function verifyXAccount"),
+    source.indexOf("async function waitForComposer"),
+  );
+  assert.match(block, /isVerifiedXAccountState\(accountState,\s*REQUIRED_X_HANDLE\)/);
+  assert.match(block, /TERAFABX_X_ACCOUNT_VERIFY_FAILED/);
+  assert.doesNotMatch(block, /haystack/);
+  assert.doesNotMatch(block, /return false/);
+});
+
 test("a pending comment remains ineligible until its retry cooldown expires", () => {
   const nowMs = Date.parse("2026-07-13T15:00:00.000Z");
   assert.equal(isTerafabxPendingCommentEligible({ verificationRequired: true }, nowMs), false);
@@ -744,6 +1699,10 @@ test("own-post reply score gate rejects sub-90 final judge scores even when pass
   assert.equal(terafabxReplyReviewFinalScore(lowPassed), 89);
   assert.equal(isTerafabxReplyReviewScoreQualified(lowPassed), false);
   assert.equal(isTerafabxReplyReviewScoreQualified({ score: 90, finalJudge: { score: 90, passed: true } }), true);
+  assert.equal(isTerafabxReplyReviewScoreQualified({
+    score: 97,
+    finalJudge: { score: 97, passed: false, flaggedQualityIssues: ["unsupported_claim"] },
+  }), false);
   assert.equal(isTerafabxReplyReviewScoreQualified({ score: 91 }), true);
   assert.equal(isTerafabxReplyReviewScoreQualified({}), false);
 });
@@ -1052,13 +2011,59 @@ test("X home HTTP 429 creates a thirty-minute discovery backoff", () => {
 test("auto comment discovery uses disposable tabs on the shared 9224 browser", () => {
   assert.equal(typeof terafabxAutoCommentBrowserResources, "function");
   const resources = terafabxAutoCommentBrowserResources();
-  assert.deepEqual(Object.keys(resources).sort(), ["legacy", "writer"]);
+  assert.deepEqual(Object.keys(resources).sort(), ["legacy", "ownHeart", "ownReply", "ownScan", "writer"]);
   assert.deepEqual(terafabxAutoCommentDiscoveryOptions(), {
     port: 9224,
     lock: "global-9224",
     disposableTab: true,
   });
   assert.equal(resources.writer.port, 9238);
+  assert.equal(resources.ownReply.port, 9239);
+  assert.equal(resources.ownScan.port, 9284);
+  assert.equal(resources.ownHeart.port, 9240);
+  assert.notEqual(resources.ownScan.lockPath, resources.ownReply.lockPath);
+  assert.notEqual(resources.ownScan.profileDir, resources.ownReply.profileDir);
+  assert.notEqual(resources.ownReply.lockPath, resources.ownHeart.lockPath);
+  assert.notEqual(resources.ownReply.profileDir, resources.ownHeart.profileDir);
+});
+
+test("own-post reply posting and standalone heart sweeps use independent X resources", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "mirror_server.js"), "utf8");
+  const replyBatch = source.slice(
+    source.indexOf("async function runTerafabxOwnPostReplyBatch"),
+    source.indexOf("async function runNextTerafabxOwnPostReplyManualQueueItem"),
+  );
+  const replyWriter = source.slice(
+    source.indexOf("async function postTerafabxOwnPostReplyWriteRecord"),
+    source.indexOf("function enqueueTerafabxOwnPostReplyWriteRecord"),
+  );
+  const heartSweep = source.slice(
+    source.indexOf("async function runTerafabxOwnPostHeartSweep"),
+    source.indexOf("async function maybeRunTerafabxOwnPostHeartAutomation"),
+  );
+  const heartAutomation = source.slice(
+    source.indexOf("async function maybeRunTerafabxOwnPostHeartAutomation"),
+    source.indexOf("function loadTerafabxCommentMonitorState"),
+  );
+  assert.match(replyWriter, /xResourceKind:\s*"ownReply"/);
+  assert.match(replyBatch, /closeTerafabxIsolatedXBrowser\("ownReply"\)/);
+  assert.doesNotMatch(replyBatch, /attemptTerafabxReplyHeart/);
+  assert.match(replyBatch, /terafabx_own_post_reply_heart_handoff/);
+  assert.match(heartSweep, /xResourceKind:\s*"ownHeart"/);
+  assert.match(heartSweep, /closeTerafabxIsolatedXBrowser\("ownHeart"\)/);
+  assert.match(heartSweep, /isTerafabxOwnPostHeartStopRequested/);
+  assert.match(heartSweep, /startTerafabxGlobalXBackoff/);
+  assert.doesNotMatch(heartAutomation, /terafabxOwnPostReplyBusy/);
+});
+
+test("Gemini browser slots are isolated by their port and profile resource key", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "mirror_server.js"), "utf8");
+  const runner = source.slice(
+    source.indexOf("async function runTerafabxGeminiScript"),
+    source.indexOf("function execFileOutput"),
+  );
+  assert.match(runner, /options\.resourceKey\s*\|\|\s*`\$\{options\.chromePort/);
+  assert.match(source, /const terafabxGeminiWebPools = new Map\(\)/);
 });
 
 test("automatic comment discovery uses FxTwitter and never opens X home", () => {
@@ -1145,7 +2150,9 @@ test("startup cleanup covers every fixed TerafabX Grok worker session", () => {
   assert(sessions.includes("terafabx-grok-headless"));
   for (let index = 1; index <= 5; index += 1) {
     assert(sessions.includes(`terafabx-grok-headless-comment-prefill-${index}`));
+    assert(sessions.includes(`terafabx-grok-headless-review-${index}`));
     assert(sessions.includes(`terafabx-grok-headless-own-post-reply-context-${index}`));
+    assert(sessions.includes(`terafabx-grok-headless-coverage-prefetch-${index}`));
   }
   assert(sessions.includes("terafabx-grok-headless-own-post-root-context"));
 });
@@ -1198,4 +2205,20 @@ test("fixed worker pool prepares at most five items without reusing an active wo
   assert.deepEqual(results.map((item) => item.item), items);
   assert.equal(results[6].ok, false);
   assert.equal(results.filter((item) => item.ok).length, 11);
+});
+
+test("heart failure is deferred and does not block a qualified reply", async () => {
+  const result = await attemptTerafabxReplyHeart(
+    "https://x.com/example/status/123",
+    { rootUrl: "https://x.com/terafabXai/status/456" },
+    async () => {
+      throw new Error("target_article_not_found");
+    },
+  );
+  assert.deepEqual(result, {
+    liked: false,
+    alreadyLiked: false,
+    deferred: true,
+    error: "target_article_not_found",
+  });
 });

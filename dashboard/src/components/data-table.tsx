@@ -7,6 +7,7 @@ import {
   getSortedRowModel,
   useReactTable,
   type ColumnDef,
+  type RowSelectionState,
   type SortingState,
   type VisibilityState,
 } from "@tanstack/react-table"
@@ -31,6 +32,7 @@ import {
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { Checkbox } from "@/components/ui/checkbox"
 import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
@@ -93,6 +95,18 @@ export type DashboardRow = {
   postedAt?: string | null
   lastError?: string | null
   canPost?: boolean
+  xPostUrl?: string | null
+  replyCompletion?: {
+    rootPostUrl: string
+    completedCount: number
+    totalCount: number | null
+    remainingCount: number | null
+    percentage: number | null
+    exact: boolean
+    scheduled?: boolean
+    source: string
+    checkedAt?: string | null
+  }
 }
 
 type DataTableProps = {
@@ -111,6 +125,7 @@ type DataTableProps = {
   onDraft: (row: DashboardRow, text?: string) => void
   onSchedule: (row: DashboardRow, text?: string, scheduledAt?: string) => void
   onAutoSchedule: (row: DashboardRow, text?: string) => void
+  onBatchAutoSchedule: (rows: DashboardRow[]) => Promise<void>
   onCancelSchedule: (row: DashboardRow) => void
   onRefetch: (row: DashboardRow) => void
   onDiscard: (row: DashboardRow) => void
@@ -393,6 +408,7 @@ export function DataTable(props: DataTableProps) {
   const [sorting, setSorting] = React.useState<SortingState>([])
   const [columnVisibility, setColumnVisibility] =
     React.useState<VisibilityState>({})
+  const [rowSelection, setRowSelection] = React.useState<RowSelectionState>({})
   const [pagination, setPagination] = React.useState({
     pageIndex: 0,
     pageSize: 12,
@@ -403,8 +419,42 @@ export function DataTable(props: DataTableProps) {
     [openRowUrl, rows]
   )
 
+  React.useEffect(() => {
+    setRowSelection({})
+    setPagination((current) => ({ ...current, pageIndex: 0 }))
+  }, [view])
+
+  React.useEffect(() => {
+    setPagination((current) => {
+      const lastPageIndex = Math.max(0, Math.ceil(rows.length / current.pageSize) - 1)
+      return current.pageIndex > lastPageIndex
+        ? { ...current, pageIndex: lastPageIndex }
+        : current
+    })
+  }, [rows.length])
+
   const columns = React.useMemo<ColumnDef<DashboardRow>[]>(
     () => [
+      {
+        id: "select",
+        header: ({ table }) => view === "discovered" ? (
+          <Checkbox
+            aria-label="현재 페이지 전체 선택"
+            checked={table.getIsAllPageRowsSelected() || (table.getIsSomePageRowsSelected() && "indeterminate")}
+            onCheckedChange={(value) => table.toggleAllPageRowsSelected(Boolean(value))}
+          />
+        ) : null,
+        cell: ({ row }) => view === "discovered" ? (
+          <Checkbox
+            aria-label={`${row.original.author || "항목"} 선택`}
+            checked={row.getIsSelected()}
+            disabled={!row.getCanSelect()}
+            onCheckedChange={(value) => row.toggleSelected(Boolean(value))}
+          />
+        ) : null,
+        enableSorting: false,
+        enableHiding: false,
+      },
       {
         id: "media",
         header: "미디어",
@@ -439,6 +489,44 @@ export function DataTable(props: DataTableProps) {
           </Badge>
         ),
       },
+      ...(view === "posted" ? [{
+        id: "replyCompletion",
+        accessorFn: (row: DashboardRow) => row.replyCompletion?.percentage ?? -1,
+        header: "대댓글 완료율",
+        cell: ({ row }: { row: { original: DashboardRow } }) => {
+          const completion = row.original.replyCompletion
+          if (!completion) {
+            return <span className="text-xs text-muted-foreground">집계 전</span>
+          }
+          const metric = (
+            <div
+              className="min-w-28"
+              title={completion.checkedAt ? `마지막 확인 ${formatDate(completion.checkedAt)}` : undefined}
+            >
+              <div className="flex items-center gap-2">
+                <Badge variant={completion.percentage === 100 ? "default" : "outline"}>
+                  {completion.percentage === null ? "계산 중" : `${completion.percentage}%`}
+                </Badge>
+                <span className="text-sm tabular-nums">
+                  {completion.completedCount}/{completion.totalCount ?? "?"}
+                </span>
+              </div>
+              <div className="mt-1 text-xs text-muted-foreground">
+                {completion.scheduled
+                  ? "예약 갱신 · 전체 댓글 기준"
+                  : completion.exact
+                    ? "직접 전체수집 기준"
+                    : "X 전체 답글 수 기준"}
+              </div>
+            </div>
+          )
+          return row.original.xPostUrl ? (
+            <a href={row.original.xPostUrl} target="_blank" rel="noreferrer" className="block hover:underline">
+              {metric}
+            </a>
+          ) : metric
+        },
+      }] : []),
       {
         accessorKey: "likeCount",
         header: () => <div className="text-right">좋아요</div>,
@@ -479,12 +567,22 @@ export function DataTable(props: DataTableProps) {
           return (
             <div className="flex items-center justify-end gap-2">
               {isPosted ? (
-                <Button variant="outline" size="sm" asChild>
-                  <a href={row.original.canonicalUrl} target="_blank" rel="noreferrer">
-                    <ExternalLinkIcon data-icon="inline-start" />
-                    원문 열기
-                  </a>
-                </Button>
+                <>
+                  {row.original.xPostUrl ? (
+                    <Button variant="outline" size="sm" asChild>
+                      <a href={row.original.xPostUrl} target="_blank" rel="noreferrer">
+                        <ExternalLinkIcon data-icon="inline-start" />
+                        X 게시글
+                      </a>
+                    </Button>
+                  ) : null}
+                  <Button variant="outline" size="sm" asChild>
+                    <a href={row.original.canonicalUrl} target="_blank" rel="noreferrer">
+                      <ExternalLinkIcon data-icon="inline-start" />
+                      Threads 원문
+                    </a>
+                  </Button>
+                </>
               ) : null}
               <Button
                 variant="outline"
@@ -552,7 +650,7 @@ export function DataTable(props: DataTableProps) {
         enableHiding: false,
       },
     ],
-    [props, busy, compact, formatDate]
+    [props, busy, compact, formatDate, view]
   )
 
   const table = useReactTable({
@@ -562,11 +660,17 @@ export function DataTable(props: DataTableProps) {
       sorting,
       columnVisibility,
       pagination,
+      rowSelection,
     },
     getRowId: (row) => row.canonicalUrl,
     onSortingChange: setSorting,
     onColumnVisibilityChange: setColumnVisibility,
     onPaginationChange: setPagination,
+    autoResetPageIndex: false,
+    onRowSelectionChange: setRowSelection,
+    enableRowSelection: (row) => view === "discovered"
+      && Boolean(row.original.canPost)
+      && !props.autoScheduleSubmitting.includes(row.original.canonicalUrl),
     getCoreRowModel: getCoreRowModel(),
     getFilteredRowModel: getFilteredRowModel(),
     getPaginationRowModel: getPaginationRowModel(),
@@ -576,31 +680,10 @@ export function DataTable(props: DataTableProps) {
   return (
     <>
     <Tabs value={view} onValueChange={onViewChange} className="w-full flex-col justify-start gap-6" id="queue">
-      <div className="flex items-center justify-between px-4 lg:px-6">
-        <Label htmlFor="view-selector" className="sr-only">
-          보기
-        </Label>
-        <Select value={view} onValueChange={onViewChange}>
-          <SelectTrigger
-            className="flex w-fit @4xl/main:hidden"
-            size="sm"
-            id="view-selector"
-          >
-            <SelectValue placeholder="보기 선택" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectGroup>
-              {views.map((item) => (
-                <SelectItem key={item.id} value={item.id}>
-                  {item.label}
-                </SelectItem>
-              ))}
-            </SelectGroup>
-          </SelectContent>
-        </Select>
-        <TabsList className="hidden **:data-[slot=badge]:size-5 **:data-[slot=badge]:rounded-full **:data-[slot=badge]:bg-muted-foreground/30 **:data-[slot=badge]:px-1 @4xl/main:flex">
+      <div className="flex flex-col gap-2 px-4 sm:flex-row sm:items-center sm:justify-between lg:px-6">
+        <TabsList className="grid h-auto w-full grid-cols-3 **:data-[slot=badge]:min-w-5 **:data-[slot=badge]:rounded-full **:data-[slot=badge]:bg-muted-foreground/30 **:data-[slot=badge]:px-1 sm:w-auto">
           {views.map((item) => (
-            <TabsTrigger key={item.id} value={item.id}>
+            <TabsTrigger key={item.id} value={item.id} className="min-h-9 px-3">
               {item.label}
               <Badge variant="secondary">
                 {compact(counts[item.countKey] || 0)}
@@ -608,7 +691,22 @@ export function DataTable(props: DataTableProps) {
             </TabsTrigger>
           ))}
         </TabsList>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          {view === "discovered" ? (
+            <Button
+              variant="default"
+              size="sm"
+              disabled={table.getSelectedRowModel().rows.length === 0}
+              onClick={async () => {
+                const selectedRows = table.getSelectedRowModel().rows.map((row) => row.original)
+                await props.onBatchAutoSchedule(selectedRows)
+                setRowSelection({})
+              }}
+            >
+              <CalendarClockIcon data-icon="inline-start" />
+              선택 {table.getSelectedRowModel().rows.length}개 자동 예약
+            </Button>
+          ) : null}
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button variant="outline" size="sm">

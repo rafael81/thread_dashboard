@@ -22,3 +22,4 @@ mirror_server.log
 *.apk.zip
 .gstack/
 .worktrees/
+.tmp/

@@ -6,6 +6,7 @@ const path = require('node:path');
 const {
   cleanThreadText,
   classifyThreadSocialLine,
+  linkedThreadMediaAttributionLabels,
   classifyXScheduleDialogState,
   composerTextMatchesExpected,
   assessTerafabxLanguageQuality,
@@ -37,6 +38,9 @@ const {
   normalizeTerafabxContextResult,
   parseTerafabxGrokContextBatch,
   discoveryAutoScheduleRequestMode,
+  discoveryScheduleRetryDecision,
+  isThreadsMediaRegression,
+  isThreadsInvalidPageText,
   isConfirmedTerafabxGrokContext,
   isDiscoveryAutoScheduleSource,
   ensureComposerText,
@@ -55,6 +59,7 @@ const {
   xScheduleRecoveryAction,
   resolveAgentBrowserBin,
   agentBrowserCommandArgs,
+  terafabxGrokStateAgentBrowserNamespace,
   ensureNodeExecutablePath,
   terafabxCommentAuthorDailyUsage,
   terafabxCommentAuthorCapDisposition,
@@ -64,6 +69,37 @@ const {
   nextTerafabxWeightedReplyCount,
   terafabxWeightedReplyRunDisposition,
 } = require('../mirror_server.js');
+
+test('a previously confirmed Threads media post cannot regress to text-only posting', () => {
+  assert.equal(isThreadsMediaRegression(2, 0), true);
+  assert.equal(isThreadsMediaRegression(1, 0), true);
+  assert.equal(isThreadsMediaRegression(2, 1), false);
+  assert.equal(isThreadsMediaRegression(0, 0), false);
+  const source = fs.readFileSync(path.join(__dirname, '..', 'mirror_server.js'), 'utf8');
+  assert.match(source, /media_count = MAX\(media_count, \?\)/);
+  assert.doesNotMatch(
+    source.slice(source.indexOf('async function refetchDiscoveryRow'), source.indexOf('async function reinspectScheduledDiscoverySource')),
+    /media_count = 0/
+  );
+});
+
+test('a Threads not-found page is never accepted as post text', () => {
+  assert.equal(isThreadsInvalidPageText(
+    '방황하는 모든 자가 길을 잃은 것은 아니지만, 이 페이지는 길을 잃었습니다\n링크가 작동하지 않거나 페이지가 존재하지 않습니다.'
+  ), true);
+  assert.equal(isThreadsInvalidPageText('아니 저 조그만 머릿속에 지금 물음표 100개 떠 있는 거 아니냐고ㅠㅠ🐱❓'), false);
+});
+
+test('a user-deleted X schedule has a dedicated local reconciliation route', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'mirror_server.js'), 'utf8');
+  assert.match(source, /async function confirmDiscoveryScheduledPostDeletedOnX/);
+  assert.match(source, /cancelledReason: "user_deleted_on_x"/);
+  assert.match(source, /req\.url === "\/api\/discovery\/confirm-x-deleted"/);
+});
+const {
+  agentBrowserInvocation: geminiAgentBrowserInvocation,
+  geminiAgentBrowserNamespace,
+} = require('../scripts/gemini_custom_prompt.js');
 
 test('automation dashboard shows FxTwitter discovery diagnostics and a manual X home scan', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'dashboard', 'src', 'main.jsx'), 'utf8');
@@ -84,6 +120,28 @@ test('discovery list exposes auto schedule beside the overflow menu instead of i
   assert.match(source, /aria-label="자동 예약"[\s\S]*props\.onAutoSchedule\(row\.original\)/);
   assert.doesNotMatch(source, /<DropdownMenuItem[^>]*onClick=\{\(\) => props\.onAutoSchedule\(row\.original\)\}/);
   assert.match(source, /autoSchedulePending \? "접수 중" : "자동 예약"/);
+});
+
+test('discovery status views stay as three direct buttons at every responsive width', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'dashboard', 'src', 'components', 'data-table.tsx'), 'utf8');
+
+  assert.match(source, /<TabsList className="grid h-auto w-full grid-cols-3/);
+  assert.match(source, /views\.map\(\(item\) => \([\s\S]*<TabsTrigger key=\{item\.id\} value=\{item\.id\}/);
+  assert.doesNotMatch(source, /id="view-selector"/);
+});
+
+test('discovery list supports checkbox selection and ordered batch auto-schedule queueing', () => {
+  const tableSource = fs.readFileSync(path.join(__dirname, '..', 'dashboard', 'src', 'components', 'data-table.tsx'), 'utf8');
+  const dashboardSource = fs.readFileSync(path.join(__dirname, '..', 'dashboard', 'src', 'main.jsx'), 'utf8');
+
+  assert.match(tableSource, /type RowSelectionState/);
+  assert.match(tableSource, /aria-label="현재 페이지 전체 선택"/);
+  assert.match(tableSource, /선택 \{table\.getSelectedRowModel\(\)\.rows\.length\}개 자동 예약/);
+  assert.match(tableSource, /await props\.onBatchAutoSchedule\(selectedRows\)/);
+  assert.match(dashboardSource, /async function queueDiscoveryAutoScheduleBatch\(selectedRows\)/);
+  assert.match(dashboardSource, /for \(const row of rowsToQueue\)/);
+  assert.match(dashboardSource, /"dashboard_batch_auto_schedule"/);
+  assert.match(dashboardSource, /onBatchAutoSchedule=\{queueDiscoveryAutoScheduleBatch\}/);
 });
 
 test('ordinary auto comments count posted and pending reservations per author on the KST date', () => {
@@ -141,7 +199,6 @@ test('weighted own-post reply is not starved while comment prefill is running', 
     now: new Date('2026-07-20T07:00:00.000Z'),
     quiet: false,
     ownReplyBusy: false,
-    todayReplyBusy: false,
     commentPrefillBusy: true,
   });
 
@@ -210,7 +267,7 @@ test('TerafabX automatic discovery scheduling does not fill slots beyond its run
   assert.equal(isAutoStyleScheduleWithinHorizon('2026-07-20T00:01:00.000Z', now, 18), false);
   assert.equal(isAutoStyleScheduleWithinHorizon('2026-07-19T05:59:00.000Z', now, 18), false);
 });
-const { DEFAULT_GROK_URL, agentBrowserInvocation, buildGrokBatchCommandChunks, buildGrokBatchCommands, isGrokPromptEcho, isGrokTitleResponse, namespaceProcessIds, normalizeGrokTitleResponse, parseDoneMarker } = require('../scripts/terafabx-grok-web-agent.js');
+const { DEFAULT_GROK_URL, agentBrowserInvocation, agentBrowserProfileDir, buildGrokBatchCommandChunks, buildGrokBatchCommands, buildGrokHistoryRecoveryEvalScript, isGrokPromptEcho, isGrokTitleResponse, namespaceProcessIds, normalizeGrokTitleResponse, ownedGrokBrowserPidsFromPs, parseDoneMarker } = require('../scripts/terafabx-grok-web-agent.js');
 
 test('sharp runtime dependency is importable', async () => {
   const sharp = await import('sharp');
@@ -461,6 +518,7 @@ test('TerafabX final judge passes a natural specific reply at the quality thresh
     fatal_error: false,
     language_error: false, awkward_korean: false, translation_tone: false, cliche: false, context_error: false, unsupported_claim: false,
     cross_post_reusable: false, headline_tone: false, specificity_error: false,
+    semantic_role_error: false, direct_response_error: false, logical_leap_error: false,
     source_anchor: '주말 출근자들',
     reason: '원문의 주말 출근 응원에 짧고 자연스럽게 반응함',
   }), '주말 출근자들에게 건넨 커피 응원이 딱 힘이 되겠네요', {
@@ -542,6 +600,9 @@ test('TerafabX final judge accepts a source anchor found in quoted post text', (
     cross_post_reusable: false,
     headline_tone: false,
     specificity_error: false,
+    semantic_role_error: false,
+    direct_response_error: false,
+    logical_leap_error: false,
     source_anchor: '엉덩이 가운데에 넣어줍니다',
     reason: '인용 원문의 구체적인 행동을 정확히 짚음',
   }), '엉덩이 밑에 손 넣는 것부터 따라 해봐야겠어요', {
@@ -634,7 +695,7 @@ test('TerafabX current policy rejects a legal classification absent from the sou
   assert.ok(result.errors.includes('unsupported_legal_classification'));
 });
 
-test('TerafabX daily comment cadence targets 600 and accelerates when behind pace', () => {
+test('TerafabX daily comment cadence targets 1000 and accelerates when behind pace', () => {
   const now = new Date('2026-07-11T00:18:00.000Z'); // 09:18 KST
   const commentHistory = Array.from({ length: 45 }, (_, index) => ({
     at: new Date(now.getTime() - index * 60_000).toISOString(),
@@ -642,9 +703,11 @@ test('TerafabX daily comment cadence targets 600 and accelerates when behind pac
   }));
   const result = terafabxDailyCommentProgress({ commentHistory }, now);
 
-  assert.equal(result.dailyTarget, 600);
+  assert.equal(result.dailyTarget, 1000);
   assert.equal(result.postedToday, 45);
-  assert.equal(result.baseIntervalMs, 108000);
+  assert.equal(result.baseIntervalMs, 64800);
+  assert.equal(result.capacityPerDay, 1080);
+  assert.equal(result.requiredPerActiveHour, 55.6);
   assert.ok(result.requiredIntervalMs < result.baseIntervalMs);
   assert.ok(result.behindBy > 0);
   assert.equal(result.reached, false);
@@ -784,7 +847,7 @@ test('TerafabX comment monitor detects a 10-minute throughput shortfall and inde
 
   const result = evaluateTerafabxCommentWorkflow(state, { now, windowMs: 10 * 60 * 1000, quiet: false });
 
-  assert.equal(result.targetInWindow, 6);
+  assert.equal(result.targetInWindow, 10);
   assert.equal(result.postedInWindow, 2);
   assert.equal(result.status, 'degraded');
   assert.ok(result.findings.some((item) => item.type === 'throughput_below_target'));
@@ -926,6 +989,28 @@ test('TerafabX Grok context automation defaults to grok.com headless', () => {
   assert.equal(require('../mirror_server.js').TERAFABX_GROK_WEB_URL, 'https://grok.com/');
 });
 
+test('Grok individual context prompt stays compact for the quick path', () => {
+  const prompt = require('../mirror_server.js').terafabxGrokContextPrompt({
+    url: 'https://x.com/example/status/123',
+    targetText: '고양이가 상자 안으로 뛰어드는 짧은 영상',
+    mediaCount: 1,
+  });
+
+  assert.ok(prompt.length < 2200, `prompt length=${prompt.length}`);
+  assert.match(prompt, /문맥.*공개 답글 초안/);
+  assert.match(prompt, /원문에 없는 사실/);
+  assert.match(prompt, /gctx-[0-9a-f-]{12,}/);
+  assert.doesNotMatch(prompt, /감정 회계/);
+});
+
+test('Grok history recovery is bound to the current request marker', () => {
+  const marker = 'gctx-22f52c83-5563-4898-a570-88a26db55604';
+  const script = buildGrokHistoryRecoveryEvalScript(marker);
+  assert.match(script, /a\[href\*="\/c\/"\]/);
+  assert.match(script, new RegExp(marker));
+  assert.match(script, /includes\(marker\)/);
+});
+
 test('Grok headless browser leaves user agent ownership to the system Chrome binary', () => {
   const invocation = agentBrowserInvocation(['open', 'https://x.com/i/grok'], {
     session: 'ua-test',
@@ -954,6 +1039,33 @@ test('launchd resolves npx beside the active Node binary and keeps agent-browser
   ]);
 });
 
+test('Gemini workers isolate agent-browser daemons by CDP resource', () => {
+  const first = geminiAgentBrowserInvocation('http://127.0.0.1:9264', ['open', 'https://gemini.google.com/app'], {
+    bin: '/opt/homebrew/bin/npx',
+  });
+  const secondNamespace = geminiAgentBrowserNamespace('http://127.0.0.1:9265');
+
+  assert.match(first.namespace, /^gm-[0-9a-f]{12}$/);
+  assert.notEqual(first.namespace, secondNamespace);
+  assert.deepEqual(first.args.slice(0, 8), [
+    '--yes',
+    'agent-browser',
+    '--namespace',
+    first.namespace,
+    '--session',
+    first.namespace,
+    '--cdp',
+    'http://127.0.0.1:9264',
+  ]);
+});
+
+test('Grok state sync uses its own short agent-browser daemon namespace', () => {
+  const first = terafabxGrokStateAgentBrowserNamespace(9224);
+  const second = terafabxGrokStateAgentBrowserNamespace(9225);
+  assert.match(first, /^tg-state-[0-9a-f]{12}$/);
+  assert.notEqual(first, second);
+});
+
 test('Grok worker treats an absolute npx path as the npx launcher', () => {
   const invocation = agentBrowserInvocation(['open', 'https://grok.com/'], {
     bin: '/opt/homebrew/bin/npx',
@@ -961,6 +1073,59 @@ test('Grok worker treats an absolute npx path as the npx launcher', () => {
   });
   assert.equal(invocation.bin, '/opt/homebrew/bin/npx');
   assert.deepEqual(invocation.args.slice(0, 2), ['--yes', 'agent-browser']);
+});
+
+test('Grok worker uses a deterministic project-owned Chrome profile', () => {
+  const profileDir = agentBrowserProfileDir('cleanup-owner-test', {
+    profileRoot: '/tmp/thread-dashboard-owned-grok',
+  });
+  const invocation = agentBrowserInvocation(['open', 'https://grok.com/'], {
+    bin: '/opt/homebrew/bin/npx',
+    session: 'cleanup-owner-test',
+    profileRoot: '/tmp/thread-dashboard-owned-grok',
+  });
+  const profileIndex = invocation.args.indexOf('--profile');
+
+  assert.equal(invocation.args[profileIndex + 1], profileDir);
+  assert.match(profileDir, /\/tmp\/thread-dashboard-owned-grok\/tg-[0-9a-f]{12}$/);
+});
+
+test('Grok worker does not combine saved login state with a persistent profile', () => {
+  const invocation = agentBrowserInvocation(['open', 'https://grok.com/'], {
+    bin: '/opt/homebrew/bin/npx',
+    session: 'state-login-test',
+    state: '/tmp/terafabx-grok-state.json',
+    profileRoot: '/tmp/thread-dashboard-owned-grok',
+  });
+
+  assert.equal(invocation.args.includes('--profile'), false);
+  assert.equal(invocation.args[invocation.args.indexOf('--state') + 1], '/tmp/terafabx-grok-state.json');
+});
+
+test('Grok worker resumes the state-backed browser without switching to a profile', () => {
+  const invocation = agentBrowserInvocation(['open', 'https://grok.com/'], {
+    bin: '/opt/homebrew/bin/npx',
+    session: 'state-resume-test',
+    state: '',
+    resume: true,
+    profileRoot: '/tmp/thread-dashboard-owned-grok',
+  });
+
+  assert.equal(invocation.args.includes('--profile'), false);
+  assert.equal(invocation.args.includes('--state'), false);
+});
+
+test('Grok cleanup selects only Chrome processes using its exact owned profile', () => {
+  const profileDir = '/tmp/thread-dashboard-owned-grok/tg-123456789abc';
+  const ps = [
+    `101 1 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=${profileDir} --headless=new`,
+    `102 101 /Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Helper --user-data-dir=${profileDir}`,
+    '103 1 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=9224 --user-data-dir=/Users/macmini/project/thread_dashboard/.data/chrome-profiles/gwajeuplupi-visible-9224',
+    '104 1 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=/tmp/agent-browser-chrome-unowned',
+  ].join('\n');
+
+  assert.deepEqual(ownedGrokBrowserPidsFromPs(ps, profileDir, 999), [102, 101]);
+  assert.deepEqual(ownedGrokBrowserPidsFromPs(ps, '/Users/macmini/project/thread_dashboard/.data/chrome-profiles/gwajeuplupi-visible-9224', 999), []);
 });
 
 test('Grok worker accepts a marker-bound JSON title even when Grok strips outer braces', () => {
@@ -1057,6 +1222,8 @@ test('Threads social-line classification requires explicit or DOM-confirmed hand
 test('X schedule verification retries a transient list-load failure before declaring failure', () => {
   assert.equal(scheduledVerificationAttemptDisposition({ error: new Error('X schedule 로딩 실패'), attempt: 0, maxAttempts: 6 }), 'retry');
   assert.equal(scheduledVerificationAttemptDisposition({ assessmentStatus: 'ok', attempt: 1, maxAttempts: 6 }), 'verified');
+  assert.equal(scheduledVerificationAttemptDisposition({ assessmentStatus: 'title_missing', attempt: 1, maxAttempts: 6 }), 'repair');
+  assert.equal(scheduledVerificationAttemptDisposition({ assessmentStatus: 'title_mismatch', attempt: 1, maxAttempts: 6 }), 'repair');
   assert.equal(scheduledVerificationAttemptDisposition({ error: new Error('X schedule 로딩 실패'), attempt: 5, maxAttempts: 6 }), 'fail');
 });
 
@@ -1146,6 +1313,28 @@ test('Threads translated DOM text is not replaced by a different embedded source
   }), '고양이가 상자를 열고 놀라는 장면');
 });
 
+// Regression: Threads embedded JSON exposed a hidden attachment/file label
+// after the visible caption and it was mirrored into an X scheduled title.
+test('Threads source selection removes a trailing standalone file label', () => {
+  assert.equal(selectThreadSourceText({
+    domText: '왜 세로로 쓰셨나요?',
+    embeddedCaption: '왜 세로로 쓰셨나요?\nwadition.zip',
+  }), '왜 세로로 쓰셨나요?');
+});
+
+test('Threads text cleanup removes trailing standalone file labels defensively', () => {
+  assert.equal(
+    cleanThreadText('hazelnut05170\n왜 세로로 쓰셨나요?\nwadition.zip', 'hazelnut05170'),
+    '왜 세로로 쓰셨나요?',
+  );
+});
+
+test('Threads text cleanup preserves a file-looking caption when it is the only content', () => {
+  assert.equal(cleanThreadText('sample_author\nwadition.zip', 'sample_author'), 'wadition.zip');
+  assert.equal(cleanThreadText('sample_author\n대리님이랑 뽀뽀할 뻔 했네요.jpg', 'sample_author'), '대리님이랑 뽀뽀할 뻔 했네요.jpg');
+  assert.equal(cleanThreadText('sample_author\n첨부 파일\nwadition.zip\n설치해 주세요', 'sample_author'), '첨부 파일\nwadition.zip\n설치해 주세요');
+});
+
 // Regression: a Threads topic/community label was included in an auto-scheduled title.
 // Found by /investigate on 2026-07-10.
 test('Threads text cleanup removes DOM-confirmed topic labels', () => {
@@ -1189,6 +1378,23 @@ test('Threads text cleanup removes DOM-confirmed media source attribution', () =
   assert.equal(
     cleanThreadText('bloneattheroots\nmingliu0107', 'bloneattheroots', ['mingliu0107']),
     '',
+  );
+});
+
+test('Threads linked inline media owner is excluded from translated post text', () => {
+  const attributionLabels = linkedThreadMediaAttributionLabels({
+    text_post_app_info: {
+      linked_inline_media: {
+        user: { username: 'kwpawtrips' },
+      },
+    },
+  });
+  const translated = '저는 정말로 그들이 개를 데리러 가는 버스가 있다는 것을 몰랐어요, 얼마나 귀여운지 🥰\nkwpawtrips';
+
+  assert.deepEqual(attributionLabels, ['kwpawtrips']);
+  assert.equal(
+    cleanThreadText(translated, 'anidiazkings', attributionLabels),
+    '저는 정말로 그들이 개를 데리러 가는 버스가 있다는 것을 몰랐어요, 얼마나 귀여운지 🥰',
   );
 });
 
@@ -1525,6 +1731,54 @@ test('startup recovery resumes scheduling only for auto-schedule sources', () =>
   assert.equal(isDiscoveryAutoScheduleSource('auto-schedule-async'), true);
   assert.equal(isDiscoveryAutoScheduleSource('android_share'), false);
   assert.equal(isDiscoveryAutoScheduleSource('manual'), false);
+});
+
+test('schedule recovery retries stale pre-submit rows but reconciles post-submit uncertainty', () => {
+  const now = Date.parse('2026-07-25T12:00:00.000Z');
+  const stale = {
+    status: 'scheduling',
+    attempts: 0,
+    discoveredAt: '2026-07-25 11:30:00',
+  };
+
+  assert.deepEqual(
+    discoveryScheduleRetryDecision({ ...stale, slotState: 'reserved' }, now).retry,
+    true,
+  );
+  assert.equal(
+    discoveryScheduleRetryDecision({ ...stale, slotState: 'submitting' }, now).reason,
+    'submission_reconciliation_required',
+  );
+});
+
+test('schedule recovery waits out rate limits and never retries hard constraints', () => {
+  const now = Date.parse('2026-07-25T12:00:00.000Z');
+  const base = {
+    status: 'failed_schedule',
+    attempts: 1,
+    discoveredAt: '2026-07-25 11:50:00',
+  };
+
+  assert.equal(
+    discoveryScheduleRetryDecision({ ...base, lastError: 'X schedule 사용량 제한 HTTP 429 code 1003' }, now).reason,
+    'rate_limit_cooldown',
+  );
+  assert.equal(
+    discoveryScheduleRetryDecision({
+      ...base,
+      discoveredAt: '2026-07-25 11:20:00',
+      lastError: 'X schedule 사용량 제한 HTTP 429 code 1003',
+    }, now).retry,
+    true,
+  );
+  assert.equal(
+    discoveryScheduleRetryDecision({ ...base, lastError: '필수 X 계정 확인 실패' }, now).reason,
+    'account_constraint',
+  );
+  assert.equal(
+    discoveryScheduleRetryDecision({ ...base, attempts: 3, lastError: 'X 작성창 로딩 실패' }, now).reason,
+    'attempt_limit',
+  );
 });
 
 test('legacy and current dashboard auto-schedule requests both use the queue path', () => {

@@ -33,7 +33,7 @@ export function buildAutomationScopeMetrics({
   postedReviews = [],
   errorReviews = [],
   heartTimeline = [],
-  dailyTarget = 500,
+  dailyTarget = 1000,
   intervalMs = 0,
 } = {}) {
   const selectedComments = comments.filter((item) => matchesDate(item, date));

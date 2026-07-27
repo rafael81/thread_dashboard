@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 const fs = require("fs");
+const crypto = require("crypto");
 const path = require("path");
 const { execFile } = require("child_process");
 
@@ -28,17 +29,39 @@ function normalizeEvalOutput(raw) {
   return null;
 }
 
-function runAgentBrowser(cdp, args, timeoutMs = 30000) {
-  return new Promise((resolve, reject) => {
-    const bin = process.env.AGENT_BROWSER_BIN || "npx";
-    execFile(bin, [
+function geminiAgentBrowserNamespace(cdp) {
+  return `gm-${crypto.createHash("sha1").update(String(cdp || "gemini")).digest("hex").slice(0, 12)}`;
+}
+
+function agentBrowserInvocation(cdp, args, options = {}) {
+  const bin = options.bin || process.env.AGENT_BROWSER_BIN || "npx";
+  const namespace = options.namespace || geminiAgentBrowserNamespace(cdp);
+  return {
+    bin,
+    namespace,
+    args: [
       ...(path.basename(String(bin)) === "npx" ? ["--yes", "agent-browser"] : []),
+      "--namespace", namespace,
+      "--session", namespace,
       "--cdp", cdp,
       ...args,
-    ], {
+    ],
+  };
+}
+
+function runAgentBrowser(cdp, args, timeoutMs = 30000, namespace = geminiAgentBrowserNamespace(cdp)) {
+  return new Promise((resolve, reject) => {
+    const invocation = agentBrowserInvocation(cdp, args, { namespace });
+    execFile(invocation.bin, invocation.args, {
       timeout: timeoutMs,
       maxBuffer: 8 * 1024 * 1024,
-      env: { ...process.env, AGENT_BROWSER_DEFAULT_TIMEOUT: String(Math.max(timeoutMs, 30000)) },
+      env: {
+        ...process.env,
+        AGENT_BROWSER_DEFAULT_TIMEOUT: String(Math.max(timeoutMs, 30000)),
+        // Gemini connects to a separately owned CDP Chrome. Let only the
+        // namespace daemon expire; browser cleanup remains the server's job.
+        AGENT_BROWSER_IDLE_TIMEOUT_MS: process.env.AGENT_BROWSER_IDLE_TIMEOUT_MS || "30000",
+      },
     }, (error, stdout = "", stderr = "") => {
       if (error) {
         error.message = [error.message, stderr, stdout].filter(Boolean).join("\n");
@@ -106,16 +129,17 @@ async function main() {
   const prompt = fs.readFileSync(args.prompt, "utf8");
   const minLength = Math.max(1, Number(args["min-length"] || 6));
   const timeoutMs = Math.max(60000, Number(process.env.TERAFABX_GEMINI_SCRIPT_TIMEOUT_MS || 300000));
-  await runAgentBrowser(args.cdp, ["open", process.env.TERAFABX_GEMINI_WEB_URL || "https://gemini.google.com/app"], 45000);
-  await runAgentBrowser(args.cdp, ["wait", "3500"], 15000);
-  const filled = normalizeEvalOutput(await runAgentBrowser(args.cdp, ["eval", "-b", encodeEval(fillScript(prompt))], 45000));
+  const namespace = geminiAgentBrowserNamespace(args.cdp);
+  await runAgentBrowser(args.cdp, ["open", process.env.TERAFABX_GEMINI_WEB_URL || "https://gemini.google.com/app"], 45000, namespace);
+  await runAgentBrowser(args.cdp, ["wait", "3500"], 15000, namespace);
+  const filled = normalizeEvalOutput(await runAgentBrowser(args.cdp, ["eval", "-b", encodeEval(fillScript(prompt))], 45000, namespace));
   if (!filled?.ok) throw new Error(`Gemini 입력 실패: ${JSON.stringify(filled)}`);
-  await runAgentBrowser(args.cdp, ["press", "Enter"], 15000);
+  await runAgentBrowser(args.cdp, ["press", "Enter"], 15000, namespace);
   const startedAt = Date.now();
   let last = null;
   while (Date.now() - startedAt < timeoutMs) {
     await new Promise((resolve) => setTimeout(resolve, 2500));
-    last = normalizeEvalOutput(await runAgentBrowser(args.cdp, ["eval", "-b", encodeEval(readScript(minLength))], 30000));
+    last = normalizeEvalOutput(await runAgentBrowser(args.cdp, ["eval", "-b", encodeEval(readScript(minLength))], 30000, namespace));
     if (last?.done && last.text) {
       fs.writeFileSync(args.out, last.text);
       process.stdout.write(JSON.stringify({ ok: true, outputLength: last.text.length, responseCount: last.responseCount }));
@@ -125,7 +149,11 @@ async function main() {
   throw new Error(`Gemini 응답 시간 초과: ${JSON.stringify(last).slice(0, 1200)}`);
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error.stack || error.message}\n`);
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  main().catch((error) => {
+    process.stderr.write(`${error.stack || error.message}\n`);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { agentBrowserInvocation, geminiAgentBrowserNamespace };
