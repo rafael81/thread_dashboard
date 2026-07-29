@@ -13,6 +13,10 @@ dashboard, with an optional share target that queues automatic X scheduling.
 
 3. The app extracts the Threads post URL and sends it to the local dashboard server.
 
+URL extraction checks Android text/title extras, `CharSequence` values, intent
+data, stream extras, and every `ClipData` item so sender payload changes do not
+silently drop a valid Threads link.
+
 `대시보드 저장` calls:
 
    `POST {dashboard server URL}/api/discovery/add-url-async`
@@ -39,7 +43,7 @@ Request body:
 }
 ```
 
-The default dashboard server URL is `http://100.81.231.118:3131`, the current
+The default dashboard server URL is `http://100.74.184.62:3131`, the current
 Tailscale address for the local mirror server. For an Android emulator, change
 the URL in the app to `http://10.0.2.2:3131`.
 

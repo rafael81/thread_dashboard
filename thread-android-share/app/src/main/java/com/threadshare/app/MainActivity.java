@@ -1,6 +1,7 @@
 package com.threadshare.app;
 
 import android.app.Activity;
+import android.content.ClipData;
 import android.content.ComponentName;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -29,6 +30,7 @@ import java.io.OutputStreamWriter;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashSet;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -37,7 +39,7 @@ public class MainActivity extends Activity {
     private static final String API_BASE_URL_KEY = "mirror_server_url";
     private static final String QUEUE_KEY = "mirror_queue";
     private static final String SCHEDULE_ENABLED_KEY = "schedule_enabled";
-    private static final String DEFAULT_API_BASE_URL = "http://100.81.231.118:3131";
+    private static final String DEFAULT_API_BASE_URL = "http://100.74.184.62:3131";
     private static final String AUTO_SCHEDULE_ALIAS = "com.threadshare.app.AutoScheduleActivity";
     private static final Pattern THREADS_POST_URL = Pattern.compile(
             "https?://(?:www\\.)?threads\\.(?:com|net)/@([^\\s/?#]+)/post/([^\\s/?#]+)",
@@ -391,9 +393,51 @@ public class MainActivity extends Activity {
     }
 
     private static String extractThreadUrlFromIntent(Intent intent) {
-        if (intent == null || !Intent.ACTION_SEND.equals(intent.getAction())) return null;
-        String text = intent.getStringExtra(Intent.EXTRA_TEXT);
-        return normalizeThreadUrl(text);
+        if (intent == null) return null;
+        String action = intent.getAction();
+        if (!Intent.ACTION_SEND.equals(action) && !Intent.ACTION_SEND_MULTIPLE.equals(action)) return null;
+
+        LinkedHashSet<String> candidates = new LinkedHashSet<>();
+        Bundle extras = intent.getExtras();
+        if (extras != null) {
+            addShareCandidate(candidates, extras.get(Intent.EXTRA_TEXT));
+            addShareCandidate(candidates, extras.get(Intent.EXTRA_TITLE));
+            addShareCandidate(candidates, extras.get(Intent.EXTRA_STREAM));
+        }
+        addShareCandidate(candidates, intent.getCharSequenceExtra(Intent.EXTRA_TEXT));
+        addShareCandidate(candidates, intent.getCharSequenceExtra(Intent.EXTRA_TITLE));
+        addShareCandidate(candidates, intent.getDataString());
+
+        ClipData clipData = intent.getClipData();
+        if (clipData != null) {
+            for (int index = 0; index < clipData.getItemCount(); index += 1) {
+                ClipData.Item item = clipData.getItemAt(index);
+                addShareCandidate(candidates, item.getText());
+                addShareCandidate(candidates, item.getHtmlText());
+                addShareCandidate(candidates, item.getUri());
+                Intent nestedIntent = item.getIntent();
+                if (nestedIntent != null) {
+                    addShareCandidate(candidates, nestedIntent.getDataString());
+                    Bundle nestedExtras = nestedIntent.getExtras();
+                    if (nestedExtras != null) {
+                        addShareCandidate(candidates, nestedExtras.get(Intent.EXTRA_TEXT));
+                        addShareCandidate(candidates, nestedExtras.get(Intent.EXTRA_TITLE));
+                    }
+                }
+            }
+        }
+
+        for (String candidate : candidates) {
+            String normalized = normalizeThreadUrl(candidate);
+            if (normalized != null) return normalized;
+        }
+        return null;
+    }
+
+    private static void addShareCandidate(LinkedHashSet<String> candidates, Object value) {
+        if (value == null) return;
+        String text = String.valueOf(value).trim();
+        if (!text.isEmpty()) candidates.add(text);
     }
 
     static String normalizeThreadUrl(String text) {
