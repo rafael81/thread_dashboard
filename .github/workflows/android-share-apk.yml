@@ -30,11 +30,18 @@ jobs:
         with:
           gradle-version: "8.9"
 
-      - name: Build debug APK
-        run: gradle -p thread-android-share :app:assembleDebug
+      - name: Test and build both debug APKs
+        run: >-
+          gradle -p thread-android-share
+          :app:testDashboardDebugUnitTest
+          :app:testAutoscheduleDebugUnitTest
+          :app:assembleDashboardDebug
+          :app:assembleAutoscheduleDebug
 
       - uses: actions/upload-artifact@v4
         with:
-          name: threads-share-android-v0.6.6
-          path: thread-android-share/app/build/outputs/apk/debug/app-debug.apk
+          name: threads-share-android-v0.7.0
+          path: |
+            thread-android-share/app/build/outputs/apk/dashboard/debug/app-dashboard-debug.apk
+            thread-android-share/app/build/outputs/apk/autoschedule/debug/app-autoschedule-debug.apk
           if-no-files-found: error

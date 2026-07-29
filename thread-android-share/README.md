@@ -1,7 +1,15 @@
 # Thread Android Share
 
-Android share-target app for saving a Threads post to the local discovery
-dashboard, with an optional share target that queues automatic X scheduling.
+Two independent Android share-target apps:
+
+- `대시보드 저장` (`com.threadshare.dashboard`) only saves a Threads post to
+  the local discovery dashboard.
+- `자동 예약` (`com.threadshare.autoschedule`) only queues automatic X
+  scheduling.
+
+The apps share URL parsing and networking code, but have separate package IDs,
+settings, launcher entries, share targets, and fixed server endpoints. Selecting
+one app can never switch to the other action at runtime.
 
 ## Flow
 
@@ -61,12 +69,17 @@ Requires a local Java runtime and Gradle/Android Gradle Plugin access.
 
 ```bash
 cd /Users/user/Documents/thread_download/thread-android-share
-gradle :app:assembleDebug
+gradle \
+  :app:testDashboardDebugUnitTest \
+  :app:testAutoscheduleDebugUnitTest \
+  :app:assembleDashboardDebug \
+  :app:assembleAutoscheduleDebug
 ```
 
-On this machine, Gradle exists only in the wrapper cache and no Java runtime is
-currently available on PATH, so the build could not be completed from this
-session.
+Build outputs:
+
+- `app/build/outputs/apk/dashboard/debug/app-dashboard-debug.apk`
+- `app/build/outputs/apk/autoschedule/debug/app-autoschedule-debug.apk`
 
 ## Server
 

@@ -2,7 +2,6 @@ package com.threadshare.app;
 
 import android.app.Activity;
 import android.content.ClipData;
-import android.content.ComponentName;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Color;
@@ -42,7 +41,6 @@ public class MainActivity extends Activity {
     private static final String QUEUE_KEY = "mirror_queue";
     private static final String SCHEDULE_ENABLED_KEY = "schedule_enabled";
     private static final String DEFAULT_API_BASE_URL = "http://100.74.184.62:3131";
-    private static final String AUTO_SCHEDULE_ALIAS = "com.threadshare.app.AutoScheduleActivity";
     private static final Pattern THREADS_POST_URL = Pattern.compile(
             "https?://(?:www\\.)?threads\\.(?:com|net)/@([^\\s/?#]+)/post/([^\\s/?#]+)",
             Pattern.CASE_INSENSITIVE
@@ -52,12 +50,8 @@ public class MainActivity extends Activity {
             Pattern.CASE_INSENSITIVE
     );
 
-    private enum ShareAction {
-        SAVE_TO_DASHBOARD,
-        AUTO_SCHEDULE
-    }
-
-    private ShareAction shareAction = ShareAction.SAVE_TO_DASHBOARD;
+    private final ShareTargetConfig shareConfig =
+            ShareTargetConfig.fromBuildMode(BuildConfig.SHARE_MODE);
     private TextView titleText;
     private EditText serverUrlInput;
     private EditText threadUrlInput;
@@ -73,7 +67,6 @@ public class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         handler = new Handler(Looper.getMainLooper());
         clearOldManagedState();
-        shareAction = shareActionFromIntent(getIntent());
         setContentView(buildContentView());
         handleIntent(getIntent());
     }
@@ -82,7 +75,6 @@ public class MainActivity extends Activity {
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
-        shareAction = shareActionFromIntent(intent);
         updateActionLabels();
         handleIntent(intent);
     }
@@ -155,7 +147,7 @@ public class MainActivity extends Activity {
         root.addView(statusText, topMargin(matchWrap(), 16));
 
         updateActionLabels();
-        setStatus(idleStatusForAction(shareAction), true);
+        setStatus(shareConfig.idleStatus, true);
         return scrollView;
     }
 
@@ -168,10 +160,12 @@ public class MainActivity extends Activity {
     }
 
     private void handleIntent(Intent intent) {
-        if (intent == null || !Intent.ACTION_SEND.equals(intent.getAction())) {
+        if (intent == null
+                || (!Intent.ACTION_SEND.equals(intent.getAction())
+                && !Intent.ACTION_SEND_MULTIPLE.equals(intent.getAction()))) {
             sharedUrlText.setText("");
             setLoading(false);
-            setStatus(idleStatusForAction(shareAction), true);
+            setStatus(shareConfig.idleStatus, true);
             return;
         }
         String threadUrl = extractThreadUrlFromIntent(intent);
@@ -201,7 +195,6 @@ public class MainActivity extends Activity {
             setStatus("이미 서버로 전송 중입니다.", true);
             return;
         }
-        final ShareAction action = shareAction;
         posting = true;
         String apiBaseUrl = normalizeApiBaseUrl(serverUrlInput.getText().toString());
         serverUrlInput.setText(apiBaseUrl);
@@ -213,19 +206,19 @@ public class MainActivity extends Activity {
         sharedUrlText.setText(threadUrl);
         setLoading(true);
         submitButton.setEnabled(false);
-        setStatus(sendingStatusForAction(action), true);
+        setStatus(shareConfig.sendingStatus, true);
 
         new Thread(new Runnable() {
             @Override
             public void run() {
-                final MirrorResult result = postMirrorRequest(apiBaseUrl, threadUrl, action);
+                final MirrorResult result = postMirrorRequest(apiBaseUrl, threadUrl);
                 runOnUiThread(new Runnable() {
                     @Override
                     public void run() {
                         posting = false;
                         setLoading(false);
                         submitButton.setEnabled(true);
-                        setStatus(currentStatusMessage(result, action), result.ok || result.duplicate);
+                        setStatus(currentStatusMessage(result), result.ok || result.duplicate);
                         if (finishOnSuccess && (result.ok || result.duplicate)) {
                             handler.postDelayed(new Runnable() {
                                 @Override
@@ -242,11 +235,11 @@ public class MainActivity extends Activity {
         }).start();
     }
 
-    private MirrorResult postMirrorRequest(String apiBaseUrl, String threadUrl, ShareAction action) {
+    private MirrorResult postMirrorRequest(String apiBaseUrl, String threadUrl) {
         HttpURLConnection connection = null;
         try {
             String resolvedThreadUrl = resolveThreadUrlForServer(threadUrl);
-            URL endpoint = new URL(apiBaseUrl + endpointPathForAction(action));
+            URL endpoint = new URL(apiBaseUrl + shareConfig.endpointPath);
             connection = (HttpURLConnection) endpoint.openConnection();
             connection.setRequestMethod("POST");
             connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
@@ -256,7 +249,7 @@ public class MainActivity extends Activity {
 
             JSONObject body = new JSONObject();
             body.put("url", resolvedThreadUrl);
-            body.put("origin", originForAction(action));
+            body.put("origin", shareConfig.origin);
 
             try (BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(connection.getOutputStream(), StandardCharsets.UTF_8))) {
                 writer.write(body.toString());
@@ -269,9 +262,9 @@ public class MainActivity extends Activity {
                 return MirrorResult.duplicate();
             }
             if (status < 200 || status >= 300 || !response.optBoolean("ok", false)) {
-                return MirrorResult.error(response.optString("error", failureMessageForAction(action, status)));
+                return MirrorResult.error(response.optString("error", shareConfig.failureMessage(status)));
             }
-            return MirrorResult.success(response.optString("message", successMessageForAction(action)));
+            return MirrorResult.success(response.optString("message", shareConfig.successMessage));
         } catch (Exception error) {
             return MirrorResult.error("대시보드 서버 연결 실패: " + error.getMessage());
         } finally {
@@ -281,9 +274,9 @@ public class MainActivity extends Activity {
         }
     }
 
-    private String currentStatusMessage(MirrorResult result, ShareAction action) {
+    private String currentStatusMessage(MirrorResult result) {
         if (result.ok) {
-            return result.message == null || result.message.isEmpty() ? successMessageForAction(action) : result.message;
+            return result.message == null || result.message.isEmpty() ? shareConfig.successMessage : result.message;
         }
         if (result.duplicate) return "이미 처리된 공유입니다.";
         return result.message;
@@ -291,60 +284,11 @@ public class MainActivity extends Activity {
 
     private void updateActionLabels() {
         if (titleText != null) {
-            titleText.setText(titleForAction(shareAction));
+            titleText.setText(shareConfig.title);
         }
         if (submitButton != null) {
-            submitButton.setText(buttonTextForAction(shareAction));
+            submitButton.setText(shareConfig.buttonText);
         }
-    }
-
-    private static ShareAction shareActionFromIntent(Intent intent) {
-        ComponentName component = intent == null ? null : intent.getComponent();
-        String className = component == null ? "" : component.getClassName();
-        if (AUTO_SCHEDULE_ALIAS.equals(className)) {
-            return ShareAction.AUTO_SCHEDULE;
-        }
-        return ShareAction.SAVE_TO_DASHBOARD;
-    }
-
-    private static String endpointPathForAction(ShareAction action) {
-        if (action == ShareAction.AUTO_SCHEDULE) return "/api/discovery/auto-schedule-async";
-        return "/api/discovery/add-url-async";
-    }
-
-    private static String originForAction(ShareAction action) {
-        if (action == ShareAction.AUTO_SCHEDULE) return "android_share_auto_schedule";
-        return "android_share";
-    }
-
-    private static String titleForAction(ShareAction action) {
-        if (action == ShareAction.AUTO_SCHEDULE) return "Threads 자동 예약";
-        return "Threads 발굴 대시보드";
-    }
-
-    private static String buttonTextForAction(ShareAction action) {
-        if (action == ShareAction.AUTO_SCHEDULE) return "자동 예약 접수";
-        return "대시보드에 추가";
-    }
-
-    private static String idleStatusForAction(ShareAction action) {
-        if (action == ShareAction.AUTO_SCHEDULE) return "Threads 글을 공유하면 대시보드에 저장하고 자동 예약합니다.";
-        return "Threads 글을 공유하면 발굴 대시보드에 추가합니다.";
-    }
-
-    private static String sendingStatusForAction(ShareAction action) {
-        if (action == ShareAction.AUTO_SCHEDULE) return "자동 예약 접수 중...";
-        return "서버로 전송 중...";
-    }
-
-    private static String successMessageForAction(ShareAction action) {
-        if (action == ShareAction.AUTO_SCHEDULE) return "자동 예약 접수됨";
-        return "대시보드 추가 접수됨";
-    }
-
-    private static String failureMessageForAction(ShareAction action, int status) {
-        if (action == ShareAction.AUTO_SCHEDULE) return "자동 예약 접수 실패 (" + status + ")";
-        return "대시보드 추가 실패 (" + status + ")";
     }
 
     private void setLoading(boolean loading) {
