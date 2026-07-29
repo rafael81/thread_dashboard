@@ -1,0 +1,440 @@
+package com.threadshare.app;
+
+import android.app.Activity;
+import android.content.ComponentName;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.graphics.Color;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.text.InputType;
+import android.view.Gravity;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.Button;
+import android.widget.EditText;
+import android.widget.LinearLayout;
+import android.widget.ProgressBar;
+import android.widget.ScrollView;
+import android.widget.TextView;
+
+import org.json.JSONObject;
+
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class MainActivity extends Activity {
+    private static final String PREFS_NAME = "thread_share_settings";
+    private static final String API_BASE_URL_KEY = "mirror_server_url";
+    private static final String QUEUE_KEY = "mirror_queue";
+    private static final String SCHEDULE_ENABLED_KEY = "schedule_enabled";
+    private static final String DEFAULT_API_BASE_URL = "http://100.81.231.118:3131";
+    private static final String AUTO_SCHEDULE_ALIAS = "com.threadshare.app.AutoScheduleActivity";
+    private static final Pattern THREADS_POST_URL = Pattern.compile(
+            "https?://(?:www\\.)?threads\\.(?:com|net)/@([^\\s/?#]+)/post/([^\\s/?#]+)",
+            Pattern.CASE_INSENSITIVE
+    );
+
+    private enum ShareAction {
+        SAVE_TO_DASHBOARD,
+        AUTO_SCHEDULE
+    }
+
+    private ShareAction shareAction = ShareAction.SAVE_TO_DASHBOARD;
+    private TextView titleText;
+    private EditText serverUrlInput;
+    private EditText threadUrlInput;
+    private Button submitButton;
+    private TextView statusText;
+    private TextView sharedUrlText;
+    private ProgressBar progressBar;
+    private Handler handler;
+    private volatile boolean posting;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        handler = new Handler(Looper.getMainLooper());
+        clearOldManagedState();
+        shareAction = shareActionFromIntent(getIntent());
+        setContentView(buildContentView());
+        handleIntent(getIntent());
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        shareAction = shareActionFromIntent(intent);
+        updateActionLabels();
+        handleIntent(intent);
+    }
+
+    private View buildContentView() {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+
+        ScrollView scrollView = new ScrollView(this);
+        scrollView.setFillViewport(true);
+        scrollView.setBackgroundColor(Color.WHITE);
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setGravity(Gravity.CENTER_HORIZONTAL);
+        root.setPadding(dp(20), dp(22), dp(20), dp(20));
+        root.setLayoutParams(new ScrollView.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
+        scrollView.addView(root);
+
+        titleText = new TextView(this);
+        titleText.setTextColor(Color.rgb(15, 20, 25));
+        titleText.setTextSize(22);
+        titleText.setGravity(Gravity.START);
+        root.addView(titleText, matchWrap());
+
+        TextView serverLabel = label("대시보드 서버 URL");
+        root.addView(serverLabel, topMargin(matchWrap(), 22));
+
+        serverUrlInput = new EditText(this);
+        serverUrlInput.setSingleLine(true);
+        serverUrlInput.setInputType(InputType.TYPE_TEXT_VARIATION_URI);
+        serverUrlInput.setText(prefs.getString(API_BASE_URL_KEY, DEFAULT_API_BASE_URL));
+        root.addView(serverUrlInput, matchWrap());
+
+        TextView sharedLabel = label("공유 URL");
+        root.addView(sharedLabel, topMargin(matchWrap(), 18));
+
+        threadUrlInput = new EditText(this);
+        threadUrlInput.setSingleLine(false);
+        threadUrlInput.setMinLines(2);
+        threadUrlInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+        threadUrlInput.setHint("Threads 원글 URL 입력");
+        root.addView(threadUrlInput, matchWrap());
+
+        submitButton = new Button(this);
+        submitButton.setAllCaps(false);
+        submitButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                submitTypedUrl();
+            }
+        });
+        root.addView(submitButton, topMargin(matchWrap(), 10));
+
+        sharedUrlText = new TextView(this);
+        sharedUrlText.setTextColor(Color.rgb(83, 100, 113));
+        sharedUrlText.setTextSize(14);
+        sharedUrlText.setTextIsSelectable(true);
+        root.addView(sharedUrlText, matchWrap());
+
+        progressBar = new ProgressBar(this);
+        progressBar.setVisibility(View.GONE);
+        root.addView(progressBar, topMargin(wrapWrap(), 18));
+
+        statusText = new TextView(this);
+        statusText.setTextColor(Color.rgb(15, 20, 25));
+        statusText.setTextSize(15);
+        root.addView(statusText, topMargin(matchWrap(), 16));
+
+        updateActionLabels();
+        setStatus(idleStatusForAction(shareAction), true);
+        return scrollView;
+    }
+
+    private void clearOldManagedState() {
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .edit()
+                .remove(QUEUE_KEY)
+                .remove(SCHEDULE_ENABLED_KEY)
+                .apply();
+    }
+
+    private void handleIntent(Intent intent) {
+        if (intent == null || !Intent.ACTION_SEND.equals(intent.getAction())) {
+            sharedUrlText.setText("");
+            setLoading(false);
+            setStatus(idleStatusForAction(shareAction), true);
+            return;
+        }
+        String threadUrl = extractThreadUrlFromIntent(intent);
+        if (threadUrl == null) {
+            sharedUrlText.setText("");
+            setLoading(false);
+            setStatus("공유 텍스트에서 Threads 원글 URL을 찾지 못했습니다.", false);
+            return;
+        }
+        threadUrlInput.setText(threadUrl);
+        postImmediately(threadUrl, true);
+    }
+
+    private void submitTypedUrl() {
+        String threadUrl = normalizeThreadUrl(threadUrlInput.getText().toString());
+        if (threadUrl == null) {
+            sharedUrlText.setText("");
+            setLoading(false);
+            setStatus("Threads 원글 URL을 입력해 주세요.", false);
+            return;
+        }
+        postImmediately(threadUrl, false);
+    }
+
+    private void postImmediately(String threadUrl, boolean finishOnSuccess) {
+        if (posting) {
+            setStatus("이미 서버로 전송 중입니다.", true);
+            return;
+        }
+        final ShareAction action = shareAction;
+        posting = true;
+        String apiBaseUrl = normalizeApiBaseUrl(serverUrlInput.getText().toString());
+        serverUrlInput.setText(apiBaseUrl);
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .edit()
+                .putString(API_BASE_URL_KEY, apiBaseUrl)
+                .apply();
+
+        sharedUrlText.setText(threadUrl);
+        setLoading(true);
+        submitButton.setEnabled(false);
+        setStatus(sendingStatusForAction(action), true);
+
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final MirrorResult result = postMirrorRequest(apiBaseUrl, threadUrl, action);
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        posting = false;
+                        setLoading(false);
+                        submitButton.setEnabled(true);
+                        setStatus(currentStatusMessage(result, action), result.ok || result.duplicate);
+                        if (finishOnSuccess && (result.ok || result.duplicate)) {
+                            handler.postDelayed(new Runnable() {
+                                @Override
+                                public void run() {
+                                    if (!isFinishing()) {
+                                        finish();
+                                    }
+                                }
+                            }, 700);
+                        }
+                    }
+                });
+            }
+        }).start();
+    }
+
+    private MirrorResult postMirrorRequest(String apiBaseUrl, String threadUrl, ShareAction action) {
+        HttpURLConnection connection = null;
+        try {
+            URL endpoint = new URL(apiBaseUrl + endpointPathForAction(action));
+            connection = (HttpURLConnection) endpoint.openConnection();
+            connection.setRequestMethod("POST");
+            connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+            connection.setConnectTimeout(8000);
+            connection.setReadTimeout(12000);
+            connection.setDoOutput(true);
+
+            JSONObject body = new JSONObject();
+            body.put("url", threadUrl);
+            body.put("origin", originForAction(action));
+
+            try (BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(connection.getOutputStream(), StandardCharsets.UTF_8))) {
+                writer.write(body.toString());
+            }
+
+            int status = connection.getResponseCode();
+            String responseText = readStream(status >= 400 ? connection.getErrorStream() : connection.getInputStream());
+            JSONObject response = responseText.isEmpty() ? new JSONObject() : new JSONObject(responseText);
+            if (status == 409) {
+                return MirrorResult.duplicate();
+            }
+            if (status < 200 || status >= 300 || !response.optBoolean("ok", false)) {
+                return MirrorResult.error(response.optString("error", failureMessageForAction(action, status)));
+            }
+            return MirrorResult.success(response.optString("message", successMessageForAction(action)));
+        } catch (Exception error) {
+            return MirrorResult.error("대시보드 서버 연결 실패: " + error.getMessage());
+        } finally {
+            if (connection != null) {
+                connection.disconnect();
+            }
+        }
+    }
+
+    private String currentStatusMessage(MirrorResult result, ShareAction action) {
+        if (result.ok) {
+            return result.message == null || result.message.isEmpty() ? successMessageForAction(action) : result.message;
+        }
+        if (result.duplicate) return "이미 처리된 공유입니다.";
+        return result.message;
+    }
+
+    private void updateActionLabels() {
+        if (titleText != null) {
+            titleText.setText(titleForAction(shareAction));
+        }
+        if (submitButton != null) {
+            submitButton.setText(buttonTextForAction(shareAction));
+        }
+    }
+
+    private static ShareAction shareActionFromIntent(Intent intent) {
+        ComponentName component = intent == null ? null : intent.getComponent();
+        String className = component == null ? "" : component.getClassName();
+        if (AUTO_SCHEDULE_ALIAS.equals(className)) {
+            return ShareAction.AUTO_SCHEDULE;
+        }
+        return ShareAction.SAVE_TO_DASHBOARD;
+    }
+
+    private static String endpointPathForAction(ShareAction action) {
+        if (action == ShareAction.AUTO_SCHEDULE) return "/api/discovery/auto-schedule-async";
+        return "/api/discovery/add-url-async";
+    }
+
+    private static String originForAction(ShareAction action) {
+        if (action == ShareAction.AUTO_SCHEDULE) return "android_share_auto_schedule";
+        return "android_share";
+    }
+
+    private static String titleForAction(ShareAction action) {
+        if (action == ShareAction.AUTO_SCHEDULE) return "Threads 자동 예약";
+        return "Threads 발굴 대시보드";
+    }
+
+    private static String buttonTextForAction(ShareAction action) {
+        if (action == ShareAction.AUTO_SCHEDULE) return "자동 예약 접수";
+        return "대시보드에 추가";
+    }
+
+    private static String idleStatusForAction(ShareAction action) {
+        if (action == ShareAction.AUTO_SCHEDULE) return "Threads 글을 공유하면 대시보드에 저장하고 자동 예약합니다.";
+        return "Threads 글을 공유하면 발굴 대시보드에 추가합니다.";
+    }
+
+    private static String sendingStatusForAction(ShareAction action) {
+        if (action == ShareAction.AUTO_SCHEDULE) return "자동 예약 접수 중...";
+        return "서버로 전송 중...";
+    }
+
+    private static String successMessageForAction(ShareAction action) {
+        if (action == ShareAction.AUTO_SCHEDULE) return "자동 예약 접수됨";
+        return "대시보드 추가 접수됨";
+    }
+
+    private static String failureMessageForAction(ShareAction action, int status) {
+        if (action == ShareAction.AUTO_SCHEDULE) return "자동 예약 접수 실패 (" + status + ")";
+        return "대시보드 추가 실패 (" + status + ")";
+    }
+
+    private void setLoading(boolean loading) {
+        progressBar.setVisibility(loading ? View.VISIBLE : View.GONE);
+    }
+
+    private void setStatus(String text, boolean normal) {
+        statusText.setText(text);
+        statusText.setTextColor(normal ? Color.rgb(15, 20, 25) : Color.rgb(180, 35, 24));
+    }
+
+    private String readStream(InputStream stream) throws Exception {
+        if (stream == null) return "";
+        StringBuilder builder = new StringBuilder();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                builder.append(line);
+            }
+        }
+        return builder.toString();
+    }
+
+    private TextView label(String text) {
+        TextView label = new TextView(this);
+        label.setText(text);
+        label.setTextColor(Color.rgb(83, 100, 113));
+        label.setTextSize(13);
+        return label;
+    }
+
+    private LinearLayout.LayoutParams matchWrap() {
+        return new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+    }
+
+    private LinearLayout.LayoutParams wrapWrap() {
+        return new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+    }
+
+    private LinearLayout.LayoutParams topMargin(LinearLayout.LayoutParams params, int marginDp) {
+        params.topMargin = dp(marginDp);
+        return params;
+    }
+
+    private int dp(int value) {
+        return Math.round(value * getResources().getDisplayMetrics().density);
+    }
+
+    private static String extractThreadUrlFromIntent(Intent intent) {
+        if (intent == null || !Intent.ACTION_SEND.equals(intent.getAction())) return null;
+        String text = intent.getStringExtra(Intent.EXTRA_TEXT);
+        return normalizeThreadUrl(text);
+    }
+
+    static String normalizeThreadUrl(String text) {
+        if (text == null) return null;
+        Matcher matcher = THREADS_POST_URL.matcher(text);
+        if (!matcher.find()) return null;
+        return "https://www.threads.com/@" + matcher.group(1) + "/post/" + matcher.group(2);
+    }
+
+    private static String normalizeApiBaseUrl(String value) {
+        String normalized = value == null ? "" : value.trim();
+        if (normalized.isEmpty()) {
+            normalized = DEFAULT_API_BASE_URL;
+        }
+        while (normalized.endsWith("/")) {
+            normalized = normalized.substring(0, normalized.length() - 1);
+        }
+        return normalized;
+    }
+
+    private static class MirrorResult {
+        final boolean ok;
+        final boolean duplicate;
+        final String message;
+
+        private MirrorResult(boolean ok, boolean duplicate, String message) {
+            this.ok = ok;
+            this.duplicate = duplicate;
+            this.message = message;
+        }
+
+        static MirrorResult success(String message) {
+            return new MirrorResult(true, false, message);
+        }
+
+        static MirrorResult duplicate() {
+            return new MirrorResult(false, true, null);
+        }
+
+        static MirrorResult error(String message) {
+            return new MirrorResult(false, false, message);
+        }
+    }
+}
