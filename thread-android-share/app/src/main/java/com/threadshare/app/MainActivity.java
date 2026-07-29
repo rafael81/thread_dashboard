@@ -383,7 +383,9 @@ public class MainActivity extends Activity {
             resolver.setInstanceFollowRedirects(true);
             resolver.setRequestMethod("GET");
             resolver.setRequestProperty("Accept", "text/html,application/xhtml+xml");
-            resolver.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android) AppleWebKit/537.36 Chrome/145 Mobile Safari/537.36");
+            // Threads serves a non-redirecting app shell to mobile browser UAs,
+            // while generic HTTP clients receive the canonical post redirect.
+            resolver.setRequestProperty("User-Agent", "curl/8.7.1");
             resolver.setConnectTimeout(8000);
             resolver.setReadTimeout(12000);
 

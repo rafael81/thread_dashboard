@@ -29,6 +29,8 @@ test("Threads Android share parser accepts and resolves current short share URLs
   assert.match(activitySource, /threads\\\\\.\(\?:com\|net\)\/t\//);
   assert.match(activitySource, /resolveThreadUrlForServer\(threadUrl\)/);
   assert.match(activitySource, /setInstanceFollowRedirects\(true\)/);
+  assert.match(activitySource, /setRequestProperty\("User-Agent", "curl\/8\.7\.1"\)/);
+  assert.doesNotMatch(activitySource, /User-Agent", "Mozilla\/5\.0 \(Linux; Android\)/);
   assert.match(activitySource, /body\.put\("url", resolvedThreadUrl\)/);
 });
 
@@ -38,10 +40,10 @@ test("Threads Android share target accepts single and multiple send intents", ()
 });
 
 test("Threads Android share parser fix increments the app version consistently", () => {
-  assert.match(manifestSource, /android:versionCode="11"/);
-  assert.match(manifestSource, /android:versionName="0\.6\.5"/);
-  assert.match(gradleSource, /versionCode = 11/);
-  assert.match(gradleSource, /versionName = "0\.6\.5"/);
+  assert.match(manifestSource, /android:versionCode="12"/);
+  assert.match(manifestSource, /android:versionName="0\.6\.6"/);
+  assert.match(gradleSource, /versionCode = 12/);
+  assert.match(gradleSource, /versionName = "0\.6\.6"/);
 });
 
 test("Threads Android share app defaults to the current Tailscale dashboard address", () => {
