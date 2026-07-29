@@ -40,7 +40,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: threads-share-android-v0.7.0
+          name: threads-share-android-v0.7.1
           path: |
             thread-android-share/app/build/outputs/apk/dashboard/debug/app-dashboard-debug.apk
             thread-android-share/app/build/outputs/apk/autoschedule/debug/app-autoschedule-debug.apk

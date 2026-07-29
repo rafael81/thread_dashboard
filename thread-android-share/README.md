@@ -24,9 +24,9 @@ one app can never switch to the other action at runtime.
 URL extraction checks Android text/title extras, `CharSequence` values, intent
 data, stream extras, and every `ClipData` item so sender payload changes do not
 silently drop a valid Threads link.
-Full `/@user/post/id` links and current `/t/id` short share links are both
-accepted. Short links are resolved to the canonical post URL before the app
-sends its dashboard request.
+Full `/@user/post/id` links, legacy `/t/id` links, and current
+`/share/token/` links are accepted. Redirect links are resolved to the canonical
+post URL before the app sends its dashboard request.
 
 `대시보드 저장` calls:
 

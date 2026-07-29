@@ -31,8 +31,6 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashSet;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 public class MainActivity extends Activity {
     private static final String TAG = "ThreadShare";
@@ -41,14 +39,6 @@ public class MainActivity extends Activity {
     private static final String QUEUE_KEY = "mirror_queue";
     private static final String SCHEDULE_ENABLED_KEY = "schedule_enabled";
     private static final String DEFAULT_API_BASE_URL = "http://100.74.184.62:3131";
-    private static final Pattern THREADS_POST_URL = Pattern.compile(
-            "https?://(?:www\\.)?threads\\.(?:com|net)/@([^\\s/?#]+)/post/([^\\s/?#]+)",
-            Pattern.CASE_INSENSITIVE
-    );
-    private static final Pattern THREADS_SHORT_URL = Pattern.compile(
-            "https?://(?:www\\.)?threads\\.(?:com|net)/t/([^\\s/?#]+)",
-            Pattern.CASE_INSENSITIVE
-    );
 
     private final ShareTargetConfig shareConfig =
             ShareTargetConfig.fromBuildMode(BuildConfig.SHARE_MODE);
@@ -313,17 +303,16 @@ public class MainActivity extends Activity {
     }
 
     private String resolveThreadUrlForServer(String threadUrl) throws Exception {
-        String canonicalUrl = normalizeCanonicalThreadUrl(threadUrl);
+        String canonicalUrl = ThreadsUrlNormalizer.normalizeCanonicalUrl(threadUrl);
         if (canonicalUrl != null) return canonicalUrl;
 
-        Matcher shortMatcher = THREADS_SHORT_URL.matcher(threadUrl == null ? "" : threadUrl);
-        if (!shortMatcher.find()) {
-            throw new IllegalArgumentException("Threads 원글 또는 단축 공유 URL 형식이 아닙니다.");
+        String redirectUrl = ThreadsUrlNormalizer.normalizeRedirectUrl(threadUrl);
+        if (redirectUrl == null) {
+            throw new IllegalArgumentException("Threads 원글 또는 공유 URL 형식이 아닙니다.");
         }
-        String shortUrl = "https://www.threads.com/t/" + shortMatcher.group(1);
         HttpURLConnection resolver = null;
         try {
-            resolver = (HttpURLConnection) new URL(shortUrl).openConnection();
+            resolver = (HttpURLConnection) new URL(redirectUrl).openConnection();
             resolver.setInstanceFollowRedirects(true);
             resolver.setRequestMethod("GET");
             resolver.setRequestProperty("Accept", "text/html,application/xhtml+xml");
@@ -334,21 +323,21 @@ public class MainActivity extends Activity {
             resolver.setReadTimeout(12000);
 
             int status = resolver.getResponseCode();
-            canonicalUrl = normalizeCanonicalThreadUrl(resolver.getURL().toString());
+            canonicalUrl = ThreadsUrlNormalizer.normalizeCanonicalUrl(resolver.getURL().toString());
             if (canonicalUrl != null) {
                 Log.i(TAG, "Resolved Threads short URL to " + canonicalUrl);
                 return canonicalUrl;
             }
 
             String location = resolver.getHeaderField("Location");
-            canonicalUrl = normalizeCanonicalThreadUrl(location);
+            canonicalUrl = ThreadsUrlNormalizer.normalizeCanonicalUrl(location);
             if (canonicalUrl != null) return canonicalUrl;
 
             InputStream stream = status >= 400 ? resolver.getErrorStream() : resolver.getInputStream();
             String body = readStream(stream).replace("\\/", "/").replace("&amp;", "&");
-            canonicalUrl = normalizeCanonicalThreadUrl(body);
+            canonicalUrl = ThreadsUrlNormalizer.normalizeCanonicalUrl(body);
             if (canonicalUrl != null) return canonicalUrl;
-            throw new IllegalStateException("Threads 단축 공유 URL을 원문 URL로 변환하지 못했습니다. HTTP " + status);
+            throw new IllegalStateException("Threads 공유 URL을 원문 URL로 변환하지 못했습니다. HTTP " + status);
         } finally {
             if (resolver != null) resolver.disconnect();
         }
@@ -438,19 +427,7 @@ public class MainActivity extends Activity {
     }
 
     static String normalizeThreadUrl(String text) {
-        String canonicalUrl = normalizeCanonicalThreadUrl(text);
-        if (canonicalUrl != null) return canonicalUrl;
-        if (text == null) return null;
-        Matcher matcher = THREADS_SHORT_URL.matcher(text);
-        if (!matcher.find()) return null;
-        return "https://www.threads.com/t/" + matcher.group(1);
-    }
-
-    private static String normalizeCanonicalThreadUrl(String text) {
-        if (text == null) return null;
-        Matcher matcher = THREADS_POST_URL.matcher(text);
-        if (!matcher.find()) return null;
-        return "https://www.threads.com/@" + matcher.group(1) + "/post/" + matcher.group(2);
+        return ThreadsUrlNormalizer.normalizeSharedUrl(text);
     }
 
     private static String normalizeApiBaseUrl(String value) {
