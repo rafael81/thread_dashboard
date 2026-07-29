@@ -25,8 +25,9 @@ URL extraction checks Android text/title extras, `CharSequence` values, intent
 data, stream extras, and every `ClipData` item so sender payload changes do not
 silently drop a valid Threads link.
 Full `/@user/post/id` links, legacy `/t/id` links, and current
-`/share/token/` links are accepted. Redirect links are resolved to the canonical
-post URL before the app sends its dashboard request.
+`/share/token/` links are accepted. The app forwards the shared URL form directly
+to the dashboard server; the server owns redirect resolution and canonical URL
+normalization so future resolver changes do not require an Android app update.
 
 `대시보드 저장` calls:
 

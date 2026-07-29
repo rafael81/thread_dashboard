@@ -7,6 +7,10 @@ const path = require("path");
 const { URL } = require("url");
 const { execFile, spawn } = require("child_process");
 const WebSocket = require("ws");
+const {
+  normalizeCanonicalThreadsUrl,
+  resolveThreadsSharedUrl,
+} = require("./lib/threads-shared-url");
 
 function loadDotEnvFile(filePath = path.join(__dirname, ".env")) {
   if (!fs.existsSync(filePath)) return;
@@ -13501,13 +13505,7 @@ async function runTerafabxCommentMonitor(options = {}) {
 }
 
 function validateThreadsUrl(value) {
-  const parsed = new URL(value);
-  if (!/^www\.threads\.(com|net)$|^threads\.(com|net)$/.test(parsed.hostname)) {
-    throw new Error("threads.com 또는 threads.net URL만 허용됩니다.");
-  }
-  const match = parsed.pathname.match(/^\/@([^/]+)\/post\/([^/]+)/);
-  if (!match) throw new Error("Threads 원글 URL 형식이 아닙니다.");
-  return `https://www.threads.com/@${match[1]}/post/${match[2]}`;
+  return normalizeCanonicalThreadsUrl(value);
 }
 
 function validateYouTubeUrl(value) {
@@ -13572,6 +13570,21 @@ function normalizeDiscoveryUrl(value) {
   if (isInssiderPostUrl(value)) return validateInssiderUrl(value).canonicalUrl;
   if (isYouTubeUrl(value)) return validateYouTubeUrl(value);
   return validateThreadsUrl(value);
+}
+
+async function resolveDiscoveryUrl(value) {
+  if (isInssiderPostUrl(value)) return validateInssiderUrl(value).canonicalUrl;
+  if (isYouTubeUrl(value)) return validateYouTubeUrl(value);
+  try {
+    return validateThreadsUrl(value);
+  } catch {
+    const canonicalUrl = await resolveThreadsSharedUrl(value);
+    logEvent("threads_shared_url_resolved", {
+      sharedUrl: String(value || "").slice(0, 240),
+      canonicalUrl,
+    });
+    return canonicalUrl;
+  }
 }
 
 function parseCompactCount(value) {
@@ -15687,7 +15700,7 @@ async function markDiscoveryExtractionFailed(canonicalUrl, details = {}) {
 }
 
 async function addDiscoveryPlaceholder(url, options = {}) {
-  const canonicalUrl = normalizeDiscoveryUrl(url);
+  const canonicalUrl = await resolveDiscoveryUrl(url);
   const db = await getDiscoveryDb();
   const author = isYouTubeUrl(canonicalUrl)
     ? "YouTube"
@@ -20121,7 +20134,7 @@ const server = http.createServer(async (req, res) => {
     try {
       const body = await readRequestBody(req);
       const payload = JSON.parse(body || "{}");
-      const canonicalUrl = normalizeDiscoveryUrl(payload.url);
+      const canonicalUrl = await resolveDiscoveryUrl(payload.url);
       const threadPost = await extractThreadPost(canonicalUrl);
       json(res, 200, {
         ok: true,
@@ -20500,7 +20513,7 @@ const server = http.createServer(async (req, res) => {
     try {
       const body = await readRequestBody(req);
       const payload = JSON.parse(body || "{}");
-      const canonicalUrl = normalizeDiscoveryUrl(payload.url);
+      const canonicalUrl = await resolveDiscoveryUrl(payload.url);
       const source = payload.origin || (autoScheduleRequestMode === "legacy"
         ? "dashboard_auto_schedule_legacy"
         : "auto_schedule_async");

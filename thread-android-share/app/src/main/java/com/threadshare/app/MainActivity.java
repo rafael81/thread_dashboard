@@ -228,7 +228,6 @@ public class MainActivity extends Activity {
     private MirrorResult postMirrorRequest(String apiBaseUrl, String threadUrl) {
         HttpURLConnection connection = null;
         try {
-            String resolvedThreadUrl = resolveThreadUrlForServer(threadUrl);
             URL endpoint = new URL(apiBaseUrl + shareConfig.endpointPath);
             connection = (HttpURLConnection) endpoint.openConnection();
             connection.setRequestMethod("POST");
@@ -238,7 +237,7 @@ public class MainActivity extends Activity {
             connection.setDoOutput(true);
 
             JSONObject body = new JSONObject();
-            body.put("url", resolvedThreadUrl);
+            body.put("url", threadUrl);
             body.put("origin", shareConfig.origin);
 
             try (BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(connection.getOutputStream(), StandardCharsets.UTF_8))) {
@@ -300,47 +299,6 @@ public class MainActivity extends Activity {
             }
         }
         return builder.toString();
-    }
-
-    private String resolveThreadUrlForServer(String threadUrl) throws Exception {
-        String canonicalUrl = ThreadsUrlNormalizer.normalizeCanonicalUrl(threadUrl);
-        if (canonicalUrl != null) return canonicalUrl;
-
-        String redirectUrl = ThreadsUrlNormalizer.normalizeRedirectUrl(threadUrl);
-        if (redirectUrl == null) {
-            throw new IllegalArgumentException("Threads 원글 또는 공유 URL 형식이 아닙니다.");
-        }
-        HttpURLConnection resolver = null;
-        try {
-            resolver = (HttpURLConnection) new URL(redirectUrl).openConnection();
-            resolver.setInstanceFollowRedirects(true);
-            resolver.setRequestMethod("GET");
-            resolver.setRequestProperty("Accept", "text/html,application/xhtml+xml");
-            // Threads serves a non-redirecting app shell to mobile browser UAs,
-            // while generic HTTP clients receive the canonical post redirect.
-            resolver.setRequestProperty("User-Agent", "curl/8.7.1");
-            resolver.setConnectTimeout(8000);
-            resolver.setReadTimeout(12000);
-
-            int status = resolver.getResponseCode();
-            canonicalUrl = ThreadsUrlNormalizer.normalizeCanonicalUrl(resolver.getURL().toString());
-            if (canonicalUrl != null) {
-                Log.i(TAG, "Resolved Threads short URL to " + canonicalUrl);
-                return canonicalUrl;
-            }
-
-            String location = resolver.getHeaderField("Location");
-            canonicalUrl = ThreadsUrlNormalizer.normalizeCanonicalUrl(location);
-            if (canonicalUrl != null) return canonicalUrl;
-
-            InputStream stream = status >= 400 ? resolver.getErrorStream() : resolver.getInputStream();
-            String body = readStream(stream).replace("\\/", "/").replace("&amp;", "&");
-            canonicalUrl = ThreadsUrlNormalizer.normalizeCanonicalUrl(body);
-            if (canonicalUrl != null) return canonicalUrl;
-            throw new IllegalStateException("Threads 공유 URL을 원문 URL로 변환하지 못했습니다. HTTP " + status);
-        } finally {
-            if (resolver != null) resolver.disconnect();
-        }
     }
 
     private TextView label(String text) {
