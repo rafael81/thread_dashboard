@@ -1,6 +1,23 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 
+test("automation timestamps are rendered as full KST date-times across the UTC date boundary", async () => {
+  const {
+    formatKstDateText,
+    formatKstDateTime,
+  } = await import("../dashboard/src/lib/automation-metrics.mjs");
+  assert.equal(
+    formatKstDateTime("2026-07-26T16:30:45.000Z"),
+    "2026-07-27 01:30:45 KST",
+  );
+  assert.equal(formatKstDateTime("invalid"), "-");
+  assert.equal(formatKstDateTime(null), "-");
+  assert.equal(
+    formatKstDateText("X 재개 2026-07-27T13:42:51.360Z"),
+    "X 재개 2026-07-27 22:42:51 KST",
+  );
+});
+
 test("automation metrics use one selected date for comments, reviews, quality, and hearts", async () => {
   const { buildAutomationScopeMetrics } = await import("../dashboard/src/lib/automation-metrics.mjs");
   const metrics = buildAutomationScopeMetrics({

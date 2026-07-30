@@ -9,6 +9,32 @@ export function formatKstDateKey(value = new Date()) {
   }).format(date);
 }
 
+export function formatKstDateTime(value) {
+  if (!value) return "-";
+  const date = value instanceof Date ? value : new Date(value);
+  if (!Number.isFinite(date.getTime())) return "-";
+  const formatted = new Intl.DateTimeFormat("sv-SE", {
+    timeZone: "Asia/Seoul",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).format(date);
+  return `${formatted} KST`;
+}
+
+export function formatKstDateText(value) {
+  const text = String(value || "");
+  if (!text) return text;
+  return text.replace(
+    /\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})\b/g,
+    (timestamp) => formatKstDateTime(timestamp),
+  );
+}
+
 function matchesDate(item, date) {
   return date === "all" || item?.date === date;
 }

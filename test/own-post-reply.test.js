@@ -28,12 +28,15 @@ const {
   terafabxOwnPostReplyWriterDelayMs,
   createSerialTaskQueue,
   createPullTaskPool,
+  createTerafabxGeminiConsumerGroup,
   runFixedWorkerPool,
   runFixedWorkerPipeline,
   allocateTerafabxOwnPostReplyWorkers,
   normalizeTerafabxOwnPostReplyWriteQueue,
   shouldUseTerafabxQuickIntent,
   attemptTerafabxReplyHeart,
+  isTerafabxReplyTargetDomMissingError,
+  terafabxReplyTargetDomRetryDisposition,
   terafabxOwnPostReplyXWriteBackoff,
   isTerafabxXRateLimitError,
   isTerafabxXAccessCircuitBreakerError,
@@ -47,6 +50,9 @@ const {
   normalizeFxTwitterFollowingCandidates,
   isTerafabxOwnPostFullCoverageMode,
   normalizeTerafabxOwnRootStatus,
+  isTerafabxConversationRootUnavailableError,
+  normalizeTerafabxOwnPostUnavailableRoots,
+  markTerafabxOwnPostUnavailableRoot,
   normalizeTerafabxOwnPostCoverageBacklog,
   rankTerafabxOwnPostCoverageBacklog,
   selectTerafabxOwnPostCoveragePhase,
@@ -237,6 +243,39 @@ test("full coverage discovery paginates and preserves reply-bearing roots in the
     "https://x.com/terafabXai/status/1234567890123456789",
     "https://x.com/terafabXai/status/3234567890123456789",
   ]);
+});
+
+test("deleted or inaccessible conversation roots are terminal and stay out of rediscovery", async () => {
+  const now = Date.parse("2026-07-28T12:00:00.000Z");
+  const rootUrl = xStatusUrlAt(now - 60 * 60 * 1000, 11n);
+  const api404 = new Error(
+    'Conversation API 댓글 수집 실패: HTTP 404: {"status":null,"thread":null,"replies":null,"author":null,"cursor":null,"code":404}',
+  );
+  assert.equal(isTerafabxConversationRootUnavailableError(api404), true);
+  assert.equal(isTerafabxConversationRootUnavailableError(new Error("HTTP 429 code 1003")), false);
+  assert.equal(isTerafabxConversationRootUnavailableError(new Error("temporary API failure")), false);
+
+  const unavailableRoots = markTerafabxOwnPostUnavailableRoot({}, rootUrl, api404, { now });
+  assert.equal(unavailableRoots[rootUrl].reason, "conversation_api_404");
+  assert.deepEqual(
+    normalizeTerafabxOwnPostUnavailableRoots(unavailableRoots, { now }),
+    unavailableRoots,
+  );
+
+  const result = await discoverTerafabxOwnPostCoverageCycle({
+    ownPostCoverageCursor: "",
+    ownPostCoverageBacklog: [{ url: rootUrl, replies: 3 }],
+    ownPostUnavailableRoots: unavailableRoots,
+  }, {
+    now,
+    maxPages: 1,
+    fetchPage: async () => ({
+      roots: [{ url: rootUrl, replies: 3 }],
+      nextCursor: "",
+      exhausted: true,
+    }),
+  });
+  assert.deepEqual(result.backlog, []);
 });
 
 test("full coverage drops roots older than 72 hours and stops profile pagination at the boundary", async () => {
@@ -466,6 +505,52 @@ test("reply-count refresh selects never-checked and stalest posted roots first",
   assert.equal(targets.some((item) => item.url === olderThanThreeDays), false);
 });
 
+test("reply-count refresh excludes tombstoned roots and terminates a new conversation 404", async () => {
+  const now = Date.parse("2026-07-28T12:00:00.000Z");
+  const rootUrl = xStatusUrlAt(now - 60 * 60 * 1000, 21n);
+  let state = {
+    commentHistory: [],
+    ownPostReplyHistory: [],
+    ownPostCoverageBacklog: [{ url: rootUrl, replies: 3 }],
+    ownPostReplyCoverage: {
+      [rootUrl]: {
+        checkedAt: "2026-07-28T10:00:00.000Z",
+        totalEligibleCount: 3,
+        rootPostText: "과거 정상 스냅샷",
+      },
+    },
+    ownPostUnavailableRoots: {},
+  };
+  const result = await runTerafabxReplyCountRefresh({
+    now,
+    staleMs: 0,
+    limit: 10,
+    historyEntries: [],
+    loadState: () => state,
+    saveState: (patch) => {
+      state = { ...state, ...patch };
+      return state;
+    },
+    collectConversation: async () => {
+      throw new Error(
+        'Conversation API 댓글 수집 실패: HTTP 404: {"status":null,"thread":null,"replies":null,"author":null,"cursor":null,"code":404}',
+      );
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.updatedCount, 0);
+  assert.equal(result.unavailableRootCount, 1);
+  assert.equal(result.failedCount, 0);
+  assert.equal(state.ownPostReplyCoverage[rootUrl].rootPostText, "과거 정상 스냅샷");
+  assert.equal(state.ownPostUnavailableRoots[rootUrl].reason, "conversation_api_404");
+  assert.deepEqual(state.ownPostCoverageBacklog, []);
+  assert.deepEqual(selectTerafabxReplyCountRefreshTargets(state, [], {
+    now: now + 60_000,
+    staleMs: 0,
+    limit: 10,
+  }), []);
+});
+
 test("scheduled reply-count refresh persists complete conversations and preserves failed snapshots", async () => {
   const now = Date.parse("2026-07-26T12:00:00.000Z");
   const successRoot = xStatusUrlAt(now - 2 * 60 * 60 * 1000, 1n);
@@ -581,9 +666,10 @@ test("automatic full coverage uses one five-worker global pull queue and never l
   assert.match(cycle, /xCatchupRequestedCount: 0/);
   assert.match(cycle, /xCatchupRemoved: true/);
   assert.match(cycle, /selectTerafabxOwnPostCoveragePhase/);
-  assert.match(cycle, /createPullTaskPool\(globalGeminiWorkerCount/);
-  assert.match(cycle, /producerPool: globalProducerPool/);
-  assert.match(cycle, /scheduling: "global_pull_queue"/);
+  assert.match(cycle, /createTerafabxGeminiConsumerGroup\(globalGeminiWorkerCount/);
+  assert.match(cycle, /producerPool: globalGeminiConsumerGroup/);
+  assert.match(cycle, /await globalGeminiConsumerGroup\?\.close\(\)/);
+  assert.match(cycle, /scheduling: "consumer_group_fifo"/);
   assert.doesNotMatch(cycle, /allocation\.concurrency <= 0/);
   assert.doesNotMatch(cycle, /skipped: "deferred_worker_capacity"/);
   assert.match(cycle, /Promise\.all\(contextualized\.map/);
@@ -594,6 +680,73 @@ test("automatic full coverage uses one five-worker global pull queue and never l
   assert.doesNotMatch(cycle, /scanPhase: "x_catchup"/);
   assert.doesNotMatch(cycle, /directScan/);
   assert.doesNotMatch(cycle, /const recheck = await collectConversation/);
+});
+
+test("Gemini consumer group keeps one resource per worker and closes resources only at group shutdown", async () => {
+  const initialized = [];
+  const closed = [];
+  const seenResources = new Map();
+  let active = 0;
+  let maxActive = 0;
+  const group = createTerafabxGeminiConsumerGroup(5, {
+    resourceFactory: (workerIndex) => ({ workerIndex, chromePort: 9264 + workerIndex }),
+    initializeResource: (resource) => initialized.push(resource.chromePort),
+    closeResource: async (resource) => {
+      closed.push(resource.chromePort);
+    },
+  });
+
+  const results = await Promise.all(Array.from({ length: 20 }, (_, itemIndex) => (
+    group.enqueue(async (workerIndex, resource) => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      assert.equal(resource.workerIndex, workerIndex);
+      if (seenResources.has(workerIndex)) {
+        assert.equal(seenResources.get(workerIndex), resource);
+      } else {
+        seenResources.set(workerIndex, resource);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      active -= 1;
+      return itemIndex;
+    })
+  )));
+
+  assert.deepEqual(results, Array.from({ length: 20 }, (_, index) => index));
+  assert.equal(maxActive, 5);
+  assert.equal(group.stats.completed, 20);
+  assert.deepEqual(initialized, [9264, 9265, 9266, 9267, 9268]);
+  assert.deepEqual(closed, []);
+
+  const isolated = await Promise.allSettled([
+    group.enqueue(async () => {
+      throw new Error("isolated message failure");
+    }),
+    group.enqueue(async (_workerIndex, resource) => resource.chromePort),
+  ]);
+  assert.equal(isolated[0].status, "rejected");
+  assert.equal(isolated[1].status, "fulfilled");
+  assert.equal(group.stats.failed, 1);
+  assert.equal(group.stats.completed, 22);
+
+  await Promise.all([group.close(), group.close()]);
+  assert.deepEqual(closed.sort((a, b) => a - b), [9264, 9265, 9266, 9267, 9268]);
+  await assert.rejects(
+    group.enqueue(async () => null),
+    /Gemini 컨슈머 그룹이 종료 중입니다/,
+  );
+});
+
+test("shared Gemini consumer group owns browser cleanup instead of each root batch", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "mirror_server.js"), "utf8");
+  const batch = source.slice(
+    source.indexOf("async function runTerafabxOwnPostReplyBatch"),
+    source.indexOf("async function runNextTerafabxOwnPostReplyManualQueueItem"),
+  );
+  assert.match(batch, /sharedConsumerGroupOwnsResources = producerPool\?\.ownsWorkerResources === true/);
+  assert.match(batch, /producerPool\.resourceForWorker\(workerIndex\)/);
+  assert.match(batch, /cleanupBrowser: false/);
+  assert.match(batch, /if \(!sharedConsumerGroupOwnsResources\)/);
 });
 
 test("coverage phase selection migrates legacy X catch-up rows to API-only collection", () => {
@@ -1553,6 +1706,60 @@ test("a blank X reply page is retried with a cooldown instead of being exhausted
   assert.ok(Date.parse(result.nextAttemptAt) > Date.now());
 });
 
+test("a reply target missing from the DOM is retried three times and then dropped", () => {
+  const error = new Error('target root 검증 실패: {"ok":false,"text":"","url":"https://x.com/a/status/1"}');
+  const now = Date.parse("2026-07-27T14:00:00.000Z");
+  assert.equal(isTerafabxReplyTargetDomMissingError(error), true);
+  assert.equal(isTerafabxReplyTargetDomMissingError(new Error("Runtime.evaluate timed out")), false);
+
+  for (let previousRetries = 0; previousRetries < 3; previousRetries += 1) {
+    assert.deepEqual(
+      terafabxReplyTargetDomRetryDisposition(
+        { targetDomMissRetries: previousRetries },
+        error,
+        { maxRetries: 3, retryDelayMs: 30_000, now },
+      ),
+      {
+        matched: true,
+        retryCount: previousRetries + 1,
+        maxRetries: 3,
+        drop: false,
+        retryAt: "2026-07-27T14:00:30.000Z",
+      },
+    );
+  }
+
+  assert.deepEqual(
+    terafabxReplyTargetDomRetryDisposition(
+      { targetDomMissRetries: 3 },
+      error,
+      { maxRetries: 3, retryDelayMs: 30_000, now },
+    ),
+    {
+      matched: true,
+      retryCount: 4,
+      maxRetries: 3,
+      drop: true,
+      retryAt: null,
+    },
+  );
+});
+
+test("target DOM misses bypass the global X writer backoff branch", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "mirror_server.js"), "utf8");
+  const block = source.slice(
+    source.indexOf("async function postTerafabxOwnPostReplyWriteRecord"),
+    source.indexOf("function enqueueTerafabxOwnPostReplyWriteRecord"),
+  );
+  assert.match(block, /target_dom_missing_retry/);
+  assert.match(block, /target_dom_missing_dropped/);
+  assert.match(block, /terafabxReplyTargetDomRetryDisposition\(latest, error\)/);
+  assert.ok(
+    block.indexOf("terafabxReplyTargetDomRetryDisposition(latest, error)")
+      < block.lastIndexOf("ownPostReplyXWriteBackoffUntil: retryAt"),
+  );
+});
+
 test("headless reply retries one pre-submit transient browser failure only", () => {
   const transient = new Error("Runtime.evaluate timed out");
   const uncertain = new Error("reply relationship verification failed");
@@ -2027,7 +2234,7 @@ test("auto comment discovery uses disposable tabs on the shared 9224 browser", (
   assert.notEqual(resources.ownReply.profileDir, resources.ownHeart.profileDir);
 });
 
-test("own-post reply posting and standalone heart sweeps use independent X resources", () => {
+test("own-post reply writer hearts before posting while standalone heart sweeps stay independent", () => {
   const source = fs.readFileSync(path.join(__dirname, "..", "mirror_server.js"), "utf8");
   const replyBatch = source.slice(
     source.indexOf("async function runTerafabxOwnPostReplyBatch"),
@@ -2046,9 +2253,15 @@ test("own-post reply posting and standalone heart sweeps use independent X resou
     source.indexOf("function loadTerafabxCommentMonitorState"),
   );
   assert.match(replyWriter, /xResourceKind:\s*"ownReply"/);
+  assert.match(replyWriter, /attemptTerafabxReplyHeart/);
+  assert.ok(
+    replyWriter.indexOf("attemptTerafabxReplyHeart")
+      < replyWriter.indexOf("postTerafabxReply"),
+  );
+  assert.match(replyWriter, /lockAction:\s*"own-post-reply-heart-before-post"/);
   assert.match(replyBatch, /closeTerafabxIsolatedXBrowser\("ownReply"\)/);
   assert.doesNotMatch(replyBatch, /attemptTerafabxReplyHeart/);
-  assert.match(replyBatch, /terafabx_own_post_reply_heart_handoff/);
+  assert.doesNotMatch(replyBatch, /terafabx_own_post_reply_heart_handoff/);
   assert.match(heartSweep, /xResourceKind:\s*"ownHeart"/);
   assert.match(heartSweep, /closeTerafabxIsolatedXBrowser\("ownHeart"\)/);
   assert.match(heartSweep, /isTerafabxOwnPostHeartStopRequested/);

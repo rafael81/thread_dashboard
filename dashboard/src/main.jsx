@@ -1200,6 +1200,14 @@ function Dashboard() {
   const [automationLiveSnapshot, setAutomationLiveSnapshot] = useState(null);
   const [automationLiveConnection, setAutomationLiveConnection] = useState("idle");
 
+  function changeView(nextView) {
+    if (nextView === view) return;
+    // Remove the old table immediately so its pagination controls cannot
+    // accept a click that would be discarded when the next view mounts.
+    setLoading(true);
+    setView(nextView);
+  }
+
   async function load(nextView = view, options = {}) {
     setError("");
     const result = nextView === "inssider-pending"
@@ -1560,7 +1568,7 @@ function Dashboard() {
       scheduleEdits={scheduleEdits}
       busy={busy}
       autoScheduleSubmitting={autoScheduleSubmitting}
-      onViewChange={setView}
+      onViewChange={changeView}
       onTitleChange={setTitleEdits}
       onScheduleChange={setScheduleEdits}
       onSaveTitle={saveDiscoveryTitle}
@@ -1646,7 +1654,7 @@ function Dashboard() {
         <AppSidebar
           variant="inset"
           view={view}
-          onViewChange={setView}
+          onViewChange={changeView}
           summary={summary}
           terafabx={data?.terafabx}
         />

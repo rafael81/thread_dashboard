@@ -5,6 +5,7 @@ const path = require('node:path');
 
 const {
   cleanThreadText,
+  cleanThreadTextOverride,
   classifyThreadSocialLine,
   linkedThreadMediaAttributionLabels,
   classifyXScheduleDialogState,
@@ -26,6 +27,7 @@ const {
   terafabxDailyCommentProgress,
   terafabxCommentPrefillCooldownDelay,
   parseTerafabxFinalJudge,
+  assessTerafabxSourceAnchorGrounding,
   scoreTerafabxClichePenalty,
   selectRootPostMediaCandidates,
   selectThreadSourceText,
@@ -41,6 +43,9 @@ const {
   discoveryScheduleRetryDecision,
   isThreadsMediaRegression,
   isThreadsInvalidPageText,
+  xAccountVerificationDisposition,
+  mirrorWorkTabRoleAllowsUrl,
+  threadPostSnapshotForMirror,
   isConfirmedTerafabxGrokContext,
   isDiscoveryAutoScheduleSource,
   ensureComposerText,
@@ -69,6 +74,63 @@ const {
   nextTerafabxWeightedReplyCount,
   terafabxWeightedReplyRunDisposition,
 } = require('../mirror_server.js');
+
+test('app share collection and X publishing use isolated browser tab roles', () => {
+  assert.equal(mirrorWorkTabRoleAllowsUrl('threads_collect', 'https://www.threads.com/@cat/post/abc'), true);
+  assert.equal(mirrorWorkTabRoleAllowsUrl('threads_collect', 'https://x.com/compose/post'), false);
+  assert.equal(mirrorWorkTabRoleAllowsUrl('x_publish', 'https://x.com/compose/post'), true);
+  assert.equal(mirrorWorkTabRoleAllowsUrl('x_publish', 'https://www.threads.com/@cat/post/abc'), false);
+
+  const source = fs.readFileSync(path.join(__dirname, '..', 'mirror_server.js'), 'utf8');
+  const extractBlock = source.slice(
+    source.indexOf('async function extractThreadPost'),
+    source.indexOf('async function discoverThreadsTimeline'),
+  );
+  const publishBlock = source.slice(
+    source.indexOf('async function postToX'),
+    source.indexOf('async function saveComposeAsXDraft'),
+  );
+  assert.match(extractBlock, /workRole:\s*MIRROR_WORK_TAB_ROLES\.THREADS_COLLECT/);
+  assert.match(publishBlock, /workRole:\s*MIRROR_WORK_TAB_ROLES\.X_PUBLISH/);
+  assert.match(source, /threadPostSnapshot:\s*detail\.threadPostSnapshot/);
+  assert.match(source, /thread_collection_snapshot_reused/);
+});
+
+test('an app share reuses the collected Threads snapshot without a second collection tab', () => {
+  const canonicalUrl = 'https://www.threads.com/@cat/post/abc';
+  const snapshot = threadPostSnapshotForMirror(canonicalUrl, {
+    url: canonicalUrl,
+    text: '고양이 원문',
+    mediaUrls: ['https://cdn.example/video.mp4'],
+    imageMediaUrls: [],
+    videoMediaUrls: ['https://cdn.example/video.mp4'],
+    likeCount: 12,
+    diagnostics: { source: 'threads_dom' },
+  });
+  assert.equal(snapshot.url, canonicalUrl);
+  assert.equal(snapshot.text, '고양이 원문');
+  assert.deepEqual(snapshot.mediaUrls, ['https://cdn.example/video.mp4']);
+  assert.equal(snapshot.diagnostics.reusedFromCollectionTab, true);
+  assert.equal(threadPostSnapshotForMirror('https://www.threads.com/@dog/post/xyz', {
+    ...snapshot,
+    url: canonicalUrl,
+  }), null);
+});
+
+test('verified X account DOM wins over an incidental account-settings 429', () => {
+  const verified = {
+    accountText: 'terafabXai\n@terafabXai',
+    profileHref: 'https://x.com/terafabXai',
+  };
+  assert.equal(
+    xAccountVerificationDisposition(verified, 'https://api.x.com/1.1/account/settings.json', 'terafabXai'),
+    'verified',
+  );
+  assert.equal(
+    xAccountVerificationDisposition({ accountText: '', profileHref: '' }, 'https://api.x.com/1.1/account/settings.json', 'terafabXai'),
+    'rate_limited',
+  );
+});
 
 test('a previously confirmed Threads media post cannot regress to text-only posting', () => {
   assert.equal(isThreadsMediaRegression(2, 0), true);
@@ -612,6 +674,98 @@ test('TerafabX final judge accepts a source anchor found in quoted post text', (
 
   assert.equal(result.sourceAnchorGrounded, true);
   assert.equal(result.passed, true);
+});
+
+test('TerafabX source grounding accepts Korean particles and confirmed media-context token overlap', () => {
+  const groundingContext = {
+    contextSummary: '비가 오는 날 강아지에게 비닐봉지로 급히 우비를 만들어 입힌 뒤 산책하는 장면이다.',
+    keyPoints: ['비닐봉지를 우비처럼 사용함', '강아지가 빗속에서 산책함'],
+    rawPreview: '{"context":"confirmed media observation"}',
+    provider: 'web-context',
+  };
+  const grounding = assessTerafabxSourceAnchorGrounding('비닐봉지 우비', {
+    rootPostText: '어떻게 해서든 산책은 나가야 함',
+    targetText: '산책은 가야죠',
+    groundingContext,
+  });
+  assert.equal(grounding.grounded, true);
+  assert.equal(grounding.method, 'normalized_token_overlap');
+  assert.deepEqual(grounding.matchedTokens, ['비닐봉지', '우비']);
+
+  const result = parseTerafabxFinalJudge(JSON.stringify({
+    context: 40,
+    naturalness: 25,
+    specificity: 15,
+    concision: 10,
+    non_ai_style: 10,
+    fatal_error: false,
+    language_error: false,
+    awkward_korean: false,
+    translation_tone: false,
+    cliche: false,
+    context_error: false,
+    unsupported_claim: false,
+    cross_post_reusable: false,
+    headline_tone: false,
+    specificity_error: false,
+    semantic_role_error: false,
+    direct_response_error: false,
+    logical_leap_error: false,
+    source_anchor: '비닐봉지 우비',
+    reason: '원문 미디어의 비닐봉지 우비 장면에 직접 호응함',
+  }), '비닐봉지 우비라도 입혀서 나가야죠 뭐', {
+    rootPostText: '어떻게 해서든 산책은 나가야 함',
+    targetText: '산책은 가야죠',
+    groundingContext,
+  });
+  assert.equal(result.score, 100);
+  assert.equal(result.sourceAnchorGrounded, true);
+  assert.equal(result.sourceAnchorGrounding.method, 'normalized_token_overlap');
+  assert.equal(result.passed, true);
+});
+
+test('TerafabX source grounding accepts actual shopping-bag and baby-bear media anchors', () => {
+  const shoppingBag = assessTerafabxSourceAnchorGrounding(
+    '쇼핑백에 앞부분이 들어간 채 함께 걷는 고양이',
+    {
+      rootPostText: '하도가출해서 이러고 다닌데 ㅋㅋㅋㅋ',
+      targetText: 'ㅋㅋㅋㅋ귀엽네요',
+      groundingContext: {
+        contextSummary: '주인이 들고 있는 쇼핑백에 앞부분이 들어간 채 함께 걷는 고양이 영상이다.',
+        keyPoints: ['쇼핑백에 고양이 앞부분이 들어간 상태로 걷는 장면'],
+        rawPreview: '{"context":"confirmed shopping bag video"}',
+        provider: 'web-context',
+      },
+    },
+  );
+  assert.equal(shoppingBag.grounded, true);
+
+  const babyBear = assessTerafabxSourceAnchorGrounding('두 발로', {
+    rootPostText: '이런....😍😅',
+    targetText: '너무 사랑스러워요',
+    groundingContext: {
+      contextSummary: '어미 곰은 네 발로 걷고 아기 곰들이 두 발로 서는 영상이다.',
+      keyPoints: ['아기 곰들이 두 발로 서 있음'],
+      rawPreview: '{"context":"confirmed bear video"}',
+      provider: 'web-context',
+    },
+  });
+  assert.equal(babyBear.grounded, true);
+});
+
+test('TerafabX source grounding still rejects unrelated or generic anchors', () => {
+  const target = {
+    rootPostText: '쇼핑백에 들어가 걷는 고양이',
+    targetText: '귀엽네요',
+  };
+  assert.equal(
+    assessTerafabxSourceAnchorGrounding('비닐봉지 우비', target).grounded,
+    false,
+  );
+  assert.equal(
+    assessTerafabxSourceAnchorGrounding('영상', target).grounded,
+    false,
+  );
 });
 
 test('TerafabX final judge rejects a concrete association absent from the source', () => {
@@ -1304,6 +1458,30 @@ test('Threads exact embedded caption replaces a truncated DOM fallback', () => {
     domText: '스페인 아르헨티나\n월드컵 결승전',
     embeddedCaption: '스페인 아르헨티나\n월드컵 결승전\n\nBTS\n만나\n신나하는\n아이쇼스피드\n\n미친듯이 좋아하네 ㅋㅋ',
   }), '스페인 아르헨티나\n월드컵 결승전\n\nBTS\n만나\n신나하는\n아이쇼스피드\n\n미친듯이 좋아하네 ㅋㅋ');
+});
+
+test('Threads empty-reply UI is removed from DOM extraction and exact-caption selection', () => {
+  const caption = [
+    '일본 지진으로 난리난 코스트코 라는데..',
+    '재난영화의 한장면 같아...',
+    '아이 울음소리도 들리고 얼마나 무서울까😭',
+    '큰 피해 없길 간절히 기도합니다🙏',
+  ].join('\n');
+  const contaminated = `${caption}\n아직 답글이 없습니다`;
+
+  assert.equal(cleanThreadText(`saemi.home\n${contaminated}`, 'saemi.home'), caption);
+  assert.equal(selectThreadSourceText({
+    domText: contaminated,
+    embeddedCaption: caption,
+  }), caption);
+});
+
+test('Threads posting override removes a previously persisted empty-reply UI line', () => {
+  assert.equal(
+    cleanThreadTextOverride('털 빗기 싫어하는 댕댕이들 있잖아 ㅠㅠ\n아직 답글이 없습니다'),
+    '털 빗기 싫어하는 댕댕이들 있잖아 ㅠㅠ',
+  );
+  assert.equal(cleanThreadTextOverride('No replies yet'), '');
 });
 
 test('Threads translated DOM text is not replaced by a different embedded source caption', () => {

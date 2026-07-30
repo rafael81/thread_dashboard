@@ -82,10 +82,22 @@ test("posted table renders reply completion with direct-scan provenance", () => 
 test("posted table keeps its page during refresh and exposes the real X post link", () => {
   const source = fs.readFileSync(path.join(__dirname, "..", "dashboard", "src", "components", "data-table.tsx"), "utf8");
   assert.match(source, /autoResetPageIndex: false/);
+  assert.match(source, /const previousViewRef = React\.useRef\(view\)/);
+  assert.match(source, /React\.useLayoutEffect\(\(\) => \{/);
+  assert.match(source, /if \(previousViewRef\.current === view\) return/);
   assert.match(source, /setPagination\(\(current\) => \(\{ \.\.\.current, pageIndex: 0 \}\)\)/);
+  assert.match(source, /type="button"[\s\S]*?<span className="sr-only">다음<\/span>/);
+  assert.match(source, /aria-live="polite"/);
   assert.match(source, /href=\{row\.original\.xPostUrl\}/);
   assert.match(source, />\s*X 게시글\s*</);
   assert.match(source, />\s*Threads 원문\s*</);
+});
+
+test("dashboard removes the previous table synchronously when its view changes", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "dashboard", "src", "main.jsx"), "utf8");
+  assert.match(source, /function changeView\(nextView\) \{[\s\S]*?setLoading\(true\);[\s\S]*?setView\(nextView\);/);
+  assert.doesNotMatch(source, /onViewChange=\{setView\}/);
+  assert.match(source, /onViewChange=\{changeView\}/);
 });
 
 test("automation dashboard exposes a dedicated cancellable own-post comment-heart control", () => {

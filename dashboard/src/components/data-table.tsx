@@ -25,6 +25,7 @@ import {
   ExternalLinkIcon,
   FilePenLineIcon,
   MoreVerticalIcon,
+  PlayIcon,
   RefreshCcwIcon,
   SendIcon,
   Trash2Icon,
@@ -86,6 +87,8 @@ export type DashboardRow = {
   viralScore?: number
   criteria?: {
     source?: string
+    mediaThumbnailUrl?: string
+    thumbnailUrl?: string
     shortHook?: boolean
     strongMedia?: boolean
     controversy?: boolean
@@ -147,6 +150,10 @@ function mediaDownloadUrl(url = "") {
   return `/api/discovery/media-download?url=${encodeURIComponent(url)}`
 }
 
+function mediaThumbnailUrl(url = "") {
+  return `/api/discovery/media-thumbnail?url=${encodeURIComponent(url)}`
+}
+
 function statusLabel(status: string) {
   const labels: Record<string, string> = {
     review: "검토",
@@ -177,6 +184,33 @@ function MediaPreview({ row, large = false }: { row: DashboardRow; large?: boole
       >
         미리보기 없음
       </a>
+    )
+  }
+
+  if (!large) {
+    const thumbnailSource = row.criteria?.mediaThumbnailUrl
+      || row.criteria?.thumbnailUrl
+      || (!isVideo(row.mediaPreviewUrl) ? row.mediaPreviewUrl : "")
+    return (
+      <div className={`${className} relative`}>
+        {thumbnailSource ? (
+          <img
+            className="size-full object-cover"
+            src={mediaThumbnailUrl(thumbnailSource)}
+            alt=""
+            width={64}
+            height={64}
+            loading="lazy"
+            decoding="async"
+            fetchPriority="low"
+          />
+        ) : (
+          <div className="flex size-full flex-col items-center justify-center gap-1 text-xs text-muted-foreground">
+            <PlayIcon className="size-5" aria-hidden="true" />
+            <span>영상</span>
+          </div>
+        )}
+      </div>
     )
   }
 
@@ -413,13 +447,16 @@ export function DataTable(props: DataTableProps) {
     pageIndex: 0,
     pageSize: 12,
   })
+  const previousViewRef = React.useRef(view)
   const [openRowUrl, setOpenRowUrl] = React.useState<string | null>(null)
   const openRow = React.useMemo(
     () => rows.find((row) => row.canonicalUrl === openRowUrl) || null,
     [openRowUrl, rows]
   )
 
-  React.useEffect(() => {
+  React.useLayoutEffect(() => {
+    if (previousViewRef.current === view) return
+    previousViewRef.current = view
     setRowSelection({})
     setPagination((current) => ({ ...current, pageIndex: 0 }))
   }, [view])
@@ -797,11 +834,16 @@ export function DataTable(props: DataTableProps) {
                 </SelectContent>
               </Select>
             </div>
-            <div className="flex w-fit items-center justify-center text-sm font-medium">
+            <div
+              className="flex w-fit items-center justify-center text-sm font-medium"
+              aria-live="polite"
+              aria-atomic="true"
+            >
               {table.getState().pagination.pageIndex + 1} / {Math.max(1, table.getPageCount())}
             </div>
             <div className="ml-auto flex items-center gap-2 lg:ml-0">
               <Button
+                type="button"
                 variant="outline"
                 className="hidden size-8 p-0 lg:flex"
                 onClick={() => table.setPageIndex(0)}
@@ -811,6 +853,7 @@ export function DataTable(props: DataTableProps) {
                 <ChevronsLeftIcon />
               </Button>
               <Button
+                type="button"
                 variant="outline"
                 className="size-8"
                 size="icon"
@@ -821,6 +864,7 @@ export function DataTable(props: DataTableProps) {
                 <ChevronLeftIcon />
               </Button>
               <Button
+                type="button"
                 variant="outline"
                 className="size-8"
                 size="icon"
@@ -831,6 +875,7 @@ export function DataTable(props: DataTableProps) {
                 <ChevronRightIcon />
               </Button>
               <Button
+                type="button"
                 variant="outline"
                 className="hidden size-8 lg:flex"
                 size="icon"

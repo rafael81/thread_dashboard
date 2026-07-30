@@ -1,5 +1,7 @@
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
+const fs = require("node:fs");
+const path = require("node:path");
 const test = require("node:test");
 
 const {
@@ -10,9 +12,40 @@ const {
   compactTerafabxDashboardStatus,
   getTerafabxAutomationStatus,
   getTerafabxDashboardOverview,
+  isVideoMediaUrl,
+  discoveryThumbnailCachePath,
   listenBeforeStartingBackgroundWork,
   loadDiscoveryDashboardDetails,
 } = require("../mirror_server");
+
+test("discovery media list uses cached thumbnails and never preloads original videos", () => {
+  assert.equal(isVideoMediaUrl("https://cdn.example/video.mp4?x=1"), true);
+  assert.equal(isVideoMediaUrl("https://cdn.example/image.jpg"), false);
+  assert.equal(
+    discoveryThumbnailCachePath("https://cdn.example/image.jpg"),
+    discoveryThumbnailCachePath("https://cdn.example/image.jpg"),
+  );
+  assert.notEqual(
+    discoveryThumbnailCachePath("https://cdn.example/image.jpg"),
+    discoveryThumbnailCachePath("https://cdn.example/other.jpg"),
+  );
+
+  const tableSource = fs.readFileSync(
+    path.join(__dirname, "..", "dashboard", "src", "components", "data-table.tsx"),
+    "utf8",
+  );
+  const listBranch = tableSource.slice(
+    tableSource.indexOf("if (!large)"),
+    tableSource.indexOf("if (isVideo(row.mediaPreviewUrl))"),
+  );
+  assert.match(listBranch, /mediaThumbnailUrl/);
+  assert.match(listBranch, /mediaThumbnailUrl\(thumbnailSource\)/);
+  assert.match(tableSource, /\/api\/discovery\/media-thumbnail/);
+  assert.match(listBranch, /loading="lazy"/);
+  assert.match(listBranch, /decoding="async"/);
+  assert.doesNotMatch(listBranch, /<video/);
+  assert.doesNotMatch(listBranch, /src=\{row\.mediaPreviewUrl\}/);
+});
 
 test("compact automation overview preserves full dashboard summary and daily flow totals", () => {
   const nowMs = Date.now();

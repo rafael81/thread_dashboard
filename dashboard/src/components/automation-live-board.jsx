@@ -29,6 +29,10 @@ import {
   ToggleGroup,
   ToggleGroupItem,
 } from "@/components/ui/toggle-group";
+import {
+  formatKstDateText,
+  formatKstDateTime,
+} from "@/lib/automation-metrics.mjs";
 
 const STAGE_LABELS = {
   collect: "수집",
@@ -119,19 +123,6 @@ function stageMetricCaption(metric) {
   const unit = UNIT_LABELS[metric?.unit] || "항목";
   const valueKind = VALUE_KIND_LABELS[metric?.valueKind] || "현재";
   return `${valueKind} ${unit}`;
-}
-
-function formatTime(value) {
-  if (!value) return "-";
-  const date = new Date(value);
-  if (!Number.isFinite(date.getTime())) return "-";
-  return new Intl.DateTimeFormat("ko-KR", {
-    timeZone: "Asia/Seoul",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  }).format(date);
 }
 
 function fallbackSnapshot({ pipeline, metrics, comments, reviewComments, enabled }) {
@@ -359,7 +350,7 @@ export function AutomationLiveBoard({
             <strong className="tabular-nums">{Number(snapshot.throughputPerMinute || 0).toLocaleString("ko-KR")}건/분</strong>
           </div>
           <div className="text-xs text-muted-foreground">
-            마지막 업데이트 {formatTime(snapshot.updatedAt)}
+            마지막 업데이트 {formatKstDateTime(snapshot.updatedAt)}
           </div>
         </div>
         <Button
@@ -396,7 +387,7 @@ export function AutomationLiveBoard({
                 <div className="mb-3 flex min-h-12 items-start justify-between gap-2 px-1">
                   <div>
                     <div className="text-sm font-medium">{stage.label || STAGE_LABELS[stage.id]}</div>
-                    <div className="mt-0.5 text-xs text-muted-foreground">{stage.detail || "상태 없음"}</div>
+                    <div className="mt-0.5 text-xs text-muted-foreground">{formatKstDateText(stage.detail) || "상태 없음"}</div>
                   </div>
                   {index < snapshot.stages.length - 1 ? (
                     <ChevronRightIcon className="absolute -right-3 top-2.5 size-4 translate-x-1/2 text-muted-foreground/60" aria-hidden="true" />
@@ -409,7 +400,7 @@ export function AutomationLiveBoard({
                   </div>
                   <div className="mt-3 text-3xl font-semibold tabular-nums">{compact(metric.value)}</div>
                   <div className="mt-1 text-xs font-medium text-foreground/70">{stageMetricCaption(metric)}</div>
-                  <div className="mt-1 text-xs text-muted-foreground">{stage.detail}</div>
+                  <div className="mt-1 text-xs text-muted-foreground">{formatKstDateText(stage.detail)}</div>
                   {item ? (
                     <button
                       type="button"
@@ -417,8 +408,8 @@ export function AutomationLiveBoard({
                       onClick={() => setExpandedActivity((current) => current === item.id ? "" : item.id)}
                     >
                       <span className="line-clamp-2 text-sm font-medium">{item.title}</span>
-                      <span className="line-clamp-2 text-xs text-muted-foreground">{item.detail}</span>
-                      <span className="mt-auto text-xs tabular-nums text-muted-foreground">{formatTime(item.at)}</span>
+                      <span className="line-clamp-2 text-xs text-muted-foreground">{formatKstDateText(item.detail)}</span>
+                      <span className="mt-auto text-xs tabular-nums text-muted-foreground">{formatKstDateTime(item.at)}</span>
                     </button>
                   ) : (
                     <div className="mt-5 flex min-h-24 items-center justify-center rounded-lg border border-dashed text-xs text-muted-foreground">
@@ -426,7 +417,7 @@ export function AutomationLiveBoard({
                     </div>
                   )}
                   <div className="mt-auto pt-3 text-center text-xs text-muted-foreground">
-                    {stage.footer || (stage.state === "active" ? "실시간 처리 중" : "2초마다 갱신")}
+                    {formatKstDateText(stage.footer) || (stage.state === "active" ? "실시간 처리 중" : "2초마다 갱신")}
                   </div>
                 </div>
               </div>
@@ -440,7 +431,7 @@ export function AutomationLiveBoard({
           <AlertTriangleIcon className="mt-0.5 size-4 shrink-0" />
           <div>
             <div className="font-medium">현재 차단 원인</div>
-            <div className="mt-0.5 text-xs">{snapshot.pipeline.blocker}</div>
+            <div className="mt-0.5 text-xs">{formatKstDateText(snapshot.pipeline.blocker)}</div>
           </div>
         </div>
       ) : null}
@@ -490,7 +481,7 @@ export function AutomationLiveBoard({
                 <SelectGroup>
                   <SelectItem value="all">전체 날짜</SelectItem>
                   {availableDates.map((date) => (
-                    <SelectItem key={date} value={date}>{date}</SelectItem>
+                    <SelectItem key={date} value={date}>{date} KST</SelectItem>
                   ))}
                 </SelectGroup>
               </SelectContent>
@@ -510,11 +501,11 @@ export function AutomationLiveBoard({
         </div>
         <div className="overflow-x-auto">
           <div className="min-w-[760px]">
-            <div className="grid grid-cols-[130px_minmax(260px,1fr)_180px_120px_36px] gap-3 border-b bg-muted/20 px-4 py-2 text-xs font-medium text-muted-foreground lg:px-5">
+            <div className="grid grid-cols-[130px_minmax(260px,1fr)_180px_190px_36px] gap-3 border-b bg-muted/20 px-4 py-2 text-xs font-medium text-muted-foreground lg:px-5">
               <span>상태</span>
               <span>제목</span>
               <span>현재 단계</span>
-              <span>처리 시각</span>
+              <span>처리 시각 (KST)</span>
               <span className="sr-only">상세</span>
             </div>
             {activities.length ? activities.map((item) => {
@@ -524,7 +515,7 @@ export function AutomationLiveBoard({
                 <div key={item.id} className="border-b last:border-b-0">
                   <button
                     type="button"
-                    className="grid w-full grid-cols-[130px_minmax(260px,1fr)_180px_120px_36px] items-center gap-3 px-4 py-3 text-left outline-none transition-colors hover:bg-muted/30 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring lg:px-5"
+                    className="grid w-full grid-cols-[130px_minmax(260px,1fr)_180px_190px_36px] items-center gap-3 px-4 py-3 text-left outline-none transition-colors hover:bg-muted/30 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring lg:px-5"
                     aria-expanded={expanded}
                     onClick={() => setExpandedActivity(expanded ? "" : item.id)}
                   >
@@ -534,10 +525,10 @@ export function AutomationLiveBoard({
                     </span>
                     <span className="min-w-0">
                       <span className="block truncate text-sm font-medium">{item.title}</span>
-                      <span className="block truncate text-xs text-muted-foreground">{item.detail}</span>
+                      <span className="block truncate text-xs text-muted-foreground">{formatKstDateText(item.detail)}</span>
                     </span>
                     <span className="text-sm">{STAGE_LABELS[item.stage] || item.stage || "-"}</span>
-                    <span className="text-sm tabular-nums text-muted-foreground">{formatTime(item.at)}</span>
+                    <span className="text-sm tabular-nums text-muted-foreground">{formatKstDateTime(item.at)}</span>
                     <ChevronRightIcon className={`size-4 text-muted-foreground transition-transform motion-reduce:transition-none ${expanded ? "rotate-90" : ""}`} />
                   </button>
                   {expanded ? (
@@ -545,7 +536,7 @@ export function AutomationLiveBoard({
                       {item.targetText ? (
                         <p className="text-muted-foreground"><span className="font-medium text-foreground">대상 문맥</span> · {item.targetText}</p>
                       ) : null}
-                      <p className="text-muted-foreground"><span className="font-medium text-foreground">처리 정보</span> · {item.detail || "상세 정보 없음"}</p>
+                      <p className="text-muted-foreground"><span className="font-medium text-foreground">처리 정보</span> · {formatKstDateText(item.detail) || "상세 정보 없음"}</p>
                       {item.targetUrl ? (
                         <a className="inline-flex w-fit items-center gap-1 font-medium underline underline-offset-4" href={item.targetUrl} target="_blank" rel="noreferrer">
                           X에서 확인 <ExternalLinkIcon className="size-3.5" />

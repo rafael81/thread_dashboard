@@ -313,6 +313,12 @@ test("live board uses stage-specific status copy instead of an unexplained bottl
   assert.doesNotMatch(source, />시작 시간</);
   assert.match(source, /normalizeActivityDisplay\(item, snapshot\)/);
   assert.match(source, /내 X 원글 댓글 확인 완료/);
+  assert.match(source, /formatKstDateTime\(snapshot\.updatedAt\)/);
+  assert.match(source, /formatKstDateTime\(item\.at\)/);
+  assert.match(source, /formatKstDateText\(stage\.detail\)/);
+  assert.match(source, /formatKstDateText\(snapshot\.pipeline\.blocker\)/);
+  assert.match(source, /처리 시각 \(KST\)/);
+  assert.doesNotMatch(source, /function formatTime/);
 });
 
 class FakeStream extends EventEmitter {
