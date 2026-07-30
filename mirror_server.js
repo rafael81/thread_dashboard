@@ -58,6 +58,19 @@ const DISCOVERY_DB_PATH = process.env.DISCOVERY_DB_PATH || path.join(__dirname, 
 const DASHBOARD_DIST_DIR = path.join(__dirname, "dashboard", "dist");
 const DASHBOARD_INDEX_PATH = path.join(DASHBOARD_DIST_DIR, "index.html");
 const GENERATED_MEDIA_DIR = path.join(__dirname, ".data", "generated-media");
+const DISCOVERY_THUMBNAIL_DIR = path.join(__dirname, ".data", "discovery-thumbnails");
+const DISCOVERY_THUMBNAIL_WIDTH = 320;
+const discoveryThumbnailJobs = new Map();
+const MEDIA_TEMP_PREFIXES = Object.freeze(["thread-mirror-", "youtube-x-upload-"]);
+const MEDIA_TEMP_ORPHAN_MIN_AGE_MS = Math.max(
+  5 * 60 * 1000,
+  Number(process.env.MEDIA_TEMP_ORPHAN_MIN_AGE_MS || 60 * 60 * 1000),
+);
+const MEDIA_TEMP_CLEANUP_INTERVAL_MS = Math.max(
+  5 * 60 * 1000,
+  Number(process.env.MEDIA_TEMP_CLEANUP_INTERVAL_MS || 60 * 60 * 1000),
+);
+const activeMediaTempDirs = new Set();
 const DISCOVERY_MIN_LIKES = Number(process.env.DISCOVERY_MIN_LIKES || 1000);
 const DISCOVERY_POST_INTERVAL_MS = Number(process.env.DISCOVERY_POST_INTERVAL_MS || 10 * 60 * 1000);
 const DISCOVERY_WORKER_INTERVAL_MS = Number(process.env.DISCOVERY_WORKER_INTERVAL_MS || 60 * 1000);
@@ -163,6 +176,8 @@ const TERAFABX_OWN_POST_REPLY_X_PROFILE_DIR = process.env.TERAFABX_OWN_POST_REPL
 const TERAFABX_OWN_POST_REPLY_X_LOCK_PATH = process.env.TERAFABX_OWN_POST_REPLY_X_LOCK_PATH || path.join(os.tmpdir(), `terafabx-own-post-reply-x${TERAFABX_OWN_POST_REPLY_X_PORT}.lock`);
 const TERAFABX_OWN_POST_REPLY_X_IDLE_TTL_MS = Math.max(60_000, Number(process.env.TERAFABX_OWN_POST_REPLY_X_IDLE_TTL_MS || 5 * 60 * 1000));
 const TERAFABX_OWN_POST_REPLY_X_BACKOFF_MS = Math.max(60_000, Number(process.env.TERAFABX_OWN_POST_REPLY_X_BACKOFF_MS || 10 * 60 * 1000));
+const TERAFABX_OWN_POST_REPLY_TARGET_DOM_MAX_RETRIES = Math.max(0, Number(process.env.TERAFABX_OWN_POST_REPLY_TARGET_DOM_MAX_RETRIES || 3));
+const TERAFABX_OWN_POST_REPLY_TARGET_DOM_RETRY_MS = Math.max(5_000, Number(process.env.TERAFABX_OWN_POST_REPLY_TARGET_DOM_RETRY_MS || 30_000));
 const TERAFABX_OWN_POST_SCAN_X_PORT = Number(process.env.TERAFABX_OWN_POST_SCAN_X_PORT || 9284);
 const TERAFABX_OWN_POST_SCAN_X_PROFILE_DIR = process.env.TERAFABX_OWN_POST_SCAN_X_PROFILE_DIR || path.join(__dirname, ".data", "chrome-profiles", "terafabx-own-post-scan-x");
 const TERAFABX_OWN_POST_SCAN_X_LOCK_PATH = process.env.TERAFABX_OWN_POST_SCAN_X_LOCK_PATH || path.join(os.tmpdir(), `terafabx-own-post-scan-x${TERAFABX_OWN_POST_SCAN_X_PORT}.lock`);
@@ -190,6 +205,8 @@ const TERAFABX_OWN_POST_COVERAGE_PAGES_PER_CYCLE = Math.max(1, Math.min(20, Numb
 const TERAFABX_OWN_POST_COVERAGE_ROOTS_PER_CYCLE = Math.max(1, Math.min(20, Number(process.env.TERAFABX_OWN_POST_COVERAGE_ROOTS_PER_CYCLE || 20)));
 const TERAFABX_OWN_POST_COVERAGE_BACKLOG_LIMIT = Math.max(100, Number(process.env.TERAFABX_OWN_POST_COVERAGE_BACKLOG_LIMIT || 5000));
 const TERAFABX_OWN_POST_COVERAGE_WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
+const TERAFABX_OWN_POST_UNAVAILABLE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const TERAFABX_OWN_POST_UNAVAILABLE_LIMIT = 200;
 const TERAFABX_REPLY_COUNT_REFRESH_INTERVAL_MS = Math.max(60_000, Number(process.env.TERAFABX_REPLY_COUNT_REFRESH_INTERVAL_MS || 2 * 60 * 1000));
 const TERAFABX_REPLY_COUNT_REFRESH_STALE_MS = Math.max(60_000, Number(process.env.TERAFABX_REPLY_COUNT_REFRESH_STALE_MS || 15 * 60 * 1000));
 const TERAFABX_REPLY_COUNT_REFRESH_BATCH_SIZE = Math.max(1, Math.min(50, Number(process.env.TERAFABX_REPLY_COUNT_REFRESH_BATCH_SIZE || 10)));
@@ -873,6 +890,118 @@ function proxyMediaDownload(url, res, redirectCount = 0) {
   });
 }
 
+function isVideoMediaUrl(url = "") {
+  return /\.mp4|\.mov|\.webm|\/o1\/v\/t16\//i.test(String(url || ""));
+}
+
+function discoveryThumbnailCachePath(url = "") {
+  const key = crypto.createHash("sha256").update(String(url || "")).digest("hex");
+  return path.join(DISCOVERY_THUMBNAIL_DIR, `${key}.webp`);
+}
+
+function localGeneratedMediaPath(url = "") {
+  try {
+    const parsed = new URL(url);
+    if (!["127.0.0.1", "localhost"].includes(parsed.hostname) || !parsed.pathname.startsWith("/generated-media/")) return "";
+    const requested = decodeURIComponent(parsed.pathname.replace(/^\/generated-media\//, ""));
+    const fullPath = path.resolve(GENERATED_MEDIA_DIR, requested);
+    const rootPath = path.resolve(GENERATED_MEDIA_DIR);
+    return fullPath.startsWith(rootPath + path.sep) && fs.existsSync(fullPath) ? fullPath : "";
+  } catch {
+    return "";
+  }
+}
+
+async function fetchDiscoveryThumbnailSource(url) {
+  const localPath = localGeneratedMediaPath(url);
+  if (localPath) return fs.readFileSync(localPath);
+  const parsed = new URL(url);
+  if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("unsupported thumbnail URL");
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+  try {
+    const response = await fetch(url, {
+      headers: { "user-agent": "Mozilla/5.0", accept: "image/avif,image/webp,image/*,*/*;q=0.8" },
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`thumbnail source HTTP ${response.status}`);
+    const declaredLength = Number(response.headers.get("content-length") || 0);
+    if (declaredLength > 25 * 1024 * 1024) throw new Error("thumbnail source is too large");
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (!buffer.length || buffer.length > 25 * 1024 * 1024) throw new Error("thumbnail source size is invalid");
+    return buffer;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function createDiscoveryThumbnail(url) {
+  const sourceUrl = String(url || "").trim();
+  if (!sourceUrl || isVideoMediaUrl(sourceUrl)) return null;
+  const cachePath = discoveryThumbnailCachePath(sourceUrl);
+  if (fs.existsSync(cachePath) && fs.statSync(cachePath).size > 0) return cachePath;
+  if (discoveryThumbnailJobs.has(sourceUrl)) return discoveryThumbnailJobs.get(sourceUrl);
+  const job = (async () => {
+    fs.mkdirSync(DISCOVERY_THUMBNAIL_DIR, { recursive: true });
+    const source = await fetchDiscoveryThumbnailSource(sourceUrl);
+    const sharp = (await import("sharp")).default;
+    const tempPath = `${cachePath}.${process.pid}.${Date.now()}.tmp`;
+    try {
+      await sharp(source)
+        .rotate()
+        .resize({
+          width: DISCOVERY_THUMBNAIL_WIDTH,
+          height: 180,
+          fit: "cover",
+          position: "centre",
+          withoutEnlargement: true,
+        })
+        .webp({ quality: 68, effort: 3 })
+        .toFile(tempPath);
+      fs.renameSync(tempPath, cachePath);
+      return cachePath;
+    } finally {
+      try { fs.unlinkSync(tempPath); } catch {}
+    }
+  })().finally(() => {
+    discoveryThumbnailJobs.delete(sourceUrl);
+  });
+  discoveryThumbnailJobs.set(sourceUrl, job);
+  return job;
+}
+
+function discoveryThumbnailPlaceholder(res) {
+  const body = `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180" viewBox="0 0 320 180"><rect width="320" height="180" fill="#f1f5f9"/><circle cx="160" cy="82" r="25" fill="#cbd5e1"/><path d="m153 69 22 13-22 13z" fill="#fff"/><text x="160" y="132" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#64748b">미디어</text></svg>`;
+  res.writeHead(200, {
+    "content-type": "image/svg+xml; charset=utf-8",
+    "cache-control": "public, max-age=300",
+  });
+  res.end(body);
+}
+
+async function serveDiscoveryThumbnail(url, res) {
+  if (!url || isVideoMediaUrl(url)) {
+    discoveryThumbnailPlaceholder(res);
+    return;
+  }
+  try {
+    const cachePath = await createDiscoveryThumbnail(url);
+    if (!cachePath) {
+      discoveryThumbnailPlaceholder(res);
+      return;
+    }
+    res.writeHead(200, {
+      "content-type": "image/webp",
+      "content-length": fs.statSync(cachePath).size,
+      "cache-control": "public, max-age=31536000, immutable",
+    });
+    fs.createReadStream(cachePath).pipe(res);
+  } catch (error) {
+    logEvent("discovery_thumbnail_error", { url: String(url).slice(0, 240), error: error.message });
+    discoveryThumbnailPlaceholder(res);
+  }
+}
+
 function tryServeDashboardAsset(req, res) {
   if (!req.url.startsWith("/assets/")) return false;
   const requested = decodeURIComponent(new URL(req.url, "http://localhost").pathname.slice(1));
@@ -964,10 +1093,41 @@ function requestExternalJson(url, timeoutMs = 12000) {
   });
 }
 
+const MIRROR_WORK_TAB_ROLES = Object.freeze({
+  THREADS_COLLECT: "threads_collect",
+  X_PUBLISH: "x_publish",
+});
+
+function mirrorWorkTabRoleAllowsUrl(role, url) {
+  const normalizedRole = String(role || "");
+  if (!normalizedRole) return true;
+  const value = String(url || "");
+  if (!value || value === "about:blank") return true;
+  let hostname = "";
+  try {
+    hostname = new URL(value).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (normalizedRole === MIRROR_WORK_TAB_ROLES.THREADS_COLLECT) {
+    return hostname === "threads.com" || hostname.endsWith(".threads.com");
+  }
+  if (normalizedRole === MIRROR_WORK_TAB_ROLES.X_PUBLISH) {
+    return hostname === "x.com" || hostname.endsWith(".x.com");
+  }
+  return false;
+}
+
+function assertMirrorWorkTabUrl(role, url) {
+  if (mirrorWorkTabRoleAllowsUrl(role, url)) return;
+  throw new Error(`브라우저 작업 탭 역할 위반: role=${String(role || "unknown")} url=${String(url || "")}`);
+}
+
 class CdpPage {
-  constructor(tab, port = CHROME_PORT) {
+  constructor(tab, port = CHROME_PORT, options = {}) {
     this.tab = tab;
     this.port = port;
+    this.workRole = String(options.workRole || "");
     this.id = 0;
     this.pending = new Map();
     this.events = [];
@@ -1057,6 +1217,7 @@ class CdpPage {
   }
 
   async navigate(url, waitMs = 6000) {
+    assertMirrorWorkTabUrl(this.workRole, url);
     try {
       await this.send("Page.navigate", { url }, 12000);
     } catch (error) {
@@ -1077,7 +1238,16 @@ class CdpPage {
       await sleep(100);
       try {
         const tabs = await requestJsonForPort(this.port, "GET", "/json/list");
-        if (!tabs.some((tab) => tab.id === this.tab.id)) return;
+        if (!tabs.some((tab) => tab.id === this.tab.id)) {
+          if (this.workRole) {
+            logEvent("browser_work_tab_closed", {
+              role: this.workRole,
+              tabId: this.tab.id,
+              port: this.port,
+            });
+          }
+          return;
+        }
       } catch {}
     }
     logEvent("cdp_tab_close_failed", {
@@ -1096,10 +1266,24 @@ class DuplicateMirrorError extends Error {
   }
 }
 
-async function newPage(url = "about:blank") {
+async function newPage(url = "about:blank", options = {}) {
+  assertMirrorWorkTabUrl(options.workRole, url);
   const tab = await requestJson("PUT", `/json/new?${encodeURIComponent(url)}`);
-  const page = new CdpPage(tab, CHROME_PORT);
-  await page.open();
+  const page = new CdpPage(tab, CHROME_PORT, options);
+  try {
+    await page.open();
+  } catch (error) {
+    await requestJsonForPort(CHROME_PORT, "PUT", `/json/close/${tab.id}`).catch(() => null);
+    throw error;
+  }
+  if (page.workRole) {
+    logEvent("browser_work_tab_opened", {
+      role: page.workRole,
+      tabId: tab.id,
+      port: CHROME_PORT,
+      url,
+    });
+  }
   return page;
 }
 
@@ -1405,6 +1589,7 @@ function loadTerafabxState() {
     lastOwnPostReplyUrl: null,
     ownPostCoverageCursor: "",
     ownPostCoverageBacklog: [],
+    ownPostUnavailableRoots: {},
     ownPostCoverageLastRunAt: null,
     ownPostCoverageLastStatus: "idle",
     ownPostCoverageLastError: null,
@@ -1443,9 +1628,20 @@ function loadTerafabxState() {
   ]) {
     delete loaded[key];
   }
+  loaded.ownPostUnavailableRoots = normalizeTerafabxOwnPostUnavailableRoots(
+    loaded.ownPostUnavailableRoots,
+  );
+  for (const item of Array.isArray(loaded.ownPostCoverageBacklog) ? loaded.ownPostCoverageBacklog : []) {
+    if (!isTerafabxConversationRootUnavailableError(item?.lastError)) continue;
+    loaded.ownPostUnavailableRoots = markTerafabxOwnPostUnavailableRoot(
+      loaded.ownPostUnavailableRoots,
+      item?.url,
+      item?.lastError,
+    );
+  }
   loaded.ownPostCoverageBacklog = normalizeTerafabxOwnPostCoverageBacklog(
     loaded.ownPostCoverageBacklog,
-    { recentOnly: true },
+    { recentOnly: true, unavailableRoots: loaded.ownPostUnavailableRoots },
   );
   terafabxStateCache = loaded;
   terafabxStateCacheSignature = signature;
@@ -1582,6 +1778,7 @@ function normalizeTerafabxOwnPostReplyWriteQueue(value) {
       status: String(row.status || "queued"),
       queuedAt: row.queuedAt || new Date().toISOString(),
       attempts: Math.max(0, Number(row.attempts || 0)),
+      targetDomMissRetries: Math.max(0, Number(row.targetDomMissRetries || 0)),
       retryAt: row.retryAt || null,
       lastError: row.lastError || null,
     };
@@ -3106,7 +3303,7 @@ function terafabxGeminiBatchFinalJudgePrompt(items = []) {
     "댓글 작성자가 실제로 먹어 봤다·가 봤다·겪었다는 근거가 없는데 '나도', '~해봤는데', '~더라'처럼 직접 경험을 꾸며내면 unsupported_claim=true로 판정해라. 제공된 영상·사진을 보고 한 관찰은 직접 경험 주장과 구분한다.",
     "원문이 한 번의 사건이나 특정 연도만 말하는데 댓글이 '매년', '항상', '원래', '늘'처럼 반복되는 사실로 확대하면 unsupported_claim=true로 판정해라.",
     "원문에 범죄·불법·위법·사기라는 법적 분류가 없는데 댓글이 행동을 새로 '범죄', '불법', '사기'로 단정하거나 '범죄나 다름없다'고 결론 내리면 unsupported_claim=true로 판정해라.",
-    "Grok 분석의 대응 조언을 사실 근거로 취급하지 마라. source_anchor에는 반드시 원문 또는 부모 원글에 실제로 적힌 고유 명사·숫자·행동 구절을 원문 그대로 적어라.",
+    "Grok 분석의 대응 조언이나 추측을 사실 근거로 취급하지 마라. source_anchor에는 원문·부모 원글 텍스트 또는 검증된 원문 미디어 분석의 확정적 관찰에 실제로 있는 고유 명사·숫자·행동 구절을 적어라.",
     "댓글이 같은 분야의 다른 글에도 그대로 붙을 수 있으면 cross_post_reusable=true다. 예: '폭로성 스캔들은 사실 확인이 먼저 필요합니다'처럼 일반 원칙만 말하는 문장.",
     "'배려가 필요합니다', '확인이 필요합니다', '안전합니다', '해야 합니다'처럼 대화형 반응 없이 당위적 결론만 말하거나 기사 제목·안전 표어·교훈 문장처럼 들리면 headline_tone=true다.",
     "댓글이 source_anchor의 구체적인 대상을 실제로 언급하거나 명확히 가리키지 않으면 specificity_error=true다.",
@@ -3545,17 +3742,117 @@ function normalizeTerafabxFinalJudgeParsed(parsed, finalReply, rawPreview = "") 
   };
 }
 
+const TERAFABX_SOURCE_ANCHOR_STOP_TOKENS = new Set([
+  "그냥", "너무", "정말", "진짜", "완전", "이거", "그거", "저거",
+  "모습", "장면", "영상", "사진", "원문", "댓글", "답글", "부모", "대상",
+  "상황", "내용", "정도", "관련", "해당",
+]);
+
+const TERAFABX_KOREAN_PARTICLE_SUFFIXES = [
+  "들에게서", "으로부터", "이라고", "이라도", "에게서", "한테서",
+  "으로", "에서", "에게", "한테", "까지", "부터", "처럼", "보다",
+  "만큼", "밖에", "라고", "이며", "이고", "이나", "이랑", "하고",
+  "들이", "께서", "와", "과", "은", "는", "이", "가", "을", "를",
+  "에", "의", "도", "만", "로",
+].sort((a, b) => b.length - a.length);
+
+function normalizeTerafabxSourceAnchorToken(value = "") {
+  let token = String(value || "")
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[^0-9a-z가-힣]/g, "");
+  if (!token || !/^[가-힣]+$/.test(token)) return token;
+  for (let pass = 0; pass < 2; pass += 1) {
+    const suffix = TERAFABX_KOREAN_PARTICLE_SUFFIXES.find((candidate) => (
+      token.endsWith(candidate) && token.length - candidate.length >= 1
+    ));
+    if (!suffix) break;
+    token = token.slice(0, -suffix.length);
+  }
+  return token;
+}
+
+function terafabxSourceAnchorTokens(value = "") {
+  return Array.from(new Set(
+    cleanSocialText(value)
+      .normalize("NFKC")
+      .toLowerCase()
+      .split(/[^0-9a-z가-힣]+/)
+      .map(normalizeTerafabxSourceAnchorToken)
+      .filter((token) => token && !TERAFABX_SOURCE_ANCHOR_STOP_TOKENS.has(token)),
+  ));
+}
+
+function terafabxTrustedSourceContext(target = {}) {
+  const context = target.groundingContext || target.grokContext || null;
+  if (!context || !isConfirmedTerafabxGrokContext(context)) return "";
+  const normalized = normalizeTerafabxContextResult(context);
+  return cleanSocialText([
+    normalized.contextSummary,
+    ...(normalized.keyPoints || []),
+  ].filter(Boolean).join(" "));
+}
+
+function assessTerafabxSourceAnchorGrounding(anchorValue = "", target = {}) {
+  const anchor = cleanSocialText(anchorValue).normalize("NFKC").toLowerCase();
+  const source = cleanSocialText([
+    target.rootPostText,
+    target.targetText,
+    target.text,
+    target.quotePostText,
+    terafabxTrustedSourceContext(target),
+  ].filter(Boolean).join(" ")).normalize("NFKC").toLowerCase();
+  if (!source || !anchor) {
+    return {
+      grounded: false,
+      method: "missing",
+      anchorTokens: [],
+      matchedTokens: [],
+      overlapRatio: 0,
+    };
+  }
+  if (source.includes(anchor)) {
+    const anchorTokens = terafabxSourceAnchorTokens(anchor);
+    return {
+      grounded: true,
+      method: "exact_phrase",
+      anchorTokens,
+      matchedTokens: anchorTokens,
+      overlapRatio: 1,
+    };
+  }
+  const anchorTokens = terafabxSourceAnchorTokens(anchor);
+  const sourceTokens = new Set(terafabxSourceAnchorTokens(source));
+  const matchedTokens = anchorTokens.filter((token) => sourceTokens.has(token));
+  const requiredMatches = anchorTokens.length <= 2
+    ? anchorTokens.length
+    : Math.max(2, Math.ceil(anchorTokens.length * 0.6));
+  const singleTokenIsSpecific = anchorTokens.length === 1 && anchorTokens[0].length >= 2;
+  const grounded = anchorTokens.length > 0
+    && (anchorTokens.length > 1 || singleTokenIsSpecific)
+    && matchedTokens.length >= requiredMatches;
+  return {
+    grounded,
+    method: grounded ? "normalized_token_overlap" : "insufficient_token_overlap",
+    anchorTokens,
+    matchedTokens,
+    overlapRatio: anchorTokens.length
+      ? Math.round((matchedTokens.length / anchorTokens.length) * 1000) / 1000
+      : 0,
+  };
+}
+
 function applyTerafabxJudgeSourceGrounding(judge, target = null) {
   if (!target) return judge;
-  const source = cleanSocialText([target.rootPostText, target.targetText, target.text, target.quotePostText].filter(Boolean).join(" ")).toLowerCase();
-  const anchor = cleanSocialText(judge.sourceAnchor || "").toLowerCase();
-  const sourceAnchorGrounded = Boolean(source && anchor && source.includes(anchor));
+  const sourceAnchorGrounding = assessTerafabxSourceAnchorGrounding(judge.sourceAnchor, target);
+  const sourceAnchorGrounded = sourceAnchorGrounding.grounded;
   const flaggedQualityIssues = sourceAnchorGrounded
     ? judge.flaggedQualityIssues
     : [...new Set([...(judge.flaggedQualityIssues || []), "source_anchor_unverifiable"])];
   return {
     ...judge,
     sourceAnchorGrounded,
+    sourceAnchorGrounding,
     flaggedQualityIssues,
     passed: Boolean(judge.passed && sourceAnchorGrounded),
   };
@@ -3595,7 +3892,13 @@ function parseTerafabxGeminiBatchFinalJudge(raw, judgedItems = []) {
       preferredVariant,
       finalReply,
       raw: row,
-    }, judgedItem.target || judgedItem.prepared?.target || null));
+    }, {
+      ...(judgedItem.target || judgedItem.prepared?.target || {}),
+      groundingContext: judgedItem.groundingContext
+        || judgedItem.prepared?.groundingContext
+        || judgedItem.prepared?.grokContext
+        || null,
+    }));
   });
   return Array.from({ length: expectedCount || rows.length }, (_, index) => {
     if (!mapped.has(index)) throw new Error(`Gemini 묶음 최종심사 결과 누락: index=${index}`);
@@ -3674,7 +3977,10 @@ async function judgeTerafabxReplyWithGeminiHeadless(target, grokInput, finalRepl
     if (result.code !== 0) throw new Error(result.stderr || result.stdout || "Gemini Web 최종 심사 실패");
     if (!fs.existsSync(outPath)) throw new Error("Gemini Web 최종 심사 출력 파일이 생성되지 않았습니다.");
     const raw = fs.readFileSync(outPath, "utf8");
-    const judged = parseTerafabxFinalJudge(raw, finalReply, target);
+    const judged = parseTerafabxFinalJudge(raw, finalReply, {
+      ...target,
+      groundingContext: options.groundingContext || null,
+    });
     logEvent("terafabx_gemini_final_judge_ok", { targetUrl: target.url, finalReply, runDir, ...judged });
     if (!judged.passed) {
       throw new Error(`Gemini 최종 심사 탈락: ${judged.score}점${judged.fatalError ? " (치명적 오류)" : ""} - ${judged.reason || "품질 기준 미달"}`);
@@ -5975,6 +6281,56 @@ function isTerafabxRecentOwnPostCoverageRoot(item = {}, now = Date.now()) {
     && createdAtMs <= Number(now) + 5 * 60 * 1000;
 }
 
+function isTerafabxConversationRootUnavailableError(error) {
+  const message = String(error?.message || error || "");
+  if (!/\bHTTP\s+404\b/i.test(message)) return false;
+  return /"(?:status|thread|replies|author)"\s*:\s*null/i.test(message)
+    || /"code"\s*:\s*404\b/i.test(message)
+    || /\bNOT_FOUND\b/i.test(message);
+}
+
+function normalizeTerafabxOwnPostUnavailableRoots(value = {}, options = {}) {
+  const now = Number.isFinite(Number(options.now)) ? Number(options.now) : Date.now();
+  const rows = [];
+  for (const [rawUrl, rawEntry] of Object.entries(value && typeof value === "object" ? value : {})) {
+    const url = normalizeXStatusUrl(rawEntry?.rootUrl || rawUrl);
+    const parsed = parseXStatusUrl(url);
+    if (!parsed?.id || parsed.handle.toLowerCase() !== REQUIRED_X_HANDLE) continue;
+    const unavailableAt = String(rawEntry?.unavailableAt || "");
+    const unavailableAtMs = Date.parse(unavailableAt);
+    if (!Number.isFinite(unavailableAtMs) || now - unavailableAtMs > TERAFABX_OWN_POST_UNAVAILABLE_TTL_MS) continue;
+    rows.push([url, {
+      rootUrl: url,
+      reason: String(rawEntry?.reason || "conversation_api_404"),
+      unavailableAt,
+      lastError: String(rawEntry?.lastError || "").slice(0, 500),
+    }]);
+  }
+  return Object.fromEntries(
+    rows
+      .sort((a, b) => String(b[1].unavailableAt).localeCompare(String(a[1].unavailableAt)))
+      .slice(0, TERAFABX_OWN_POST_UNAVAILABLE_LIMIT),
+  );
+}
+
+function markTerafabxOwnPostUnavailableRoot(value = {}, rootUrl = "", error = "", options = {}) {
+  const now = Number.isFinite(Number(options.now)) ? Number(options.now) : Date.now();
+  const url = normalizeXStatusUrl(rootUrl);
+  const parsed = parseXStatusUrl(url);
+  if (!parsed?.id || parsed.handle.toLowerCase() !== REQUIRED_X_HANDLE) {
+    return normalizeTerafabxOwnPostUnavailableRoots(value, { now });
+  }
+  return normalizeTerafabxOwnPostUnavailableRoots({
+    ...value,
+    [url]: {
+      rootUrl: url,
+      reason: "conversation_api_404",
+      unavailableAt: new Date(now).toISOString(),
+      lastError: String(error?.message || error || "").slice(0, 500),
+    },
+  }, { now });
+}
+
 async function fetchTerafabxOwnRootStatusPage({ cursor = "", fetchJson = requestExternalJson } = {}) {
   const query = new URLSearchParams({ count: "100", since: "0" });
   if (cursor) query.set("cursor", cursor);
@@ -5994,11 +6350,13 @@ async function fetchTerafabxOwnRootStatusPage({ cursor = "", fetchJson = request
 function normalizeTerafabxOwnPostCoverageBacklog(value = [], options = {}) {
   const rows = new Map();
   const now = Number.isFinite(Number(options.now)) ? Number(options.now) : Date.now();
+  const unavailableRoots = normalizeTerafabxOwnPostUnavailableRoots(options.unavailableRoots, { now });
   for (const item of Array.isArray(value) ? value : []) {
     const row = typeof item === "string" ? { url: item } : item;
     const url = normalizeXStatusUrl(row?.url || "");
     const parsed = parseXStatusUrl(url);
     if (!parsed?.id || parsed.handle.toLowerCase() !== REQUIRED_X_HANDLE) continue;
+    if (unavailableRoots[url]) continue;
     const existing = rows.get(url);
     const normalized = {
       url,
@@ -6115,6 +6473,7 @@ async function discoverTerafabxOwnPostCoverageCycle(state = loadTerafabxState(),
   const maxPages = Math.max(1, Math.floor(Number(options.maxPages || TERAFABX_OWN_POST_COVERAGE_PAGES_PER_CYCLE)));
   const fetchPage = options.fetchPage || fetchTerafabxOwnRootStatusPage;
   const now = Number.isFinite(Number(options.now)) ? Number(options.now) : Date.now();
+  const unavailableRoots = normalizeTerafabxOwnPostUnavailableRoots(state.ownPostUnavailableRoots, { now });
   const startingCursor = String(state.ownPostCoverageCursor || "");
   let cursor = startingCursor;
   let completedPass = false;
@@ -6152,7 +6511,7 @@ async function discoverTerafabxOwnPostCoverageCycle(state = loadTerafabxState(),
       ...item,
       discoveredAt: new Date(now).toISOString(),
     })),
-  ], { recentOnly: true, now });
+  ], { recentOnly: true, now, unavailableRoots });
   return {
     startingCursor,
     nextCursor: cursor,
@@ -6496,6 +6855,72 @@ function createPullTaskPool(concurrency, { onStats = null, now = () => Date.now(
       return promise;
     },
   };
+}
+
+function createTerafabxGeminiConsumerGroup(concurrency, {
+  onStats = null,
+  now = () => Date.now(),
+  resourceFactory = terafabxOwnPostReplyWorkerResources,
+  initializeResource = (resource) => seedTerafabxGeminiProfileFromTemplate(resource.profileDir),
+  closeResource = async (resource) => {
+    await closeTerafabxGeminiHeadlessBrowser({
+      port: resource.chromePort,
+      profileDir: resource.profileDir,
+    }).catch(() => null);
+    await closeTerafabxGrokWebSession(resource.grokContextSession).catch(() => null);
+  },
+} = {}) {
+  const workerCount = Math.max(1, Math.floor(Number(concurrency) || 1));
+  const resources = Array.from({ length: workerCount }, (_, workerIndex) => resourceFactory(workerIndex));
+  resources.forEach((resource, workerIndex) => initializeResource(resource, workerIndex));
+  const pool = createPullTaskPool(workerCount, { onStats, now });
+  const inFlight = new Set();
+  let accepting = true;
+  let closePromise = null;
+
+  const group = {
+    kind: "gemini_consumer_group",
+    ownsWorkerResources: true,
+    get concurrency() {
+      return workerCount;
+    },
+    get depth() {
+      return pool.depth;
+    },
+    get active() {
+      return pool.active;
+    },
+    get stats() {
+      return pool.stats;
+    },
+    get resources() {
+      return resources.slice();
+    },
+    resourceForWorker(workerIndex) {
+      return resources[workerIndex] || null;
+    },
+    enqueue(task) {
+      if (!accepting) return Promise.reject(new Error("Gemini 컨슈머 그룹이 종료 중입니다."));
+      if (typeof task !== "function") return Promise.reject(new TypeError("task must be a function"));
+      const tracked = pool.enqueue((workerIndex) => task(workerIndex, resources[workerIndex]));
+      inFlight.add(tracked);
+      tracked.then(
+        () => inFlight.delete(tracked),
+        () => inFlight.delete(tracked),
+      );
+      return tracked;
+    },
+    close() {
+      if (closePromise) return closePromise;
+      accepting = false;
+      closePromise = (async () => {
+        await Promise.allSettled(Array.from(inFlight));
+        await Promise.all(resources.map((resource, workerIndex) => closeResource(resource, workerIndex)));
+      })();
+      return closePromise;
+    },
+  };
+  return group;
 }
 
 function allocateTerafabxOwnPostReplyWorkers(entries = [], maxWorkers = TERAFABX_BROWSER_CONCURRENCY_CAP) {
@@ -6889,9 +7314,13 @@ function selectTerafabxReplyCountRefreshTargets(state = {}, historyEntries = [],
   const coverage = state.ownPostReplyCoverage && typeof state.ownPostReplyCoverage === "object"
     ? state.ownPostReplyCoverage
     : {};
+  const unavailableRoots = normalizeTerafabxOwnPostUnavailableRoots(state.ownPostUnavailableRoots, { now });
   const roots = new Set([
     ...Object.keys(coverage),
-    ...normalizeTerafabxOwnPostCoverageBacklog(state.ownPostCoverageBacklog).map((item) => item.url),
+    ...normalizeTerafabxOwnPostCoverageBacklog(state.ownPostCoverageBacklog, {
+      now,
+      unavailableRoots,
+    }).map((item) => item.url),
     ...Array.from(terafabxCompletedReplyTargetsByRoot(state).keys()),
     ...(historyEntries || [])
       .filter((item) => item?.status === "posted")
@@ -6900,6 +7329,7 @@ function selectTerafabxReplyCountRefreshTargets(state = {}, historyEntries = [],
   ]);
   return Array.from(roots)
     .filter((url) => {
+      if (unavailableRoots[url]) return false;
       const parsed = parseXStatusUrl(url);
       if (!parsed?.id || parsed.handle.toLowerCase() !== REQUIRED_X_HANDLE) return false;
       const publishedAtMs = xStatusCreatedAtMs(url);
@@ -6967,13 +7397,36 @@ async function runTerafabxReplyCountRefresh(options = {}) {
           }
           return { ok: true, target, conversation };
         } catch (error) {
-          return { ok: false, target, error: error.message };
+          return {
+            ok: false,
+            target,
+            error: error.message,
+            rootUnavailable: isTerafabxConversationRootUnavailableError(error),
+          };
         }
       },
     );
     const latestState = loadState();
     const coverage = { ...(latestState.ownPostReplyCoverage || {}) };
+    let unavailableRoots = normalizeTerafabxOwnPostUnavailableRoots(
+      latestState.ownPostUnavailableRoots,
+      { now },
+    );
     for (const result of results) {
+      if (result.rootUnavailable) {
+        unavailableRoots = markTerafabxOwnPostUnavailableRoot(
+          unavailableRoots,
+          result.target.url,
+          result.error,
+          { now },
+        );
+        logEvent("terafabx_reply_count_refresh_root_unavailable", {
+          rootUrl: result.target.url,
+          reason: "conversation_api_404",
+          error: result.error,
+        });
+        continue;
+      }
       if (!result.ok) continue;
       const record = buildTerafabxOwnPostReplyCoverageRecord(result.conversation, latestState, {
         checkedAt,
@@ -6981,11 +7434,13 @@ async function runTerafabxReplyCountRefresh(options = {}) {
       });
       if (record) coverage[result.target.url] = record;
     }
-    const failed = results.filter((item) => !item.ok);
+    const unavailable = results.filter((item) => item.rootUnavailable);
+    const failed = results.filter((item) => !item.ok && !item.rootUnavailable);
     const summary = {
       checkedAt,
       requestedCount: targets.length,
-      updatedCount: results.length - failed.length,
+      updatedCount: results.filter((item) => item.ok).length,
+      unavailableRootCount: unavailable.length,
       failedCount: failed.length,
       failed: failed.map((item) => ({ rootUrl: item.target.url, error: item.error })).slice(0, 10),
       intervalMs: TERAFABX_REPLY_COUNT_REFRESH_INTERVAL_MS,
@@ -6994,6 +7449,11 @@ async function runTerafabxReplyCountRefresh(options = {}) {
     };
     saveState({
       ownPostReplyCoverage: coverage,
+      ownPostUnavailableRoots: unavailableRoots,
+      ownPostCoverageBacklog: normalizeTerafabxOwnPostCoverageBacklog(
+        latestState.ownPostCoverageBacklog,
+        { now, recentOnly: true, unavailableRoots },
+      ),
       ownPostReplyCountRefreshLastRunAt: checkedAt,
       ownPostReplyCountRefreshLastStatus: failed.length ? "degraded" : "ok",
       ownPostReplyCountRefreshLastError: failed.length
@@ -7441,6 +7901,7 @@ async function buildTerafabxVerifiedReviewRecord({ profile, target, manual, work
       cleanupBrowser: false,
       chromePort: geminiPort,
       profileDir: geminiProfileDir,
+      groundingContext: grokContext,
     });
     comment = validateTerafabxReply(geminiReview.finalReply);
     const contextRecord = terafabxGrokContextForRecord(grokContext);
@@ -8205,6 +8666,31 @@ function isTerafabxReplySubmissionUncertain(error) {
 function isTerafabxTransientReplyPageError(error) {
   const message = String(error?.message || error || "");
   return /target root 검증 실패:.*\"text\":\"\"|활성화된 답글 게시 버튼을 찾지 못했습니다|X .*로딩 실패|Runtime\.evaluate timed out|missing_editor/i.test(message);
+}
+
+function isTerafabxReplyTargetDomMissingError(error) {
+  return /target root 검증 실패:.*\"text\":\"\"/i.test(String(error?.message || error || ""));
+}
+
+function terafabxReplyTargetDomRetryDisposition(record = {}, error, options = {}) {
+  if (!isTerafabxReplyTargetDomMissingError(error)) return { matched: false };
+  const maxRetries = Math.max(0, Number(
+    options.maxRetries ?? TERAFABX_OWN_POST_REPLY_TARGET_DOM_MAX_RETRIES,
+  ));
+  const retryDelayMs = Math.max(0, Number(
+    options.retryDelayMs ?? TERAFABX_OWN_POST_REPLY_TARGET_DOM_RETRY_MS,
+  ));
+  const retryCount = Math.max(0, Number(record.targetDomMissRetries || 0)) + 1;
+  const drop = retryCount > maxRetries;
+  return {
+    matched: true,
+    retryCount,
+    maxRetries,
+    drop,
+    retryAt: drop
+      ? null
+      : new Date(Number(options.now ?? Date.now()) + retryDelayMs).toISOString(),
+  };
 }
 
 function terafabxOwnPostReplyXWriteBackoff(state = loadTerafabxState(), now = Date.now()) {
@@ -9116,7 +9602,10 @@ async function buildTerafabxPreparedCommentRecord(target, options = {}) {
   let geminiReview;
   let comment;
   try {
-    geminiReview = await reviewTerafabxReplyWithGemini(target, grokResult, geminiOptions);
+    geminiReview = await reviewTerafabxReplyWithGemini(target, grokResult, {
+      ...geminiOptions,
+      groundingContext: grokContext,
+    });
     assertTerafabxReplyReviewScoreQualified(geminiReview, TERAFABX_REVIEW_COMMENT_MIN_SCORE);
     comment = validateTerafabxReply(geminiReview.finalReply);
     const contextAssessment = assessTerafabxParentContextMismatch(target, comment);
@@ -9349,11 +9838,22 @@ async function postTerafabxOwnPostReplyWriteRecord(record, { onProgress = null }
   if (!latest.manual) {
     const writerBackoff = terafabxOwnPostReplyXWriteBackoff();
     if (writerBackoff.active) {
-      return deferTerafabxOwnPostReplyWrite(latest, {
-        retryAt: writerBackoff.retryAt,
-        error: writerBackoff.error,
-        reason: "x_writer_backoff",
-      });
+      if (isTerafabxReplyTargetDomMissingError(writerBackoff.error)) {
+        saveTerafabxState({
+          ownPostReplyXWriteBackoffUntil: null,
+          ownPostReplyXWriteBackoffError: null,
+        });
+        logEvent("terafabx_own_post_reply_target_dom_global_backoff_cleared", {
+          retryAt: writerBackoff.retryAt,
+          error: writerBackoff.error,
+        });
+      } else {
+        return deferTerafabxOwnPostReplyWrite(latest, {
+          retryAt: writerBackoff.retryAt,
+          error: writerBackoff.error,
+          reason: "x_writer_backoff",
+        });
+      }
     }
     const daily = terafabxDailyCommentProgress();
     if (daily.reached) {
@@ -9409,6 +9909,22 @@ async function postTerafabxOwnPostReplyWriteRecord(record, { onProgress = null }
     writerStartedAt: new Date().toISOString(),
   });
   try {
+    const heart = await attemptTerafabxReplyHeart(targetUrl, {
+      rootUrl: latest.rootUrl,
+      manual: Boolean(latest.manual),
+      source: latest.source || "own_post_reply",
+      xResourceKind: "ownReply",
+      cleanupHeadless: false,
+      lockAction: "own-post-reply-heart-before-post",
+    });
+    logEvent("terafabx_own_post_reply_heart_before_post", {
+      rootUrl: latest.rootUrl,
+      targetUrl,
+      liked: heart.liked,
+      alreadyLiked: heart.alreadyLiked,
+      deferred: heart.deferred,
+      error: heart.error,
+    });
     const result = await postTerafabxReply(targetUrl, latest.prepared.comment, {
       headless: true,
       quick: false,
@@ -9437,7 +9953,7 @@ async function postTerafabxOwnPostReplyWriteRecord(record, { onProgress = null }
       attempts: latest.attempts,
       durableQueueDepth: loadTerafabxOwnPostReplyWriteQueue().length,
     });
-    return { status: "posted", result, historyRecord, record: latest };
+    return { status: "posted", result, historyRecord, heart, record: latest };
   } catch (error) {
     if (isTerafabxSkippableOwnPostReplyTargetError(error)) {
       removeTerafabxOwnPostReplyWrite(latest.id);
@@ -9448,6 +9964,31 @@ async function postTerafabxOwnPostReplyWriteRecord(record, { onProgress = null }
         error: error.message,
       });
       return { status: "target_unavailable", error, record: latest };
+    }
+    const targetDomDisposition = terafabxReplyTargetDomRetryDisposition(latest, error);
+    if (targetDomDisposition.matched) {
+      const failed = {
+        ...latest,
+        targetDomMissRetries: targetDomDisposition.retryCount,
+      };
+      if (targetDomDisposition.drop) {
+        removeTerafabxOwnPostReplyWrite(latest.id);
+        logEvent("terafabx_own_post_reply_write_queue_target_dom_dropped", {
+          id: latest.id,
+          rootUrl: latest.rootUrl,
+          targetUrl,
+          retries: targetDomDisposition.retryCount,
+          maxRetries: targetDomDisposition.maxRetries,
+          error: error.message,
+          durableQueueDepth: loadTerafabxOwnPostReplyWriteQueue().length,
+        });
+        return { status: "target_dom_missing_dropped", error, record: failed };
+      }
+      return deferTerafabxOwnPostReplyWrite(failed, {
+        retryAt: targetDomDisposition.retryAt,
+        error: error.message,
+        reason: "target_dom_missing_retry",
+      });
     }
     const retryAt = new Date(Date.now() + TERAFABX_OWN_POST_REPLY_X_BACKOFF_MS).toISOString();
     saveTerafabxState({
@@ -9492,6 +10033,24 @@ function enqueueTerafabxOwnPostReplyWriteRecord(record, options = {}) {
 function pumpTerafabxOwnPostReplyWriteQueue() {
   const now = Date.now();
   const state = loadTerafabxState();
+  const writerBackoff = terafabxOwnPostReplyXWriteBackoff(state, now);
+  if (writerBackoff.active && isTerafabxReplyTargetDomMissingError(writerBackoff.error)) {
+    saveTerafabxState({
+      ownPostReplyXWriteBackoffUntil: null,
+      ownPostReplyXWriteBackoffError: null,
+    });
+    const rows = loadTerafabxOwnPostReplyWriteQueue();
+    const released = rows.map((row) => (
+      row.retryAt === writerBackoff.retryAt && row.lastError === writerBackoff.error
+        ? { ...row, retryAt: null, lastError: null, status: "queued" }
+        : row
+    ));
+    saveTerafabxOwnPostReplyWriteQueue(released);
+    logEvent("terafabx_own_post_reply_target_dom_global_backoff_released", {
+      retryAt: writerBackoff.retryAt,
+      released: released.filter((row, index) => row !== rows[index]).length,
+    });
+  }
   const postedTargets = new Set([
     ...(state.commentHistory || []),
     ...(state.ownPostReplyHistory || []),
@@ -9637,9 +10196,18 @@ async function runTerafabxOwnPostReplyOnce({ postUrl = "", targetCommentUrl = ""
           });
           continue;
         }
+        const heart = await attemptTerafabxReplyHeart(target.url, {
+          rootUrl: selectedPostUrl,
+          manual,
+          source: "own_post_reply",
+          xResourceKind: "ownReply",
+          cleanupHeadless: false,
+          lockAction: "own-post-reply-heart-before-post",
+        });
         const posted = await postTerafabxReply(target.url, prepared.comment, {
           headless: true,
           lockAction: "own-post-reply-post",
+          xResourceKind: "ownReply",
         });
         const historyRecord = saveTerafabxOwnPostReplySuccess({
           prepared,
@@ -9661,6 +10229,10 @@ async function runTerafabxOwnPostReplyOnce({ postUrl = "", targetCommentUrl = ""
           comment: prepared.comment,
           score: prepared.geminiReview?.finalJudge?.score ?? prepared.geminiReview?.score ?? null,
           replyUrl: posted.replyUrl,
+          liked: heart.liked,
+          alreadyLiked: heart.alreadyLiked,
+          heartDeferred: heart.deferred,
+          heartError: heart.error,
           postedAt: historyRecord.postedAt,
           rejected,
           skippedTargets,
@@ -9816,6 +10388,7 @@ async function runTerafabxOwnPostReplyBatch({
   const startedAt = new Date().toISOString();
   const workerIndexes = Array.from({ length: workerCount }, (_, index) => index);
   const workerResources = workerIndexes.map(resourceFactory);
+  const sharedConsumerGroupOwnsResources = producerPool?.ownsWorkerResources === true;
   try {
     if (queueRequestId) updateTerafabxOwnPostReplyQueueItem(queueRequestId, { stage: "collecting", stageLabel: "댓글 수집 중" });
     if (!producerPool) {
@@ -9924,8 +10497,10 @@ async function runTerafabxOwnPostReplyBatch({
     const delays = [];
     const prepareCandidate = async (candidate, workerIndex) => {
       const target = buildTerafabxOwnPostReplyTarget(candidate, discovery);
-      const resource = producerPool
-        ? resourceFactory(workerIndex)
+      const resource = sharedConsumerGroupOwnsResources
+        ? producerPool.resourceForWorker(workerIndex)
+        : producerPool
+          ? resourceFactory(workerIndex)
         : workerResources[workerIndex];
       if (grokContextUnavailable) {
         return { ok: false, candidate, target, workerIndex, error: grokContextUnavailable.message, skipped: "grok_context_unavailable" };
@@ -9943,6 +10518,7 @@ async function runTerafabxOwnPostReplyBatch({
           skipGrokStateSync: true,
           grokContext,
           deferGeminiReview: false,
+          cleanupBrowser: false,
         });
         return { ok: true, candidate, target, prepared, workerIndex };
       } catch (error) {
@@ -10061,7 +10637,7 @@ async function runTerafabxOwnPostReplyBatch({
         }),
       }).then((outcome) => {
         if (outcome.status === "posted") {
-          const { historyRecord, result } = outcome;
+          const { historyRecord, result, heart } = outcome;
           posted.push({
             targetUrl: item.target.url,
             targetAuthor: item.candidate.authorHandle || "",
@@ -10069,10 +10645,10 @@ async function runTerafabxOwnPostReplyBatch({
             comment: item.prepared.comment,
             score: item.prepared.geminiReview?.finalJudge?.score ?? item.prepared.geminiReview?.score ?? null,
             replyUrl: result.replyUrl,
-            liked: false,
-            alreadyLiked: false,
-            heartDeferred: true,
-            heartError: null,
+            liked: Boolean(heart?.liked),
+            alreadyLiked: Boolean(heart?.alreadyLiked),
+            heartDeferred: Boolean(heart?.deferred),
+            heartError: heart?.error || null,
             postedAt: historyRecord.postedAt,
           });
           onProgress?.({
@@ -10087,11 +10663,6 @@ async function runTerafabxOwnPostReplyBatch({
             currentTargetUrl: "",
             currentComment: "",
             writerStartedAt: null,
-          });
-          logEvent("terafabx_own_post_reply_heart_handoff", {
-            rootUrl,
-            targetUrl: item.target.url,
-            worker: "own-post-heart-9240",
           });
           if (queueRequestId) updateTerafabxOwnPostReplyQueueItem(queueRequestId, {
             stage: "posting",
@@ -10211,13 +10782,15 @@ async function runTerafabxOwnPostReplyBatch({
     return result;
   } finally {
     if (cleanupXBrowser) await closeTerafabxIsolatedXBrowser("ownReply").catch(() => null);
-    await Promise.all(workerResources.map(async (resource) => {
-      await closeTerafabxGeminiHeadlessBrowser({
-        port: resource.chromePort,
-        profileDir: resource.profileDir,
-      }).catch(() => null);
-      await closeTerafabxGrokWebSession(resource.grokContextSession).catch(() => null);
-    }));
+    if (!sharedConsumerGroupOwnsResources) {
+      await Promise.all(workerResources.map(async (resource) => {
+        await closeTerafabxGeminiHeadlessBrowser({
+          port: resource.chromePort,
+          profileDir: resource.profileDir,
+        }).catch(() => null);
+        await closeTerafabxGrokWebSession(resource.grokContextSession).catch(() => null);
+      }));
+    }
     await closeTerafabxGrokWebSession(rootGrokSession).catch(() => null);
     if (!internalConcurrent) terafabxOwnPostReplyBusy = false;
   }
@@ -12157,7 +12730,7 @@ function getTerafabxAutomationStatus() {
         durableXWriterQueueDepth: ownPostReplyWriteQueue.length,
         durableXWriterQueuePath: TERAFABX_OWN_POST_REPLY_WRITE_QUEUE_PATH,
         streaming: true,
-        scheduling: "global_pull_queue",
+        scheduling: "consumer_group_fifo",
       },
       targetUrls: (state.ownPostReplyTargets || []).map(normalizeXStatusUrl).filter(Boolean),
       nextRunAt: state.ownPostReplyEnabled && (state.ownPostReplyTargets || []).length
@@ -12468,6 +13041,7 @@ async function runTerafabxOwnPostFullCoverageCycle(options = {}) {
   const analyzeContext = options.analyzeContext || analyzeTerafabxOwnPostRootContext;
   const rootConcurrency = Math.max(1, Math.min(5, Number(options.rootConcurrency || 5)));
   const globalGeminiConcurrency = terafabxBrowserConcurrency(TERAFABX_OWN_POST_REPLY_CONCURRENCY);
+  let globalGeminiConsumerGroup = null;
   clearTerafabxOwnPostReplyXIdleCleanup();
   terafabxOwnPostReplyBusy = true;
   terafabxOwnPostCoverageRuntime = {
@@ -12493,7 +13067,12 @@ async function runTerafabxOwnPostFullCoverageCycle(options = {}) {
   };
   try {
     const discovery = await discoverCycle(state, options);
-    let backlog = normalizeTerafabxOwnPostCoverageBacklog(discovery.backlog, { recentOnly: true, now });
+    let unavailableRoots = normalizeTerafabxOwnPostUnavailableRoots(state.ownPostUnavailableRoots, { now });
+    let backlog = normalizeTerafabxOwnPostCoverageBacklog(discovery.backlog, {
+      recentOnly: true,
+      now,
+      unavailableRoots,
+    });
     const phasePlan = selectTerafabxOwnPostCoveragePhase(
       backlog,
       state,
@@ -12599,14 +13178,7 @@ async function runTerafabxOwnPostFullCoverageCycle(options = {}) {
     });
 
     const globalGeminiWorkerCount = globalGeminiConcurrency;
-    const globalGeminiResources = Array.from(
-      { length: globalGeminiWorkerCount },
-      (_, workerIndex) => terafabxOwnPostReplyWorkerResources(workerIndex),
-    );
-    globalGeminiResources.forEach((resource) => (
-      seedTerafabxGeminiProfileFromTemplate(resource.profileDir)
-    ));
-    const globalProducerPool = createPullTaskPool(globalGeminiWorkerCount, {
+    globalGeminiConsumerGroup = createTerafabxGeminiConsumerGroup(globalGeminiWorkerCount, {
       onStats: (stats) => {
         terafabxOwnPostCoverageRuntime = {
           ...terafabxOwnPostCoverageRuntime,
@@ -12621,10 +13193,13 @@ async function runTerafabxOwnPostFullCoverageCycle(options = {}) {
       },
     });
     logEvent("terafabx_own_post_reply_global_gemini_pool_start", {
+      groupId: "own-post-reply-gemini",
       workerCount: globalGeminiWorkerCount,
       rootCount: contextualized.filter((entry) => entry.ok && entry.snapshot?.candidates?.length).length,
       candidateCount: contextualized.reduce((sum, entry) => sum + Number(entry.snapshot?.candidates?.length || 0), 0),
-      scheduling: "global_pull_queue",
+      scheduling: "consumer_group_fifo",
+      resourceAssignment: "one_gemini_browser_per_worker",
+      resourceOwner: "consumer_group",
     });
     const rootProgress = new Map(contextualized.map((entry) => [entry.root?.url, {
       candidateCount: Number(entry.snapshot?.candidates?.length || 0),
@@ -12723,7 +13298,6 @@ async function runTerafabxOwnPostFullCoverageCycle(options = {}) {
           limit: rootBatchLimit,
           delayMinMs: TERAFABX_OWN_POST_REPLY_DELAY_MIN_MS,
           delayMaxMs: TERAFABX_OWN_POST_REPLY_DELAY_MAX_MS,
-          resourceFactory: (workerIndex) => globalGeminiResources[workerIndex],
           rootGrokSession: `${TERAFABX_GROK_WEB_SESSION}-coverage-root-${entryIndex + 1}`,
           source: TERAFABX_OWN_POST_COVERAGE_MODE,
           ignoreRootCap: true,
@@ -12731,7 +13305,7 @@ async function runTerafabxOwnPostFullCoverageCycle(options = {}) {
           fullScan: false,
           discoverySnapshot: entry.snapshot,
           rootContextSnapshot: entry.rootContext || null,
-          producerPool: globalProducerPool,
+          producerPool: globalGeminiConsumerGroup,
           internalConcurrent: true,
           cleanupXBrowser: false,
           onProgress: updateRootProgress,
@@ -12741,7 +13315,7 @@ async function runTerafabxOwnPostFullCoverageCycle(options = {}) {
         logEvent("terafabx_own_post_full_coverage_root_error", {
           rootUrl: entry.root.url,
           concurrency: globalGeminiWorkerCount,
-          scheduling: "global_pull_queue",
+          scheduling: "consumer_group_fifo",
           error: error.message,
         });
         return { ...entry, ok: false, error: error.message };
@@ -12752,8 +13326,8 @@ async function runTerafabxOwnPostFullCoverageCycle(options = {}) {
       completedCount: batchResults.filter((item) => item.ok && item.batch).length,
       failedCount: batchResults.filter((item) => !item.ok).length,
       concurrency: globalGeminiWorkerCount,
-      workerPool: globalProducerPool.stats,
-      scheduling: "global_pull_queue",
+      workerPool: globalGeminiConsumerGroup.stats,
+      scheduling: "consumer_group_fifo",
     });
     terafabxOwnPostCoverageRuntime = {
       ...terafabxOwnPostCoverageRuntime,
@@ -12765,6 +13339,29 @@ async function runTerafabxOwnPostFullCoverageCycle(options = {}) {
       const root = entry.root;
       if (!entry.ok || !entry.batch) {
         const error = entry.error || "병렬 처리 결과가 없습니다.";
+        if (isTerafabxConversationRootUnavailableError(error)) {
+          unavailableRoots = markTerafabxOwnPostUnavailableRoot(
+            unavailableRoots,
+            root.url,
+            error,
+            { now },
+          );
+          completedUrls.add(root.url);
+          processedByUrl.set(root.url, {
+            rootUrl: root.url,
+            collectionPhase: entry.collectionPhase || root.scanPhase || "api",
+            status: "root_unavailable",
+            reason: "conversation_api_404",
+            unavailable: true,
+            remainingEligibleCount: 0,
+          });
+          logEvent("terafabx_own_post_full_coverage_root_unavailable", {
+            rootUrl: root.url,
+            reason: "conversation_api_404",
+            error,
+          });
+          continue;
+        }
         retryable.set(root.url, {
           ...root,
           scanPhase: "api",
@@ -12820,7 +13417,11 @@ async function runTerafabxOwnPostFullCoverageCycle(options = {}) {
     });
     backlog = normalizeTerafabxOwnPostCoverageBacklog(backlog
       .filter((item) => !completedUrls.has(item.url))
-      .map((item) => retryable.get(item.url) || item), { recentOnly: true, now });
+      .map((item) => retryable.get(item.url) || item), {
+      recentOnly: true,
+      now,
+      unavailableRoots,
+    });
     const completedAt = new Date().toISOString();
     const retryableErrorCount = processed.filter((item) => item.error || item.rejectedCount > 0).length;
     const remainingEligibleCount = processed.reduce((sum, item) => sum + Math.max(0, Number(item.remainingEligibleCount || 0)), 0);
@@ -12838,6 +13439,7 @@ async function runTerafabxOwnPostFullCoverageCycle(options = {}) {
       postedCount,
       remainingEligibleCount,
       backlogCount: backlog.length,
+      unavailableRootCount: processed.filter((item) => item.unavailable === true).length,
       retryableErrorCount,
       rootConcurrency,
       scanConcurrency: 0,
@@ -12846,11 +13448,11 @@ async function runTerafabxOwnPostFullCoverageCycle(options = {}) {
       xCatchupPendingCount: 0,
       apiOnlyCollection: true,
       xCatchupRemoved: true,
-      workerPool: globalProducerPool.stats,
+      workerPool: globalGeminiConsumerGroup.stats,
       workerAllocations: [{
         scope: "global",
         concurrency: globalGeminiWorkerCount,
-        scheduling: "pull_next_available",
+        scheduling: "consumer_group_fifo",
       }],
       duplicateFullScanRemoved: true,
       dailyTarget: dailyAtStart.dailyTarget,
@@ -12863,6 +13465,7 @@ async function runTerafabxOwnPostFullCoverageCycle(options = {}) {
     saveTerafabxState({
       ownPostCoverageCursor: discovery.nextCursor,
       ownPostCoverageBacklog: backlog,
+      ownPostUnavailableRoots: unavailableRoots,
       ownPostCoverageLastRunAt: completedAt,
       ownPostCoverageLastStatus: complete ? "complete" : retryableErrorCount ? "degraded" : "running",
       ownPostCoverageLastError: retryableErrorCount
@@ -12891,14 +13494,7 @@ async function runTerafabxOwnPostFullCoverageCycle(options = {}) {
     throw error;
   } finally {
     scheduleTerafabxOwnPostReplyXIdleCleanup();
-    await Promise.all(Array.from({ length: globalGeminiConcurrency }, async (_, workerIndex) => {
-      const resource = terafabxOwnPostReplyWorkerResources(workerIndex);
-      await closeTerafabxGeminiHeadlessBrowser({
-        port: resource.chromePort,
-        profileDir: resource.profileDir,
-      }).catch(() => null);
-      await closeTerafabxGrokWebSession(`${TERAFABX_GROK_WEB_SESSION}-coverage-root-${workerIndex + 1}`).catch(() => null);
-    }));
+    await globalGeminiConsumerGroup?.close().catch(() => null);
     terafabxOwnPostReplyBusy = false;
   }
 }
@@ -13764,7 +14360,7 @@ function removeTrailingThreadFileLabels(value) {
 }
 
 function cleanDiscoveryPreviewText(value) {
-  const text = String(value || "").trim();
+  const text = removeThreadUiArtifactLines(value);
   if (!text) return "";
   let lines = text.split("\n").map((line) => line.trim()).filter(Boolean);
   if (lines.length === 1 && classifyThreadSocialLine(lines[0]) === "explicit_handle") return "";
@@ -13784,8 +14380,29 @@ function cleanDiscoveryPreviewText(value) {
   return lines.join("\n").trim();
 }
 
+function isThreadUiArtifactLine(value) {
+  const text = String(value || "")
+    .replace(/\s+/g, " ")
+    .replace(/[.!。！]+$/g, "")
+    .trim()
+    .toLowerCase();
+  return /^(?:아직 답글이 없습니다|아직 댓글이 없습니다|첫 번째 답글을 남겨보세요|첫 답글을 남겨보세요|no replies yet|be the first to reply|返信はまだありません|まだ返信はありません)$/.test(text);
+}
+
+function removeThreadUiArtifactLines(value) {
+  return String(value || "")
+    .split(/\r?\n/)
+    .filter((line) => !isThreadUiArtifactLine(line))
+    .join("\n")
+    .trim();
+}
+
+function cleanThreadTextOverride(value) {
+  return truncateXText(removeThreadUiArtifactLines(value), 280);
+}
+
 function cleanThreadText(raw, expectedHandle = "", ignoredLines = []) {
-  const lines = String(raw || "")
+  const lines = removeThreadUiArtifactLines(raw)
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean);
@@ -13829,8 +14446,8 @@ function cleanThreadText(raw, expectedHandle = "", ignoredLines = []) {
 }
 
 function selectThreadSourceText({ domText = "", embeddedCaption = "" } = {}) {
-  const visibleText = removeTrailingThreadFileLabels(domText);
-  const exactCaption = removeTrailingThreadFileLabels(embeddedCaption);
+  const visibleText = removeTrailingThreadFileLabels(removeThreadUiArtifactLines(domText));
+  const exactCaption = removeTrailingThreadFileLabels(removeThreadUiArtifactLines(embeddedCaption));
   if (!exactCaption) return visibleText;
   if (!visibleText) return exactCaption;
   const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
@@ -13868,7 +14485,7 @@ function selectRootPostMediaCandidates(candidates = [], maxMedia = MAX_MEDIA) {
 }
 
 async function extractThreadPost(sourceUrl, options = {}) {
-  const page = await newPage(sourceUrl);
+  const page = await newPage(sourceUrl, { workRole: MIRROR_WORK_TAB_ROLES.THREADS_COLLECT });
   try {
     const expectedHandle = new URL(sourceUrl).pathname.split("/")[1].replace("@", "");
     await sleep(9000);
@@ -14420,22 +15037,97 @@ function unique(values) {
   })));
 }
 
-async function downloadMedia(urls) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "thread-mirror-"));
-  const files = [];
-  for (let i = 0; i < urls.length; i++) {
-    const parsed = new URL(urls[i]);
-    const ext = parsed.pathname.includes(".mp4") ? ".mp4" : ".jpg";
-    const file = path.join(dir, `media-${i + 1}${ext}`);
-    await downloadFile(urls[i], file);
-    files.push(file);
+function createMediaTempDir(prefix, options = {}) {
+  if (!MEDIA_TEMP_PREFIXES.includes(prefix)) {
+    throw new Error(`허용되지 않은 미디어 임시 폴더 접두사입니다: ${prefix}`);
   }
-  return { dir, files };
+  const tmpRoot = path.resolve(options.tmpRoot || os.tmpdir());
+  fs.mkdirSync(tmpRoot, { recursive: true });
+  const dir = fs.mkdtempSync(path.join(tmpRoot, prefix));
+  activeMediaTempDirs.add(path.resolve(dir));
+  return dir;
+}
+
+function cleanupMediaTempDir(dir) {
+  if (!dir) return false;
+  const resolved = path.resolve(dir);
+  try {
+    fs.rmSync(resolved, { recursive: true, force: true });
+    return true;
+  } finally {
+    activeMediaTempDirs.delete(resolved);
+  }
+}
+
+function cleanupOrphanedMediaTempDirs(options = {}) {
+  const tmpRoot = path.resolve(options.tmpRoot || os.tmpdir());
+  const now = Number.isFinite(Number(options.now)) ? Number(options.now) : Date.now();
+  const minAgeMs = Math.max(0, Number(options.minAgeMs ?? MEDIA_TEMP_ORPHAN_MIN_AGE_MS));
+  const activeDirs = options.activeDirs || activeMediaTempDirs;
+  const result = {
+    tmpRoot,
+    minAgeMs,
+    checkedCount: 0,
+    removedCount: 0,
+    skippedActiveCount: 0,
+    skippedFreshCount: 0,
+    removed: [],
+    errors: [],
+  };
+  let entries = [];
+  try {
+    entries = fs.readdirSync(tmpRoot, { withFileTypes: true });
+  } catch (error) {
+    if (error.code !== "ENOENT") result.errors.push({ dir: tmpRoot, error: error.message });
+    return result;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !MEDIA_TEMP_PREFIXES.some((prefix) => entry.name.startsWith(prefix))) continue;
+    const dir = path.resolve(tmpRoot, entry.name);
+    result.checkedCount += 1;
+    if (activeDirs.has(dir)) {
+      result.skippedActiveCount += 1;
+      continue;
+    }
+    try {
+      const stat = fs.statSync(dir);
+      const ageMs = Math.max(0, now - stat.mtimeMs);
+      if (ageMs < minAgeMs) {
+        result.skippedFreshCount += 1;
+        continue;
+      }
+      fs.rmSync(dir, { recursive: true, force: true });
+      result.removedCount += 1;
+      result.removed.push({ dir, ageMs });
+    } catch (error) {
+      result.errors.push({ dir, error: error.message });
+    }
+  }
+  return result;
+}
+
+async function downloadMedia(urls, options = {}) {
+  const dir = createMediaTempDir("thread-mirror-", options);
+  const files = [];
+  const download = options.downloadFile || downloadFile;
+  try {
+    for (let i = 0; i < urls.length; i++) {
+      const parsed = new URL(urls[i]);
+      const ext = parsed.pathname.includes(".mp4") ? ".mp4" : ".jpg";
+      const file = path.join(dir, `media-${i + 1}${ext}`);
+      await download(urls[i], file);
+      files.push(file);
+    }
+    return { dir, files };
+  } catch (error) {
+    cleanupMediaTempDir(dir);
+    throw error;
+  }
 }
 
 async function downloadYouTubeVideo(url) {
   const canonicalUrl = validateYouTubeUrl(url);
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "youtube-x-upload-"));
+  const dir = createMediaTempDir("youtube-x-upload-");
   const outputTemplate = path.join(dir, "video.%(ext)s");
   try {
     const result = await execFileOutput("yt-dlp", [
@@ -14461,7 +15153,7 @@ async function downloadYouTubeVideo(url) {
     logEvent("youtube_video_downloaded", { canonicalUrl, file: path.basename(file), size });
     return { dir, files: [file], size };
   } catch (error) {
-    fs.rmSync(dir, { recursive: true, force: true });
+    cleanupMediaTempDir(dir);
     throw new Error(`YouTube 영상 다운로드 실패: ${error.message}`);
   }
 }
@@ -14497,6 +15189,12 @@ function isVerifiedXAccountState(accountState = {}, requiredHandle = REQUIRED_X_
   return accountText.includes(`@${wanted}`) || profilePath === `/${wanted}`;
 }
 
+function xAccountVerificationDisposition(accountState = {}, rateLimitUrl = null, requiredHandle = REQUIRED_X_HANDLE) {
+  if (isVerifiedXAccountState(accountState, requiredHandle)) return "verified";
+  if (rateLimitUrl) return "rate_limited";
+  return "retry";
+}
+
 async function verifyXAccount(page) {
   let accountState = null;
   const currentUrl = await page.evalFast("location.href", 5000).catch(() => "");
@@ -14518,17 +15216,28 @@ async function verifyXAccount(page) {
         };
       })()`);
       const rateLimitUrl = latestRelevantXRateLimitUrl(page);
-      if (rateLimitUrl) {
-        const error = new Error(`X 계정 검증 사용량 제한 HTTP 429 code 1003: ${rateLimitUrl}`);
-        error.code = "TERAFABX_X_RATE_LIMIT";
-        throw error;
-      }
-      if (isVerifiedXAccountState(accountState, REQUIRED_X_HANDLE)) {
+      const accountVerified = isVerifiedXAccountState(accountState, REQUIRED_X_HANDLE);
+      const disposition = accountVerified
+        ? "verified"
+        : xAccountVerificationDisposition(accountState, rateLimitUrl, REQUIRED_X_HANDLE);
+      if (disposition === "verified") {
+        if (rateLimitUrl) {
+          logEvent("x_account_verify_incidental_rate_limit_ignored", {
+            required: REQUIRED_X_HANDLE,
+            url: accountState.url,
+            rateLimitUrl,
+          });
+        }
         if (url !== "https://x.com/home") {
           logEvent("x_account_verify_dom_ok", { required: REQUIRED_X_HANDLE, url: accountState.url, profileHref: accountState.profileHref });
           await closeXDialogs(page).catch(() => {});
         }
         return true;
+      }
+      if (disposition === "rate_limited") {
+        const error = new Error(`X 계정 검증 사용량 제한 HTTP 429 code 1003: ${rateLimitUrl}`);
+        error.code = "TERAFABX_X_RATE_LIMIT";
+        throw error;
       }
       if (!accountState.bodyText && attempt === 4) {
         await page.send("Page.reload", { ignoreCache: true }, 12000).catch(() => null);
@@ -15050,7 +15759,9 @@ async function verifyScheduledPostSubmission(page, expected) {
 
 async function postToX(threadPost, mediaFiles, options = {}) {
   return withMirrorChromeLock(options.schedule ? "mirror_schedule" : "mirror_post", async () => {
-    const page = await newPage(`https://x.com/${REQUIRED_X_HANDLE}`);
+    const page = await newPage(`https://x.com/${REQUIRED_X_HANDLE}`, {
+      workRole: MIRROR_WORK_TAB_ROLES.X_PUBLISH,
+    });
     let xScheduleSubmissionStarted = false;
     try {
       await verifyXAccount(page);
@@ -15196,7 +15907,9 @@ async function saveComposeAsXDraft(page) {
 
 async function createXDraft(threadPost, mediaFiles) {
   return withMirrorChromeLock("mirror_draft", async () => {
-    const page = await newPage(`https://x.com/${REQUIRED_X_HANDLE}`);
+    const page = await newPage(`https://x.com/${REQUIRED_X_HANDLE}`, {
+      workRole: MIRROR_WORK_TAB_ROLES.X_PUBLISH,
+    });
     try {
       await verifyXAccount(page);
       await page.navigate("https://x.com/compose/post", 5000);
@@ -15637,6 +16350,11 @@ function isDiscoveryPlaceholderText(value) {
   return !text || text === "수집 중" || text === "(본문 없음)";
 }
 
+function isDiscoveryFailureLabel(value) {
+  const text = String(value || "").trim();
+  return /^(Threads 수집 시간 초과|미디어 없음|예약 실패|예약실패|Threads 수집 실패|수집 중|\(본문 없음\))$/.test(text);
+}
+
 function discoveryFailurePreviewText(error, kind = "detail") {
   const message = String(error?.message || error || "");
   if (/Runtime\.evaluate timed out|timed out/i.test(message)) return "Threads 수집 시간 초과";
@@ -15926,6 +16644,7 @@ async function addThreadToDiscoveryReview(url, options = {}) {
       hasMedia: post.mediaUrls.length > 0,
       textOnly: post.mediaUrls.length === 0,
       mediaOnly: !String(post.text || "").trim() && post.mediaUrls.length > 0,
+      mediaThumbnailUrl: post.imageMediaUrls?.[0] || "",
       shortHook: assessment.isShortHook,
       strongMedia: assessment.hasStrongMedia,
       controversy: assessment.hasControversy,
@@ -15940,10 +16659,27 @@ async function addThreadToDiscoveryReview(url, options = {}) {
     textOnly: post.mediaUrls.length === 0,
     ...saved,
   });
+  const thumbnailSource = post.imageMediaUrls?.[0]
+    || post.mediaUrls.find((mediaUrl) => !isVideoMediaUrl(mediaUrl))
+    || "";
+  if (thumbnailSource) {
+    setImmediate(() => {
+      createDiscoveryThumbnail(thumbnailSource).catch((error) => {
+        logEvent("discovery_thumbnail_prewarm_error", {
+          canonicalUrl,
+          error: error.message,
+        });
+      });
+    });
+  }
   return {
     canonicalUrl,
     likeCount,
     mediaCount: post.mediaUrls.length,
+    threadPostSnapshot: {
+      ...post,
+      url: canonicalUrl,
+    },
     saved,
     message: "대시보드에 추가됨",
   };
@@ -16644,8 +17380,8 @@ async function renderDiscoveryDashboard(requestUrl = "/discovery") {
         : "";
     const mediaPreview = row.mediaPreviewUrl
       ? (/\.mp4|\/o1\/v\/t16\//i.test(row.mediaPreviewUrl)
-        ? `<video class="media-preview" src="${escapeHtml(row.mediaPreviewUrl)}" muted playsinline controls loop preload="metadata"></video>`
-        : `<img class="media-preview" src="${escapeHtml(row.mediaPreviewUrl)}" alt="" loading="lazy" referrerpolicy="no-referrer" />`)
+        ? `<div class="media-empty">영상 · 상세에서 재생</div>`
+        : `<img class="media-preview" src="/api/discovery/media-thumbnail?url=${encodeURIComponent(row.mediaPreviewUrl)}" alt="" width="320" height="180" loading="lazy" decoding="async" />`)
       : `<a class="media-empty" href="${escapeHtml(row.canonicalUrl)}" target="_blank" rel="noreferrer">미리보기 보강 필요</a>`;
     const mediaDownload = row.mediaPreviewUrl
       ? `<a class="media-download" href="/api/discovery/media-download?url=${encodeURIComponent(row.mediaPreviewUrl)}">미디어 다운로드</a>`
@@ -18604,6 +19340,30 @@ async function waitForPostButton(page, expectedMediaCount = 0) {
   return { ok: false, reason: JSON.stringify(lastState) };
 }
 
+function threadPostSnapshotForMirror(canonicalUrl, snapshot) {
+  if (!snapshot || typeof snapshot !== "object") return null;
+  let snapshotUrl = "";
+  try {
+    snapshotUrl = validateThreadsUrl(snapshot.url);
+  } catch {
+    return null;
+  }
+  if (snapshotUrl !== canonicalUrl) return null;
+  const mediaUrls = unique(Array.isArray(snapshot.mediaUrls) ? snapshot.mediaUrls : []).slice(0, MAX_MEDIA);
+  return {
+    url: canonicalUrl,
+    text: String(snapshot.text || ""),
+    mediaUrls,
+    imageMediaUrls: unique(Array.isArray(snapshot.imageMediaUrls) ? snapshot.imageMediaUrls : []).slice(0, MAX_MEDIA),
+    videoMediaUrls: unique(Array.isArray(snapshot.videoMediaUrls) ? snapshot.videoMediaUrls : []).slice(0, MAX_MEDIA),
+    likeCount: Number.isFinite(Number(snapshot.likeCount)) ? Number(snapshot.likeCount) : null,
+    diagnostics: {
+      ...(snapshot.diagnostics && typeof snapshot.diagnostics === "object" ? snapshot.diagnostics : {}),
+      reusedFromCollectionTab: true,
+    },
+  };
+}
+
 async function mirrorThread(url, options = {}) {
   const canonicalUrl = validateThreadsUrl(url);
   const requestedScheduledAt = parseRequestedScheduleTime(options.scheduledAt);
@@ -18622,9 +19382,17 @@ async function mirrorThread(url, options = {}) {
     schedule: Boolean(options.schedule),
     requestedScheduledAt: requestedScheduledAt?.toISOString(),
   });
-  const threadPost = await extractThreadPost(canonicalUrl, {
+  const collectedSnapshot = threadPostSnapshotForMirror(canonicalUrl, options.threadPostSnapshot);
+  const threadPost = collectedSnapshot || await extractThreadPost(canonicalUrl, {
     allowEmptyText: true,
   });
+  if (collectedSnapshot) {
+    logEvent("thread_collection_snapshot_reused", {
+      canonicalUrl,
+      mediaCount: threadPost.mediaUrls.length,
+      source: options.source || null,
+    });
+  }
   logEvent("thread_extracted", {
     canonicalUrl,
     textPreview: threadPost.text.slice(0, 120),
@@ -18648,8 +19416,8 @@ async function mirrorThread(url, options = {}) {
   if (!String(threadPost.text || "").trim() && threadPost.mediaUrls.length === 0) {
     throw new Error("Threads 원글에서 본문과 미디어를 모두 찾지 못해 게시를 중단했습니다.");
   }
-  if (options.textOverride && String(options.textOverride).trim()) {
-    threadPost.text = truncateXText(options.textOverride, 280);
+  if (options.textOverride && String(options.textOverride).trim() && !isDiscoveryFailureLabel(options.textOverride)) {
+    threadPost.text = cleanThreadTextOverride(options.textOverride);
   }
   if (options.schedule) {
     logEvent("schedule_media_strategy", {
@@ -18686,7 +19454,7 @@ async function mirrorThread(url, options = {}) {
       message: postResult.scheduledAt ? `X 예약됨 · ${postResult.scheduledAt.toLocaleString("ko-KR")}` : "X 게시됨",
     };
   } finally {
-    fs.rmSync(media.dir, { recursive: true, force: true });
+    cleanupMediaTempDir(media.dir);
     logEvent("cleanup_done", { canonicalUrl, dir: media.dir });
   }
 }
@@ -18725,7 +19493,7 @@ async function createXDraftFromThread(url, options = {}) {
     throw new Error("Threads 원글에서 미디어 후보를 발견했지만 첨부 대상으로 확정하지 못해 초안 저장을 중단했습니다.");
   }
   if (options.textOverride && String(options.textOverride).trim()) {
-    threadPost.text = String(options.textOverride).trim().slice(0, 280);
+    threadPost.text = cleanThreadTextOverride(options.textOverride);
   }
   const media = await downloadMedia(threadPost.mediaUrls);
   try {
@@ -18742,7 +19510,7 @@ async function createXDraftFromThread(url, options = {}) {
       message: "X 초안 저장됨",
     };
   } finally {
-    fs.rmSync(media.dir, { recursive: true, force: true });
+    cleanupMediaTempDir(media.dir);
     logEvent("cleanup_done", { canonicalUrl, dir: media.dir, draft: true });
   }
 }
@@ -18800,7 +19568,7 @@ async function postDiscoveryRowToX(canonicalUrl, options = {}) {
         message: postResult.scheduledAt ? `X 예약됨 · ${postResult.scheduledAt.toLocaleString("ko-KR")}` : "X 게시됨",
       };
     } finally {
-      fs.rmSync(media.dir, { recursive: true, force: true });
+      cleanupMediaTempDir(media.dir);
       logEvent("cleanup_done", { canonicalUrl: url, dir: media.dir, source: "youtube" });
     }
   }
@@ -18885,7 +19653,7 @@ async function postDiscoveryRowToX(canonicalUrl, options = {}) {
       message: postResult.scheduledAt ? `X 예약됨 · ${postResult.scheduledAt.toLocaleString("ko-KR")}` : "X 게시됨",
     };
   } finally {
-    fs.rmSync(media.dir, { recursive: true, force: true });
+    cleanupMediaTempDir(media.dir);
     logEvent("cleanup_done", { canonicalUrl, dir: media.dir, source: "inssider" });
   }
 }
@@ -18917,7 +19685,7 @@ async function createXDraftFromDiscoveryRow(canonicalUrl, options = {}) {
       logEvent("youtube_x_draft_success", { canonicalUrl: url, mediaCount: media.files.length });
       return { canonicalUrl: url, mediaCount: media.files.length, message: "X 초안 저장됨" };
     } finally {
-      fs.rmSync(media.dir, { recursive: true, force: true });
+      cleanupMediaTempDir(media.dir);
       logEvent("cleanup_done", { canonicalUrl: url, dir: media.dir, draft: true, source: "youtube" });
     }
   }
@@ -18942,7 +19710,7 @@ async function createXDraftFromDiscoveryRow(canonicalUrl, options = {}) {
       message: "X 초안 저장됨",
     };
   } finally {
-    fs.rmSync(media.dir, { recursive: true, force: true });
+    cleanupMediaTempDir(media.dir);
     logEvent("cleanup_done", { canonicalUrl, dir: media.dir, draft: true, source: "inssider" });
   }
 }
@@ -18956,7 +19724,7 @@ async function runDiscoveryAutoSchedule(canonicalUrl, options = {}) {
   let scheduledAt = null;
   let submissionCompleted = false;
   try {
-    if (options.text && String(options.text).trim()) {
+    if (options.text && String(options.text).trim() && !isDiscoveryFailureLabel(options.text)) {
       await updateDiscoveryTitle(canonicalUrl, options.text);
     }
     scheduledAt = await reserveNextAutoScheduleTime(canonicalUrl);
@@ -18969,6 +19737,8 @@ async function runDiscoveryAutoSchedule(canonicalUrl, options = {}) {
       textOverride: options.text,
       schedule: true,
       scheduledAt,
+      source: options.source || null,
+      threadPostSnapshot: options.threadPostSnapshot || null,
     });
     submissionCompleted = true;
     await markDiscoveryScheduled(canonicalUrl, result.mediaCount, result.scheduledAt);
@@ -19234,9 +20004,17 @@ async function runDiscoveryScheduleRecovery(options = {}) {
 }
 
 async function processDiscoveryAutoScheduleJob(canonicalUrl, source, text) {
+  const safeText = isDiscoveryFailureLabel(text) ? "" : text;
+  if (safeText !== text) {
+    logEvent("discovery_auto_schedule_failure_label_filtered", {
+      canonicalUrl,
+      source,
+      originalText: String(text || "").slice(0, 60),
+    });
+  }
   logEvent("discovery_auto_schedule_async_start", { canonicalUrl, source });
   const previous = await getDiscoveryRow(canonicalUrl);
-  const detail = await addSourceToDiscoveryReview(canonicalUrl, { text, allowTextOnly: true });
+  const detail = await addSourceToDiscoveryReview(canonicalUrl, { text: safeText, allowTextOnly: true });
   if (detail.skipped) {
     logEvent("discovery_auto_schedule_async_skipped", {
       canonicalUrl,
@@ -19260,8 +20038,9 @@ async function processDiscoveryAutoScheduleJob(canonicalUrl, source, text) {
   }
   await markDiscoveryScheduleQueueState(canonicalUrl, "scheduling");
   const result = await runDiscoveryAutoSchedule(canonicalUrl, {
-    text,
+    text: safeText,
     source,
+    threadPostSnapshot: detail.threadPostSnapshot || null,
     waitForBusy: true,
   });
   logEvent("discovery_auto_schedule_async_success", {
@@ -20116,6 +20895,11 @@ const server = http.createServer(async (req, res) => {
     }
     return;
   }
+  if (req.method === "GET" && req.url.startsWith("/api/discovery/media-thumbnail")) {
+    const parsedUrl = new URL(req.url, "http://localhost");
+    await serveDiscoveryThumbnail(parsedUrl.searchParams.get("url") || "", res);
+    return;
+  }
   if (req.method === "GET" && req.url.startsWith("/api/discovery/media-download")) {
     try {
       const parsedUrl = new URL(req.url, "http://localhost");
@@ -20708,7 +21492,7 @@ async function futureScheduledDiscoveryRows() {
     })
     .map((row) => ({
       ...row,
-      textPreview: isDiscoveryPlaceholderText(row.textPreview) ? "" : row.textPreview,
+      textPreview: isDiscoveryPlaceholderText(row.textPreview) || isDiscoveryFailureLabel(row.textPreview) ? "" : row.textPreview,
     }));
 }
 
@@ -20723,7 +21507,7 @@ async function recoverMissingXScheduledPost(canonicalUrl) {
   const threadPost = isYouTubeUrl(url)
     ? await extractYouTubePost(url)
     : await extractThreadPost(url, { allowEmptyText: true });
-  const storedText = isDiscoveryPlaceholderText(row.textPreview) ? "" : row.textPreview;
+  const storedText = isDiscoveryPlaceholderText(row.textPreview) || isDiscoveryFailureLabel(row.textPreview) ? "" : row.textPreview;
   threadPost.text = isYouTubeUrl(url)
     ? sanitizeYouTubeXTitle(storedText || threadPost.title || threadPost.text)
     : truncateXText(storedText || threadPost.text, 280);
@@ -20751,7 +21535,7 @@ async function recoverMissingXScheduledPost(canonicalUrl) {
     });
     return { ok: true, canonicalUrl: url, scheduledAt: result.scheduledAt.toISOString(), mediaCount: media.files.length };
   } finally {
-    fs.rmSync(media.dir, { recursive: true, force: true });
+    cleanupMediaTempDir(media.dir);
     logEvent("cleanup_done", { canonicalUrl: url, dir: media.dir, source: "x_schedule_monitor_missing_recovery" });
   }
 }
@@ -20810,6 +21594,7 @@ async function confirmExistingXScheduledPost(canonicalUrl, scheduledAtValue) {
 }
 
 async function runXScheduleMonitor(options = {}) {
+  return { ok: true, skipped: true, status: "disabled", reason: "disabled_by_user" };
   const globalBackoff = terafabxGlobalXBackoff();
   if (globalBackoff.active && ["startup", "timer"].includes(options.source || "timer")) {
     logEvent("x_schedule_monitor_skipped", { reason: "x_global_backoff", source: options.source || "timer", retryAt: globalBackoff.retryAt });
@@ -21067,10 +21852,27 @@ function startBackgroundWorkAfterBrowserCleanup() {
       logEvent("terafabx_reply_count_refresh_tick_error", { error: error.message });
     });
   }, TERAFABX_REPLY_COUNT_REFRESH_INTERVAL_MS);
+
+  setInterval(() => {
+    const result = cleanupOrphanedMediaTempDirs();
+    if (result.removedCount > 0 || result.errors.length > 0) {
+      logEvent("media_temp_orphan_cleanup", {
+        source: "timer",
+        ...result,
+        removed: result.removed.map((item) => ({ ...item, dir: path.basename(item.dir) })),
+      });
+    }
+  }, MEDIA_TEMP_CLEANUP_INTERVAL_MS);
 }
 
 function startBackgroundWork() {
   const startedAt = Date.now();
+  const mediaCleanup = cleanupOrphanedMediaTempDirs();
+  logEvent("media_temp_orphan_cleanup", {
+    source: "startup",
+    ...mediaCleanup,
+    removed: mediaCleanup.removed.map((item) => ({ ...item, dir: path.basename(item.dir) })),
+  });
   cleanupOwnedTerafabxGrokBrowserProfiles("startup")
     .then(() => cleanupKnownTerafabxGrokWebSessions("startup"))
     .catch((error) => {
@@ -21130,7 +21932,15 @@ if (require.main === module) {
 module.exports = {
   TERAFABX_GROK_WEB_URL,
   TERAFABX_GROK_CONTEXT_MODE,
+  MEDIA_TEMP_PREFIXES,
+  createMediaTempDir,
+  cleanupMediaTempDir,
+  cleanupOrphanedMediaTempDirs,
+  isVideoMediaUrl,
+  discoveryThumbnailCachePath,
+  downloadMedia,
   cleanThreadText,
+  cleanThreadTextOverride,
   classifyThreadSocialLine,
   linkedThreadMediaAttributionLabels,
   validateYouTubeUrl,
@@ -21195,8 +22005,13 @@ module.exports = {
   isTerafabxReplySubmitCandidate,
   isTerafabxInlineReplyComposerContext,
   isVerifiedXAccountState,
+  xAccountVerificationDisposition,
+  mirrorWorkTabRoleAllowsUrl,
+  threadPostSnapshotForMirror,
   isTerafabxReplySubmissionUncertain,
   isTerafabxTransientReplyPageError,
+  isTerafabxReplyTargetDomMissingError,
+  terafabxReplyTargetDomRetryDisposition,
   terafabxOwnPostReplyXWriteBackoff,
   isTerafabxXRateLimitError,
   isTerafabxXAccessCircuitBreakerError,
@@ -21217,6 +22032,9 @@ module.exports = {
   isTerafabxOwnPostFullCoverageMode,
   normalizeTerafabxOwnRootStatus,
   fetchTerafabxOwnRootStatusPage,
+  isTerafabxConversationRootUnavailableError,
+  normalizeTerafabxOwnPostUnavailableRoots,
+  markTerafabxOwnPostUnavailableRoot,
   normalizeTerafabxOwnPostCoverageBacklog,
   rankTerafabxOwnPostCoverageBacklog,
   selectTerafabxOwnPostCoveragePhase,
@@ -21263,6 +22081,7 @@ module.exports = {
   terafabxOwnPostReplyWriterDelayMs,
   createSerialTaskQueue,
   createPullTaskPool,
+  createTerafabxGeminiConsumerGroup,
   runFixedWorkerPool,
   runFixedWorkerPipeline,
   allocateTerafabxOwnPostReplyWorkers,
@@ -21273,6 +22092,7 @@ module.exports = {
   deleteTerafabxOwnReply,
   judgeTerafabxReplyWithGeminiHeadless,
   parseTerafabxFinalJudge,
+  assessTerafabxSourceAnchorGrounding,
   parseTerafabxGeminiBatchReview,
   parseTerafabxGeminiBatchFinalJudge,
   selectTerafabxReviewCandidate,
