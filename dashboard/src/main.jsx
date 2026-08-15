@@ -21,6 +21,7 @@ import { toast } from "sonner";
 
 import { AppSidebar } from "@/components/app-sidebar";
 import { AutomationLiveBoard } from "@/components/automation-live-board";
+import { HomeVerifiedBoard } from "@/components/home-verified-board";
 import { ChartAreaInteractive } from "@/components/chart-area-interactive";
 import { DataTable } from "@/components/data-table";
 import { SiteHeader } from "@/components/site-header";
@@ -1216,6 +1217,8 @@ function Dashboard() {
           ? { ok: true, coupang: await api(`/api/coupang/performance?startDate=${compactCoupangDate(coupangRange.startDate)}&endDate=${compactCoupangDate(coupangRange.endDate)}`) }
           : nextView === "naver-adpost"
             ? { ok: true, adpost: await api(`/api/naver-adpost/revenue?startDate=${compactCoupangDate(adpostRange.startDate)}&endDate=${compactCoupangDate(adpostRange.endDate)}${options.force ? "&refresh=1" : ""}`) }
+          : nextView === "home-verified"
+            ? await api(`/api/discovery/home-verified-dashboard?date=${encodeURIComponent(options.automationDate || automationDate)}`)
           : await api(`/api/discovery/dashboard?view=${encodeURIComponent(nextView)}${nextView === "automation" ? `&date=${encodeURIComponent(options.automationDate || automationDate)}` : ""}`);
     setData(result);
     setTitleEdits((current) => Object.fromEntries((result.rows || []).map((row) => [
@@ -1514,6 +1517,26 @@ function Dashboard() {
         : "내 글 댓글 하트 순회를 완료했습니다");
   }
 
+  async function runHomeVerifiedCommentAction(action) {
+    const labels = {
+      enable: "홈 인증 댓글 자동화 ON",
+      disable: "홈 인증 댓글 자동화 OFF",
+      prefill_only: "생성 보관 모드",
+      live: "실게시 허용",
+      discover: "개인 파란체크 후보 수집",
+      prepare: "준비 사이클",
+      pump: "게시 큐 pump",
+      purge_dead_targets: "죽은 타겟 청소",
+    };
+    await runAction(`home-verified-${action}`, async () => {
+      await api("/api/terafabx/home-verified-comment", {
+        method: "POST",
+        body: JSON.stringify({ action }),
+      });
+      await load(view);
+    }, labels[action] || "홈 인증 댓글 처리");
+  }
+
   async function runTerafabxReviewAction(item, action) {
     const labels = { post: "게시", complete: "완료 처리", delete: "삭제" };
     await runAction(`terafabx-review-${action}-${item.id || item.targetUrl}`, async () => {
@@ -1660,8 +1683,8 @@ function Dashboard() {
         />
         <SidebarInset>
           <SiteHeader
-            title={view === "inssider-pending" ? "인싸이더 판결중" : view === "automation" ? "자동화 운영" : view === "coupang-performance" ? "쿠팡 파트너스 실적" : view === "naver-adpost" ? "네이버 애드포스트 수익" : "Threads 발굴 대시보드"}
-            subtitle={view === "inssider-pending" ? "연애·결혼 / 직장·사회 카테고리의 진행 중인 판결글" : view === "automation" ? "실시간 파이프라인 · 자동댓글 기록 · 병목 상태" : view === "coupang-performance" ? "쿠팡 파트너스 월간 실적과 최근 일자별 수수료" : view === "naver-adpost" ? "현재 잔액 · 기간별 수익 · 노출과 클릭 현황" : "좋아요 1000+ · 미디어 포함 · X 수동 검토/예약 워크플로우"}
+            title={view === "inssider-pending" ? "인싸이더 판결중" : view === "automation" ? "자동화 운영" : view === "home-verified" ? "파란체크 자동댓글" : view === "coupang-performance" ? "쿠팡 파트너스 실적" : view === "naver-adpost" ? "네이버 애드포스트 수익" : "Threads 발굴 대시보드"}
+            subtitle={view === "inssider-pending" ? "연애·결혼 / 직장·사회 카테고리의 진행 중인 판결글" : view === "automation" ? "실시간 파이프라인 · 자동댓글 기록 · 병목 상태" : view === "home-verified" ? "개인 파란체크 원글 자동댓글 · 대기 큐 · 게시 타임라인" : view === "coupang-performance" ? "쿠팡 파트너스 월간 실적과 최근 일자별 수수료" : view === "naver-adpost" ? "현재 잔액 · 기간별 수익 · 노출과 클릭 현황" : "좋아요 1000+ · 미디어 포함 · X 수동 검토/예약 워크플로우"}
             autoRefresh={autoRefresh}
             busy={controlsBusy}
             onRefresh={() => runAction("refresh-data", () => load(view), "새로고침 완료")}
@@ -1721,7 +1744,24 @@ function Dashboard() {
                 </div>
               ) : null}
 
-              {view === "automation" ? (
+              {view === "home-verified" ? (
+                <HomeVerifiedBoard
+                  status={data?.status || data?.terafabx?.homeVerifiedComment}
+                  timeline={data?.timeline || []}
+                  pending={data?.pending || []}
+                  availableDates={data?.availableDates || []}
+                  selectedDate={automationDate}
+                  onDateChange={setAutomationDate}
+                  sort={automationSort}
+                  onSortChange={setAutomationSort}
+                  lastDiscovery={data?.lastDiscovery}
+                  lastDiscoveryAt={data?.lastDiscoveryAt}
+                  lastDeadTargetDiscard={data?.lastDeadTargetDiscard}
+                  actionBusy={controlsBusy}
+                  actionBusyKey={busy}
+                  onAction={runHomeVerifiedCommentAction}
+                />
+              ) : view === "automation" ? (
                 <AutomationTimelineView
                   comments={sortedComments}
                   reviewComments={sortedReviewComments}

@@ -9,6 +9,7 @@ import {
   Settings2Icon,
   ScaleIcon,
   SparklesIcon,
+  BadgeCheckIcon,
 } from "lucide-react"
 
 import { NavMain } from "@/components/nav-main"
@@ -31,6 +32,7 @@ const viewItems = [
   { id: "coupang-performance", title: "쿠팡 실적", icon: <LinkIcon /> },
   { id: "naver-adpost", title: "애드포스트 수익", icon: <CircleDollarSignIcon /> },
   { id: "automation", title: "자동화", icon: <Settings2Icon /> },
+  { id: "home-verified", title: "파란체크 자동댓글", icon: <BadgeCheckIcon /> },
   { id: "inssider-pending", title: "인싸이더 판결중", icon: <ScaleIcon /> },
 ]
 
@@ -66,6 +68,8 @@ export function AppSidebar({
                 ? "수익"
               : item.id === "automation"
                 ? "운영"
+                : item.id === "home-verified"
+                  ? (terafabx as { homeVerifiedComment?: { postedToday?: number } } | undefined)?.homeVerifiedComment?.postedToday ?? "파란"
                 : item.id === "inssider-pending"
                   ? summary.totalCount
                   : "운영",
