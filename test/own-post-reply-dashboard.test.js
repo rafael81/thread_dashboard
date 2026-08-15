@@ -73,10 +73,20 @@ test("dashboard shows a queued batch so the user never needs to press twice", as
 test("posted table renders reply completion with direct-scan provenance", () => {
   const source = fs.readFileSync(path.join(__dirname, "..", "dashboard", "src", "components", "data-table.tsx"), "utf8");
   assert.match(source, /header: "대댓글 완료율"/);
-  assert.match(source, /예약 갱신 · 전체 댓글 기준/);
-  assert.match(source, /직접 전체수집 기준/);
-  assert.match(source, /X 전체 답글 수 기준/);
+  assert.match(source, /예약 갱신 · 대댓글 대상\(직접 댓글\)/);
+  assert.match(source, /직접 전체수집 · 대댓글 대상/);
+  assert.match(source, /X 표시/);
+  assert.match(source, /xDisplayReplyCount|rawReplyCount/);
   assert.match(source, /completion\.completedCount/);
+});
+
+test("posted table exposes a destructive dashboard delete action", () => {
+  const table = fs.readFileSync(path.join(__dirname, "..", "dashboard", "src", "components", "data-table.tsx"), "utf8");
+  const main = fs.readFileSync(path.join(__dirname, "..", "dashboard", "src", "main.jsx"), "utf8");
+  assert.match(table, /isPosted \? \([\s\S]*variant="destructive"[\s\S]*삭제/);
+  assert.match(table, /대시보드에서 삭제/);
+  assert.match(main, /대시보드 게시됨 목록에서 이 항목을 삭제할까요/);
+  assert.match(main, /게시됨 항목 삭제됨/);
 });
 
 test("posted table keeps its page during refresh and exposes the real X post link", () => {

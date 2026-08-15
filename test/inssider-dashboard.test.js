@@ -43,6 +43,9 @@ const {
   discoveryScheduleRetryDecision,
   isThreadsMediaRegression,
   isThreadsInvalidPageText,
+  isThreadsUnusableExtraction,
+  threadsInvalidPageError,
+  isDiscoveryFailureLabel,
   xAccountVerificationDisposition,
   mirrorWorkTabRoleAllowsUrl,
   threadPostSnapshotForMirror,
@@ -150,6 +153,51 @@ test('a Threads not-found page is never accepted as post text', () => {
     '방황하는 모든 자가 길을 잃은 것은 아니지만, 이 페이지는 길을 잃었습니다\n링크가 작동하지 않거나 페이지가 존재하지 않습니다.'
   ), true);
   assert.equal(isThreadsInvalidPageText('아니 저 조그만 머릿속에 지금 물음표 100개 떠 있는 거 아니냐고ㅠㅠ🐱❓'), false);
+});
+
+test('a Threads temporary error page is never accepted as post text', () => {
+  const errorPage = [
+    '문제가 발생했습니다. 나중에 다시 시도해보세요.',
+    '다시 시도',
+    '© 2026',
+    'Threads 약관',
+    '개인정보처리방침',
+    '쿠키 정책',
+  ].join('\n');
+  assert.equal(isThreadsInvalidPageText(errorPage), true);
+  assert.equal(isThreadsInvalidPageText('문제가 발생했습니다. 나중에 다시 시도해보세요.'), false);
+  assert.equal(isThreadsInvalidPageText('사귀그네'), false);
+  assert.equal(isDiscoveryFailureLabel(errorPage), true);
+  assert.equal(isDiscoveryFailureLabel('사귀그네'), false);
+  assert.equal(
+    threadsInvalidPageError(errorPage),
+    'Threads 페이지가 오류 상태라 미디어와 본문을 신뢰할 수 없습니다.',
+  );
+  assert.equal(
+    threadsInvalidPageError('이 페이지는 길을 잃었습니다'),
+    'Threads 원문이 삭제·비공개·잘못된 링크 상태라 미디어와 본문을 신뢰할 수 없습니다.',
+  );
+  assert.equal(isThreadsUnusableExtraction({
+    targetArticleFound: false,
+    handleFound: false,
+  }, [], '', errorPage), true);
+  assert.equal(isThreadsUnusableExtraction({
+    targetArticleFound: true,
+    handleFound: true,
+  }, ['https://cdn.example/1.jpg'], '', '사귀그네'), false);
+  assert.equal(isThreadsUnusableExtraction({
+    targetArticleFound: true,
+    handleFound: true,
+  }, [], '', '사귀그네'), false);
+
+  const source = fs.readFileSync(path.join(__dirname, '..', 'mirror_server.js'), 'utf8');
+  const extractBlock = source.slice(
+    source.indexOf('async function extractThreadPost'),
+    source.indexOf('async function discoverThreadsTimeline'),
+  );
+  assert.match(extractBlock, /isThreadsInvalidPageText\(text\) \|\| isThreadsInvalidPageText\(data\.text\)/);
+  assert.match(extractBlock, /isThreadsUnusableExtraction\(/);
+  assert.match(source, /isDiscoveryFailureLabel\(incomingText\)/);
 });
 
 test('a user-deleted X schedule has a dedicated local reconciliation route', () => {
@@ -1201,11 +1249,9 @@ test('Gemini workers isolate agent-browser daemons by CDP resource', () => {
 
   assert.match(first.namespace, /^gm-[0-9a-f]{12}$/);
   assert.notEqual(first.namespace, secondNamespace);
-  assert.deepEqual(first.args.slice(0, 8), [
+  assert.deepEqual(first.args.slice(0, 6), [
     '--yes',
     'agent-browser',
-    '--namespace',
-    first.namespace,
     '--session',
     first.namespace,
     '--cdp',

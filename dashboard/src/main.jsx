@@ -1643,8 +1643,14 @@ function Dashboard() {
           });
         }, "재수집 완료")
       }
-      onDiscard={(row) =>
-        runAction(`discard-${row.canonicalUrl}`, async () => {
+      onDiscard={(row) => {
+        if (row.status === "posted") {
+          const ok = window.confirm(
+            "대시보드 게시됨 목록에서 이 항목을 삭제할까요?\nX/Threads 원글은 삭제하지 않으며, 목록에서만 숨깁니다.",
+          );
+          if (!ok) return;
+        }
+        return runAction(`discard-${row.canonicalUrl}`, async () => {
           await api("/api/discovery/discard", {
             method: "POST",
             body: JSON.stringify({ url: row.canonicalUrl }),
@@ -1659,8 +1665,8 @@ function Dashboard() {
             delete next[row.canonicalUrl];
             return next;
           });
-        }, "삭제됨")
-      }
+        }, row.status === "posted" ? "게시됨 항목 삭제됨" : "삭제됨");
+      }}
       formatDate={formatDate}
       compact={compact}
     />

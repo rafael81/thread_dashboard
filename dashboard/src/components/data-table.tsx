@@ -109,6 +109,9 @@ export type DashboardRow = {
     scheduled?: boolean
     source: string
     checkedAt?: string | null
+    rawReplyCount?: number | null
+    xDisplayReplyCount?: number | null
+    collectedDirectReplyCount?: number | null
   }
 }
 
@@ -535,6 +538,7 @@ export function DataTable(props: DataTableProps) {
           if (!completion) {
             return <span className="text-xs text-muted-foreground">집계 전</span>
           }
+          const xDisplay = completion.xDisplayReplyCount ?? completion.rawReplyCount ?? null
           const metric = (
             <div
               className="min-w-28"
@@ -548,12 +552,19 @@ export function DataTable(props: DataTableProps) {
                   {completion.completedCount}/{completion.totalCount ?? "?"}
                 </span>
               </div>
+              {xDisplay != null ? (
+                <div className="mt-1 text-xs tabular-nums text-muted-foreground">
+                  X 표시 {compact(xDisplay)}
+                </div>
+              ) : null}
               <div className="mt-1 text-xs text-muted-foreground">
                 {completion.scheduled
-                  ? "예약 갱신 · 전체 댓글 기준"
+                  ? "예약 갱신 · 대댓글 대상(직접 댓글)"
                   : completion.exact
-                    ? "직접 전체수집 기준"
-                    : "X 전체 답글 수 기준"}
+                    ? "직접 전체수집 · 대댓글 대상"
+                    : completion.source === "x-status-reply-count"
+                      ? "status API · X 표시 수"
+                      : "X 표시 수 추정"}
               </div>
             </div>
           )
@@ -619,6 +630,15 @@ export function DataTable(props: DataTableProps) {
                       Threads 원문
                     </a>
                   </Button>
+                  <Button
+                    variant="destructive"
+                    size="sm"
+                    onClick={() => props.onDiscard(row.original)}
+                    disabled={Boolean(busy)}
+                  >
+                    <Trash2Icon data-icon="inline-start" />
+                    삭제
+                  </Button>
                 </>
               ) : null}
               <Button
@@ -664,8 +684,12 @@ export function DataTable(props: DataTableProps) {
                         예약 취소
                       </DropdownMenuItem>
                     ) : (
-                      <DropdownMenuItem onClick={() => props.onDiscard(row.original)} disabled={Boolean(busy)}>
-                        삭제
+                      <DropdownMenuItem
+                        className={isPosted ? "text-destructive focus:text-destructive" : undefined}
+                        onClick={() => props.onDiscard(row.original)}
+                        disabled={Boolean(busy)}
+                      >
+                        {isPosted ? "대시보드에서 삭제" : "삭제"}
                       </DropdownMenuItem>
                     )}
                   </DropdownMenuGroup>

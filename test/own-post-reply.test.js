@@ -53,6 +53,10 @@ const {
   isTerafabxConversationRootUnavailableError,
   normalizeTerafabxOwnPostUnavailableRoots,
   markTerafabxOwnPostUnavailableRoot,
+  clearTerafabxOwnPostUnavailableRoot,
+  isTerafabxOwnPostRootUnavailable,
+  applyTerafabxOwnPostStatusOnlyReplyCount,
+  collectTerafabxOwnPostCoverageReopenRoots,
   normalizeTerafabxOwnPostCoverageBacklog,
   rankTerafabxOwnPostCoverageBacklog,
   selectTerafabxOwnPostCoveragePhase,
@@ -245,7 +249,7 @@ test("full coverage discovery paginates and preserves reply-bearing roots in the
   ]);
 });
 
-test("deleted or inaccessible conversation roots are terminal and stay out of rediscovery", async () => {
+test("conversation 404 uses soft backoff and legacy hard tombstones no longer block", async () => {
   const now = Date.parse("2026-07-28T12:00:00.000Z");
   const rootUrl = xStatusUrlAt(now - 60 * 60 * 1000, 11n);
   const api404 = new Error(
@@ -257,12 +261,29 @@ test("deleted or inaccessible conversation roots are terminal and stay out of re
 
   const unavailableRoots = markTerafabxOwnPostUnavailableRoot({}, rootUrl, api404, { now });
   assert.equal(unavailableRoots[rootUrl].reason, "conversation_api_404");
+  assert.equal(unavailableRoots[rootUrl].severity, "soft");
+  assert.equal(unavailableRoots[rootUrl].failureCount, 1);
+  assert.ok(unavailableRoots[rootUrl].retryAfter);
+  assert.equal(isTerafabxOwnPostRootUnavailable(unavailableRoots, rootUrl, now), true);
+  // Soft backoff expires → root is selectable again.
+  assert.equal(
+    isTerafabxOwnPostRootUnavailable(unavailableRoots, rootUrl, now + 31 * 60 * 1000),
+    false,
+  );
+  // Legacy 7d tombstones without severity/retryAfter are dropped.
   assert.deepEqual(
-    normalizeTerafabxOwnPostUnavailableRoots(unavailableRoots, { now }),
-    unavailableRoots,
+    normalizeTerafabxOwnPostUnavailableRoots({
+      [rootUrl]: {
+        rootUrl,
+        reason: "conversation_api_404",
+        unavailableAt: new Date(now).toISOString(),
+        lastError: "legacy",
+      },
+    }, { now }),
+    {},
   );
 
-  const result = await discoverTerafabxOwnPostCoverageCycle({
+  const blocked = await discoverTerafabxOwnPostCoverageCycle({
     ownPostCoverageCursor: "",
     ownPostCoverageBacklog: [{ url: rootUrl, replies: 3 }],
     ownPostUnavailableRoots: unavailableRoots,
@@ -275,7 +296,22 @@ test("deleted or inaccessible conversation roots are terminal and stay out of re
       exhausted: true,
     }),
   });
-  assert.deepEqual(result.backlog, []);
+  assert.deepEqual(blocked.backlog, []);
+
+  const afterSoft = await discoverTerafabxOwnPostCoverageCycle({
+    ownPostCoverageCursor: "",
+    ownPostCoverageBacklog: [],
+    ownPostUnavailableRoots: unavailableRoots,
+  }, {
+    now: now + 31 * 60 * 1000,
+    maxPages: 1,
+    fetchPage: async () => ({
+      roots: [{ url: rootUrl, replies: 3, createdAt: new Date(now - 60 * 60 * 1000).toISOString() }],
+      nextCursor: "",
+      exhausted: true,
+    }),
+  });
+  assert.equal(afterSoft.backlog.some((item) => item.url === rootUrl), true);
 });
 
 test("full coverage drops roots older than 72 hours and stops profile pagination at the boundary", async () => {
@@ -505,7 +541,7 @@ test("reply-count refresh selects never-checked and stalest posted roots first",
   assert.equal(targets.some((item) => item.url === olderThanThreeDays), false);
 });
 
-test("reply-count refresh excludes tombstoned roots and terminates a new conversation 404", async () => {
+test("reply-count refresh soft-backs off conversation 404 but still updates X display count", async () => {
   const now = Date.parse("2026-07-28T12:00:00.000Z");
   const rootUrl = xStatusUrlAt(now - 60 * 60 * 1000, 21n);
   let state = {
@@ -517,6 +553,8 @@ test("reply-count refresh excludes tombstoned roots and terminates a new convers
         checkedAt: "2026-07-28T10:00:00.000Z",
         totalEligibleCount: 3,
         rootPostText: "과거 정상 스냅샷",
+        rawReplyCount: 3,
+        lastConversationRawReplyCount: 3,
       },
     },
     ownPostUnavailableRoots: {},
@@ -536,19 +574,91 @@ test("reply-count refresh excludes tombstoned roots and terminates a new convers
         'Conversation API 댓글 수집 실패: HTTP 404: {"status":null,"thread":null,"replies":null,"author":null,"cursor":null,"code":404}',
       );
     },
+    fetchStatus: async () => ({ replyCount: 14 }),
   });
-  assert.equal(result.ok, true);
   assert.equal(result.updatedCount, 0);
+  assert.equal(result.statusOnlyCount, 1);
   assert.equal(result.unavailableRootCount, 1);
-  assert.equal(result.failedCount, 0);
   assert.equal(state.ownPostReplyCoverage[rootUrl].rootPostText, "과거 정상 스냅샷");
-  assert.equal(state.ownPostUnavailableRoots[rootUrl].reason, "conversation_api_404");
-  assert.deepEqual(state.ownPostCoverageBacklog, []);
-  assert.deepEqual(selectTerafabxReplyCountRefreshTargets(state, [], {
+  assert.equal(state.ownPostReplyCoverage[rootUrl].rawReplyCount, 14);
+  assert.equal(state.ownPostReplyCoverage[rootUrl].lastConversationRawReplyCount, 3);
+  assert.equal(state.ownPostUnavailableRoots[rootUrl].severity, "soft");
+  assert.equal(state.ownPostUnavailableRoots[rootUrl].failureCount, 1);
+  // During soft backoff: still selected for status-only, conversation disallowed.
+  const duringSoft = selectTerafabxReplyCountRefreshTargets(state, [], {
     now: now + 60_000,
     staleMs: 0,
     limit: 10,
-  }), []);
+  });
+  assert.equal(duringSoft.length, 1);
+  assert.equal(duringSoft[0].conversationAllowed, false);
+  // After soft expiry: conversation allowed again.
+  const afterSoft = selectTerafabxReplyCountRefreshTargets(state, [], {
+    now: now + 31 * 60 * 1000,
+    staleMs: 0,
+    limit: 10,
+  });
+  assert.equal(afterSoft[0].conversationAllowed, true);
+  // raw growth reopens coverage backlog once conversation baseline is behind.
+  const reopened = collectTerafabxOwnPostCoverageReopenRoots(state, { now: now + 31 * 60 * 1000 });
+  assert.equal(reopened.some((item) => item.url === rootUrl), true);
+  state.ownPostUnavailableRoots = clearTerafabxOwnPostUnavailableRoot(
+    state.ownPostUnavailableRoots,
+    rootUrl,
+    { now: now + 31 * 60 * 1000 },
+  );
+  assert.equal(isTerafabxOwnPostRootUnavailable(state.ownPostUnavailableRoots, rootUrl, now + 31 * 60 * 1000), false);
+});
+
+test("reply-count refresh clears soft backoff after successful conversation", async () => {
+  const now = Date.parse("2026-07-28T12:00:00.000Z");
+  const rootUrl = xStatusUrlAt(now - 60 * 60 * 1000, 22n);
+  let state = {
+    commentHistory: [],
+    ownPostReplyHistory: [],
+    ownPostCoverageBacklog: [],
+    ownPostReplyCoverage: {
+      [rootUrl]: {
+        checkedAt: "2026-07-28T10:00:00.000Z",
+        totalEligibleCount: 1,
+        rawReplyCount: 1,
+      },
+    },
+    ownPostUnavailableRoots: markTerafabxOwnPostUnavailableRoot(
+      {},
+      rootUrl,
+      'Conversation API 댓글 수집 실패: HTTP 404: {"status":null,"thread":null,"replies":null,"author":null,"cursor":null,"code":404}',
+      { now: now - 40 * 60 * 1000 },
+    ),
+  };
+  // Soft expired so conversation is allowed.
+  const result = await runTerafabxReplyCountRefresh({
+    now,
+    staleMs: 0,
+    limit: 10,
+    historyEntries: [],
+    loadState: () => state,
+    saveState: (patch) => {
+      state = { ...state, ...patch };
+      return state;
+    },
+    collectConversation: async () => ({
+      postUrl: rootUrl,
+      rootPost: { url: rootUrl, text: "복구 원글", replyCount: 5 },
+      rows: [],
+      directReplies: [{}, {}, {}, {}, {}],
+      alreadyReplied: [],
+      candidates: [{ url: "https://x.com/alice/status/1" }],
+      collectionSource: "fxtwitter-v2-conversation",
+      partial: false,
+      truncated: false,
+    }),
+  });
+  assert.equal(result.updatedCount, 1);
+  assert.equal(state.ownPostUnavailableRoots[rootUrl], undefined);
+  assert.equal(state.ownPostReplyCoverage[rootUrl].rawReplyCount, 5);
+  assert.equal(state.ownPostReplyCoverage[rootUrl].lastConversationRawReplyCount, 5);
+  assert.equal(state.ownPostReplyCoverage[rootUrl].totalEligibleCount, 1);
 });
 
 test("scheduled reply-count refresh persists complete conversations and preserves failed snapshots", async () => {
@@ -2218,7 +2328,7 @@ test("X home HTTP 429 creates a thirty-minute discovery backoff", () => {
 test("auto comment discovery uses disposable tabs on the shared 9224 browser", () => {
   assert.equal(typeof terafabxAutoCommentBrowserResources, "function");
   const resources = terafabxAutoCommentBrowserResources();
-  assert.deepEqual(Object.keys(resources).sort(), ["legacy", "ownHeart", "ownReply", "ownScan", "writer"]);
+  assert.deepEqual(Object.keys(resources).sort(), ["homeVerified", "legacy", "ownHeart", "ownReply", "ownScan", "writer"]);
   assert.deepEqual(terafabxAutoCommentDiscoveryOptions(), {
     port: 9224,
     lock: "global-9224",

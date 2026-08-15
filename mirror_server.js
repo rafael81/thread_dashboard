@@ -61,6 +61,8 @@ const DASHBOARD_DIST_DIR = path.join(__dirname, "dashboard", "dist");
 const DASHBOARD_INDEX_PATH = path.join(DASHBOARD_DIST_DIR, "index.html");
 const GENERATED_MEDIA_DIR = path.join(__dirname, ".data", "generated-media");
 const DISCOVERY_THUMBNAIL_DIR = path.join(__dirname, ".data", "discovery-thumbnails");
+const DISCOVERY_MEDIA_SNAPSHOT_DIR = process.env.DISCOVERY_MEDIA_SNAPSHOT_DIR
+  || path.join(__dirname, ".data", "discovery-media");
 const DISCOVERY_THUMBNAIL_WIDTH = 320;
 const discoveryThumbnailJobs = new Map();
 const MEDIA_TEMP_PREFIXES = Object.freeze(["thread-mirror-", "youtube-x-upload-"]);
@@ -71,6 +73,10 @@ const MEDIA_TEMP_ORPHAN_MIN_AGE_MS = Math.max(
 const MEDIA_TEMP_CLEANUP_INTERVAL_MS = Math.max(
   5 * 60 * 1000,
   Number(process.env.MEDIA_TEMP_CLEANUP_INTERVAL_MS || 60 * 60 * 1000),
+);
+const DISCOVERY_MEDIA_SNAPSHOT_TTL_MS = Math.max(
+  60 * 60 * 1000,
+  Number(process.env.DISCOVERY_MEDIA_SNAPSHOT_TTL_MS || 7 * 24 * 60 * 60 * 1000),
 );
 const activeMediaTempDirs = new Set();
 const DISCOVERY_MIN_LIKES = Number(process.env.DISCOVERY_MIN_LIKES || 1000);
@@ -264,7 +270,21 @@ const TERAFABX_OWN_POST_COVERAGE_PAGES_PER_CYCLE = Math.max(1, Math.min(20, Numb
 const TERAFABX_OWN_POST_COVERAGE_ROOTS_PER_CYCLE = Math.max(1, Math.min(20, Number(process.env.TERAFABX_OWN_POST_COVERAGE_ROOTS_PER_CYCLE || 20)));
 const TERAFABX_OWN_POST_COVERAGE_BACKLOG_LIMIT = Math.max(100, Number(process.env.TERAFABX_OWN_POST_COVERAGE_BACKLOG_LIMIT || 5000));
 const TERAFABX_OWN_POST_COVERAGE_WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
+// Legacy 7d hard-tombstone TTL is no longer used for conversation 404.
+// Soft backoff is short; hard quarantine only after repeated failures.
 const TERAFABX_OWN_POST_UNAVAILABLE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const TERAFABX_OWN_POST_CONVERSATION_SOFT_BACKOFF_MS = Math.max(
+  60_000,
+  Number(process.env.TERAFABX_OWN_POST_CONVERSATION_SOFT_BACKOFF_MS || 30 * 60 * 1000),
+);
+const TERAFABX_OWN_POST_CONVERSATION_HARD_TTL_MS = Math.max(
+  15 * 60 * 1000,
+  Number(process.env.TERAFABX_OWN_POST_CONVERSATION_HARD_TTL_MS || 6 * 60 * 60 * 1000),
+);
+const TERAFABX_OWN_POST_CONVERSATION_HARD_AFTER_FAILURES = Math.max(
+  2,
+  Number(process.env.TERAFABX_OWN_POST_CONVERSATION_HARD_AFTER_FAILURES || 5),
+);
 const TERAFABX_OWN_POST_UNAVAILABLE_LIMIT = 200;
 const TERAFABX_REPLY_COUNT_REFRESH_INTERVAL_MS = Math.max(60_000, Number(process.env.TERAFABX_REPLY_COUNT_REFRESH_INTERVAL_MS || 2 * 60 * 1000));
 const TERAFABX_REPLY_COUNT_REFRESH_STALE_MS = Math.max(60_000, Number(process.env.TERAFABX_REPLY_COUNT_REFRESH_STALE_MS || 15 * 60 * 1000));
@@ -4106,6 +4126,7 @@ function buildTerafabxOwnPostReplyCompletionMetrics(state = loadTerafabxState())
       : totalCount
         ? Math.min(100, Math.round((completedCount / totalCount) * 1000) / 10)
         : null;
+    const statusOnly = snapshot.statusOnlyRefreshAt && !snapshot.countRefreshScheduled && !direct;
     metrics.set(rootUrl, {
       rootPostUrl: rootUrl,
       rootPostText: String(snapshot.rootPostText || latestHistory?.rootPostText || ""),
@@ -4119,12 +4140,18 @@ function buildTerafabxOwnPostReplyCompletionMetrics(state = loadTerafabxState())
         ? "scheduled-full-conversation"
         : direct
           ? "x-direct-full-scroll"
-          : totalCount
-            ? "x-reply-count-estimate"
-            : "history-only",
-      checkedAt: snapshot.countRefreshCheckedAt || snapshot.checkedAt || backlog.lastCheckedAt || null,
+          : statusOnly
+            ? "x-status-reply-count"
+            : totalCount
+              ? "x-reply-count-estimate"
+              : "history-only",
+      checkedAt: snapshot.countRefreshCheckedAt || snapshot.statusOnlyRefreshAt || snapshot.checkedAt || backlog.lastCheckedAt || null,
       rawReplyCount: rawReplyCount || null,
+      xDisplayReplyCount: rawReplyCount || null,
       collectedDirectReplyCount: direct ? Math.max(0, Number(snapshot.directReplyCount || 0)) : null,
+      lastConversationRawReplyCount: Number.isFinite(Number(snapshot.lastConversationRawReplyCount))
+        ? Number(snapshot.lastConversationRawReplyCount)
+        : null,
     });
   }
   return metrics;
@@ -7948,8 +7975,26 @@ function isTerafabxConversationRootUnavailableError(error) {
     || /\bNOT_FOUND\b/i.test(message);
 }
 
+function terafabxOwnPostUnavailableEntryActive(entry = {}, now = Date.now()) {
+  if (!entry || typeof entry !== "object") return false;
+  const severity = String(entry.severity || "");
+  // Legacy 7d hard tombstones (no severity/retryAfter) are intentionally inactive
+  // so they no longer block coverage or reply-count refresh.
+  if (!severity || !entry.retryAfter) return false;
+  const retryAfterMs = Date.parse(String(entry.retryAfter || ""));
+  if (Number.isFinite(retryAfterMs) && now >= retryAfterMs) return false;
+  if (severity === "hard") {
+    const unavailableAtMs = Date.parse(String(entry.unavailableAt || ""));
+    if (Number.isFinite(unavailableAtMs) && now - unavailableAtMs > TERAFABX_OWN_POST_CONVERSATION_HARD_TTL_MS) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function normalizeTerafabxOwnPostUnavailableRoots(value = {}, options = {}) {
   const now = Number.isFinite(Number(options.now)) ? Number(options.now) : Date.now();
+  const includeInactive = options.includeInactive === true;
   const rows = [];
   for (const [rawUrl, rawEntry] of Object.entries(value && typeof value === "object" ? value : {})) {
     const url = normalizeXStatusUrl(rawEntry?.rootUrl || rawUrl);
@@ -7957,13 +8002,26 @@ function normalizeTerafabxOwnPostUnavailableRoots(value = {}, options = {}) {
     if (!parsed?.id || parsed.handle.toLowerCase() !== REQUIRED_X_HANDLE) continue;
     const unavailableAt = String(rawEntry?.unavailableAt || "");
     const unavailableAtMs = Date.parse(unavailableAt);
-    if (!Number.isFinite(unavailableAtMs) || now - unavailableAtMs > TERAFABX_OWN_POST_UNAVAILABLE_TTL_MS) continue;
-    rows.push([url, {
+    if (!Number.isFinite(unavailableAtMs)) continue;
+    // Drop legacy hard tombstones that predate soft-backoff policy.
+    const hasPolicyFields = Boolean(rawEntry?.severity && rawEntry?.retryAfter);
+    if (!hasPolicyFields) continue;
+    const severity = String(rawEntry.severity) === "hard" ? "hard" : "soft";
+    const failureCount = Math.max(1, Number(rawEntry.failureCount || 1));
+    const retryAfter = String(rawEntry.retryAfter || "");
+    const entry = {
       rootUrl: url,
       reason: String(rawEntry?.reason || "conversation_api_404"),
+      severity,
+      failureCount,
       unavailableAt,
+      retryAfter,
       lastError: String(rawEntry?.lastError || "").slice(0, 500),
-    }]);
+    };
+    if (!includeInactive && !terafabxOwnPostUnavailableEntryActive(entry, now)) continue;
+    // Absolute safety cap so stale hard rows never linger beyond the old TTL.
+    if (now - unavailableAtMs > TERAFABX_OWN_POST_UNAVAILABLE_TTL_MS) continue;
+    rows.push([url, entry]);
   }
   return Object.fromEntries(
     rows
@@ -7977,17 +8035,52 @@ function markTerafabxOwnPostUnavailableRoot(value = {}, rootUrl = "", error = ""
   const url = normalizeXStatusUrl(rootUrl);
   const parsed = parseXStatusUrl(url);
   if (!parsed?.id || parsed.handle.toLowerCase() !== REQUIRED_X_HANDLE) {
-    return normalizeTerafabxOwnPostUnavailableRoots(value, { now });
+    return normalizeTerafabxOwnPostUnavailableRoots(value, { now, includeInactive: true });
   }
-  return normalizeTerafabxOwnPostUnavailableRoots({
-    ...value,
+  const previousRaw = value && typeof value === "object" ? value[url] : null;
+  const previousCount = previousRaw && previousRaw.severity && previousRaw.retryAfter
+    ? Math.max(0, Number(previousRaw.failureCount || 0))
+    : 0;
+  const failureCount = previousCount + 1;
+  const severity = failureCount >= TERAFABX_OWN_POST_CONVERSATION_HARD_AFTER_FAILURES ? "hard" : "soft";
+  const backoffMs = severity === "hard"
+    ? TERAFABX_OWN_POST_CONVERSATION_HARD_TTL_MS
+    : TERAFABX_OWN_POST_CONVERSATION_SOFT_BACKOFF_MS;
+  const next = {
+    ...(value && typeof value === "object" ? value : {}),
     [url]: {
       rootUrl: url,
       reason: "conversation_api_404",
+      severity,
+      failureCount,
       unavailableAt: new Date(now).toISOString(),
+      retryAfter: new Date(now + backoffMs).toISOString(),
       lastError: String(error?.message || error || "").slice(0, 500),
     },
-  }, { now });
+  };
+  return normalizeTerafabxOwnPostUnavailableRoots(next, { now, includeInactive: true });
+}
+
+function clearTerafabxOwnPostUnavailableRoot(value = {}, rootUrl = "", options = {}) {
+  const now = Number.isFinite(Number(options.now)) ? Number(options.now) : Date.now();
+  const url = normalizeXStatusUrl(rootUrl);
+  if (!url || !value || typeof value !== "object" || !value[url]) {
+    return normalizeTerafabxOwnPostUnavailableRoots(value, { now, includeInactive: true });
+  }
+  const next = { ...value };
+  delete next[url];
+  return normalizeTerafabxOwnPostUnavailableRoots(next, { now, includeInactive: true });
+}
+
+function isTerafabxOwnPostRootUnavailable(value = {}, rootUrl = "", now = Date.now()) {
+  const url = normalizeXStatusUrl(rootUrl);
+  if (!url) return false;
+  const active = normalizeTerafabxOwnPostUnavailableRoots(value, { now });
+  return Boolean(active[url]);
+}
+
+function terafabxOwnPostConversationAllowed(value = {}, rootUrl = "", now = Date.now()) {
+  return !isTerafabxOwnPostRootUnavailable(value, rootUrl, now);
 }
 
 async function fetchTerafabxOwnRootStatusPage({ cursor = "", fetchJson = requestExternalJson } = {}) {
@@ -8164,12 +8257,14 @@ async function discoverTerafabxOwnPostCoverageCycle(state = loadTerafabxState(),
     }
     cursor = page.nextCursor;
   }
+  const reopened = collectTerafabxOwnPostCoverageReopenRoots(state, { now });
   const backlog = normalizeTerafabxOwnPostCoverageBacklog([
     ...(state.ownPostCoverageBacklog || []),
     ...discovered.filter((item) => item.replies > 0).map((item) => ({
       ...item,
       discoveredAt: new Date(now).toISOString(),
     })),
+    ...reopened,
   ], { recentOnly: true, now, unavailableRoots });
   return {
     startingCursor,
@@ -8178,6 +8273,7 @@ async function discoverTerafabxOwnPostCoverageCycle(state = loadTerafabxState(),
     pageCount,
     discoveredRootCount: discovered.length,
     discoveredReplyRootCount: discovered.filter((item) => item.replies > 0).length,
+    reopenedRootCount: reopened.length,
     backlog,
   };
 }
@@ -8924,6 +9020,7 @@ function buildTerafabxOwnPostReplyCoverageRecord(conversation = {}, state = {}, 
   const completedCount = Math.max(historyCompletedCount, Number(conversation.alreadyReplied?.length || 0));
   const remainingEligibleCount = Math.max(0, Number(conversation.candidates?.length || 0));
   const checkedAt = options.checkedAt || new Date().toISOString();
+  const rawReplyCount = Math.max(0, Number(conversation.rootPost?.replyCount || 0));
   return {
     rootPostUrl: rootUrl,
     rootPostText: cleanSocialText(conversation.rootPost?.text || ""),
@@ -8935,12 +9032,62 @@ function buildTerafabxOwnPostReplyCoverageRecord(conversation = {}, state = {}, 
     completedCount,
     remainingEligibleCount,
     totalEligibleCount: completedCount + remainingEligibleCount,
-    rawReplyCount: Math.max(0, Number(conversation.rootPost?.replyCount || 0)),
+    rawReplyCount,
+    lastConversationRawReplyCount: rawReplyCount,
     ...(options.scheduled === true ? {
       countRefreshScheduled: true,
       countRefreshCheckedAt: checkedAt,
     } : {}),
   };
+}
+
+function applyTerafabxOwnPostStatusOnlyReplyCount(coverage = {}, rootUrl = "", replyCount = 0, options = {}) {
+  const url = normalizeXStatusUrl(rootUrl);
+  if (!parseXStatusUrl(url)?.id) return coverage;
+  const checkedAt = options.checkedAt || new Date().toISOString();
+  const existing = coverage[url] && typeof coverage[url] === "object" ? coverage[url] : {};
+  const rawReplyCount = Math.max(0, Number(replyCount || 0));
+  return {
+    ...coverage,
+    [url]: {
+      ...existing,
+      rootPostUrl: url,
+      rootPostText: existing.rootPostText || "",
+      rawReplyCount,
+      statusOnlyRefreshAt: checkedAt,
+      countRefreshCheckedAt: checkedAt,
+    },
+  };
+}
+
+function collectTerafabxOwnPostCoverageReopenRoots(state = {}, options = {}) {
+  const now = Number.isFinite(Number(options.now)) ? Number(options.now) : Date.now();
+  const unavailableRoots = normalizeTerafabxOwnPostUnavailableRoots(state.ownPostUnavailableRoots, { now });
+  const coverage = state.ownPostReplyCoverage && typeof state.ownPostReplyCoverage === "object"
+    ? state.ownPostReplyCoverage
+    : {};
+  const reopened = [];
+  for (const [rawUrl, snapshot] of Object.entries(coverage)) {
+    const url = normalizeXStatusUrl(rawUrl);
+    if (!parseXStatusUrl(url)?.id) continue;
+    if (unavailableRoots[url]) continue;
+    if (!isTerafabxRecentOwnPostCoverageRoot({ url, createdAt: snapshot?.createdAt }, now)) continue;
+    const rawReplyCount = Math.max(0, Number(snapshot?.rawReplyCount || 0));
+    if (rawReplyCount <= 0) continue;
+    const lastConversationRaw = Number(snapshot?.lastConversationRawReplyCount);
+    const hasConversationBaseline = Number.isFinite(lastConversationRaw) && lastConversationRaw >= 0;
+    if (hasConversationBaseline && rawReplyCount > lastConversationRaw) {
+      reopened.push({
+        url,
+        replies: rawReplyCount,
+        createdAt: snapshot?.createdAt || null,
+        discoveredAt: new Date(now).toISOString(),
+        reopenReason: "raw_reply_growth",
+        scanPhase: "api",
+      });
+    }
+  }
+  return reopened;
 }
 
 function recordTerafabxOwnPostReplyCoverage(conversation = {}) {
@@ -8973,12 +9120,14 @@ function selectTerafabxReplyCountRefreshTargets(state = {}, historyEntries = [],
   const coverage = state.ownPostReplyCoverage && typeof state.ownPostReplyCoverage === "object"
     ? state.ownPostReplyCoverage
     : {};
+  // Active soft/hard blocks exclude roots from coverage backlog, but reply-count
+  // refresh still selects them so status.raw can update during conversation backoff.
   const unavailableRoots = normalizeTerafabxOwnPostUnavailableRoots(state.ownPostUnavailableRoots, { now });
   const roots = new Set([
     ...Object.keys(coverage),
     ...normalizeTerafabxOwnPostCoverageBacklog(state.ownPostCoverageBacklog, {
       now,
-      unavailableRoots,
+      unavailableRoots: {},
     }).map((item) => item.url),
     ...Array.from(terafabxCompletedReplyTargetsByRoot(state).keys()),
     ...(historyEntries || [])
@@ -8988,7 +9137,6 @@ function selectTerafabxReplyCountRefreshTargets(state = {}, historyEntries = [],
   ]);
   return Array.from(roots)
     .filter((url) => {
-      if (unavailableRoots[url]) return false;
       const parsed = parseXStatusUrl(url);
       if (!parsed?.id || parsed.handle.toLowerCase() !== REQUIRED_X_HANDLE) return false;
       const publishedAtMs = xStatusCreatedAtMs(url);
@@ -8998,12 +9146,16 @@ function selectTerafabxReplyCountRefreshTargets(state = {}, historyEntries = [],
     })
     .map((url) => {
       const snapshot = coverage[url] || {};
-      const checkedAt = snapshot.countRefreshCheckedAt || snapshot.checkedAt || "";
+      const checkedAt = snapshot.countRefreshCheckedAt || snapshot.statusOnlyRefreshAt || snapshot.checkedAt || "";
       const checkedAtMs = Date.parse(checkedAt);
+      const block = unavailableRoots[url] || null;
       return {
         url,
         checkedAt: checkedAt || null,
         checkedAtMs: Number.isFinite(checkedAtMs) ? checkedAtMs : 0,
+        conversationAllowed: !block,
+        blockSeverity: block?.severity || null,
+        blockRetryAfter: block?.retryAfter || null,
       };
     })
     .filter((item) => item.checkedAtMs === 0 || now - item.checkedAtMs >= staleMs)
@@ -9019,6 +9171,7 @@ async function runTerafabxReplyCountRefresh(options = {}) {
   const loadState = options.loadState || loadTerafabxState;
   const saveState = options.saveState || saveTerafabxState;
   const collectConversation = options.collectConversation || collectTerafabxOwnPostConversation;
+  const fetchStatus = options.fetchStatus || fetchFxTwitterV2Status;
   const historyEntries = options.historyEntries || loadMirrorHistory();
   const now = Number.isFinite(Number(options.now)) ? Number(options.now) : Date.now();
   const checkedAt = new Date(now).toISOString();
@@ -9031,7 +9184,15 @@ async function runTerafabxReplyCountRefresh(options = {}) {
       limit: options.limit,
     });
     if (!targets.length) {
-      const summary = { checkedAt, requestedCount: 0, updatedCount: 0, failedCount: 0 };
+      const summary = {
+        checkedAt,
+        requestedCount: 0,
+        updatedCount: 0,
+        statusOnlyCount: 0,
+        failedCount: 0,
+        softBackoffCount: 0,
+        hardBackoffCount: 0,
+      };
       saveState({
         ownPostReplyCountRefreshLastRunAt: checkedAt,
         ownPostReplyCountRefreshLastStatus: "idle",
@@ -9044,6 +9205,35 @@ async function runTerafabxReplyCountRefresh(options = {}) {
       targets,
       options.concurrency || TERAFABX_REPLY_COUNT_REFRESH_CONCURRENCY,
       async (target) => {
+        const tryStatusOnly = async (errorMessage = "") => {
+          try {
+            const status = await fetchStatus(target.url);
+            return {
+              ok: false,
+              statusOnly: true,
+              target,
+              replyCount: Math.max(0, Number(status.replyCount || 0)),
+              error: errorMessage || null,
+              rootUnavailable: isTerafabxConversationRootUnavailableError(errorMessage),
+            };
+          } catch (statusError) {
+            return {
+              ok: false,
+              statusOnly: false,
+              target,
+              error: errorMessage || statusError.message,
+              statusError: statusError.message,
+              rootUnavailable: isTerafabxConversationRootUnavailableError(errorMessage),
+            };
+          }
+        };
+        if (target.conversationAllowed === false) {
+          return tryStatusOnly(
+            target.blockSeverity === "hard"
+              ? "conversation hard backoff active"
+              : "conversation soft backoff active",
+          );
+        }
         try {
           const conversation = await collectConversation(target.url, {
             verifiedOnly: false,
@@ -9056,22 +9246,40 @@ async function runTerafabxReplyCountRefresh(options = {}) {
           }
           return { ok: true, target, conversation };
         } catch (error) {
+          const statusResult = await tryStatusOnly(error.message);
           return {
-            ok: false,
-            target,
-            error: error.message,
+            ...statusResult,
             rootUnavailable: isTerafabxConversationRootUnavailableError(error),
+            error: error.message,
           };
         }
       },
     );
     const latestState = loadState();
-    const coverage = { ...(latestState.ownPostReplyCoverage || {}) };
+    let coverage = { ...(latestState.ownPostReplyCoverage || {}) };
     let unavailableRoots = normalizeTerafabxOwnPostUnavailableRoots(
       latestState.ownPostUnavailableRoots,
-      { now },
+      { now, includeInactive: true },
     );
+    let fullUpdated = 0;
+    let statusOnlyCount = 0;
     for (const result of results) {
+      if (result.ok && result.conversation) {
+        unavailableRoots = clearTerafabxOwnPostUnavailableRoot(
+          unavailableRoots,
+          result.target.url,
+          { now },
+        );
+        const record = buildTerafabxOwnPostReplyCoverageRecord(result.conversation, latestState, {
+          checkedAt,
+          scheduled: true,
+        });
+        if (record) {
+          coverage[result.target.url] = record;
+          fullUpdated += 1;
+        }
+        continue;
+      }
       if (result.rootUnavailable) {
         unavailableRoots = markTerafabxOwnPostUnavailableRoot(
           unavailableRoots,
@@ -9082,36 +9290,67 @@ async function runTerafabxReplyCountRefresh(options = {}) {
         logEvent("terafabx_reply_count_refresh_root_unavailable", {
           rootUrl: result.target.url,
           reason: "conversation_api_404",
+          severity: unavailableRoots[result.target.url]?.severity || "soft",
+          failureCount: unavailableRoots[result.target.url]?.failureCount || 1,
+          retryAfter: unavailableRoots[result.target.url]?.retryAfter || null,
           error: result.error,
         });
-        continue;
       }
-      if (!result.ok) continue;
-      const record = buildTerafabxOwnPostReplyCoverageRecord(result.conversation, latestState, {
-        checkedAt,
-        scheduled: true,
-      });
-      if (record) coverage[result.target.url] = record;
+      if (result.statusOnly && Number.isFinite(Number(result.replyCount))) {
+        coverage = applyTerafabxOwnPostStatusOnlyReplyCount(
+          coverage,
+          result.target.url,
+          result.replyCount,
+          { checkedAt },
+        );
+        statusOnlyCount += 1;
+        logEvent("terafabx_reply_count_refresh_status_fallback", {
+          rootUrl: result.target.url,
+          replyCount: result.replyCount,
+          error: result.error || null,
+        });
+      }
     }
-    const unavailable = results.filter((item) => item.rootUnavailable);
-    const failed = results.filter((item) => !item.ok && !item.rootUnavailable);
+    unavailableRoots = normalizeTerafabxOwnPostUnavailableRoots(unavailableRoots, {
+      now,
+      includeInactive: true,
+    });
+    const activeUnavailable = normalizeTerafabxOwnPostUnavailableRoots(unavailableRoots, { now });
+    const reopenRoots = collectTerafabxOwnPostCoverageReopenRoots({
+      ...latestState,
+      ownPostReplyCoverage: coverage,
+      ownPostUnavailableRoots: activeUnavailable,
+    }, { now });
+    const failed = results.filter((item) => !item.ok && !item.statusOnly);
+    const softBackoffCount = Object.values(activeUnavailable).filter((item) => item.severity === "soft").length;
+    const hardBackoffCount = Object.values(activeUnavailable).filter((item) => item.severity === "hard").length;
     const summary = {
       checkedAt,
       requestedCount: targets.length,
-      updatedCount: results.filter((item) => item.ok).length,
-      unavailableRootCount: unavailable.length,
+      updatedCount: fullUpdated,
+      statusOnlyCount,
+      reopenRootCount: reopenRoots.length,
+      unavailableRootCount: results.filter((item) => item.rootUnavailable).length,
+      softBackoffCount,
+      hardBackoffCount,
       failedCount: failed.length,
       failed: failed.map((item) => ({ rootUrl: item.target.url, error: item.error })).slice(0, 10),
       intervalMs: TERAFABX_REPLY_COUNT_REFRESH_INTERVAL_MS,
       staleMs: TERAFABX_REPLY_COUNT_REFRESH_STALE_MS,
+      softBackoffMs: TERAFABX_OWN_POST_CONVERSATION_SOFT_BACKOFF_MS,
+      hardTtlMs: TERAFABX_OWN_POST_CONVERSATION_HARD_TTL_MS,
+      hardAfterFailures: TERAFABX_OWN_POST_CONVERSATION_HARD_AFTER_FAILURES,
       publishedWindowMs: Number(options.publishedWindowMs ?? TERAFABX_OWN_POST_COVERAGE_WINDOW_MS),
     };
     saveState({
       ownPostReplyCoverage: coverage,
       ownPostUnavailableRoots: unavailableRoots,
       ownPostCoverageBacklog: normalizeTerafabxOwnPostCoverageBacklog(
-        latestState.ownPostCoverageBacklog,
-        { now, recentOnly: true, unavailableRoots },
+        [
+          ...(latestState.ownPostCoverageBacklog || []),
+          ...reopenRoots,
+        ],
+        { now, recentOnly: true, unavailableRoots: activeUnavailable },
       ),
       ownPostReplyCountRefreshLastRunAt: checkedAt,
       ownPostReplyCountRefreshLastStatus: failed.length ? "degraded" : "ok",
@@ -14737,11 +14976,15 @@ async function runTerafabxOwnPostFullCoverageCycle(options = {}) {
   };
   try {
     const discovery = await discoverCycle(state, options);
-    let unavailableRoots = normalizeTerafabxOwnPostUnavailableRoots(state.ownPostUnavailableRoots, { now });
+    let unavailableRoots = normalizeTerafabxOwnPostUnavailableRoots(state.ownPostUnavailableRoots, {
+      now,
+      includeInactive: true,
+    });
+    const activeUnavailableRoots = () => normalizeTerafabxOwnPostUnavailableRoots(unavailableRoots, { now });
     let backlog = normalizeTerafabxOwnPostCoverageBacklog(discovery.backlog, {
       recentOnly: true,
       now,
-      unavailableRoots,
+      unavailableRoots: activeUnavailableRoots(),
     });
     const phasePlan = selectTerafabxOwnPostCoveragePhase(
       backlog,
@@ -15016,18 +15259,36 @@ async function runTerafabxOwnPostFullCoverageCycle(options = {}) {
             error,
             { now },
           );
-          completedUrls.add(root.url);
+          const block = unavailableRoots[root.url] || {};
+          // Soft backoff keeps the root retryable after retryAfter.
+          // Only repeated hard quarantine removes it as terminal for this window.
+          if (block.severity === "hard") {
+            completedUrls.add(root.url);
+          } else {
+            retryable.set(root.url, {
+              ...root,
+              scanPhase: "api",
+              lastCheckedAt: new Date().toISOString(),
+              lastError: error,
+            });
+          }
           processedByUrl.set(root.url, {
             rootUrl: root.url,
             collectionPhase: entry.collectionPhase || root.scanPhase || "api",
             status: "root_unavailable",
             reason: "conversation_api_404",
             unavailable: true,
+            severity: block.severity || "soft",
+            failureCount: block.failureCount || 1,
+            retryAfter: block.retryAfter || null,
             remainingEligibleCount: 0,
           });
           logEvent("terafabx_own_post_full_coverage_root_unavailable", {
             rootUrl: root.url,
             reason: "conversation_api_404",
+            severity: block.severity || "soft",
+            failureCount: block.failureCount || 1,
+            retryAfter: block.retryAfter || null,
             error,
           });
           continue;
@@ -15046,6 +15307,7 @@ async function runTerafabxOwnPostFullCoverageCycle(options = {}) {
         });
         continue;
       }
+      unavailableRoots = clearTerafabxOwnPostUnavailableRoot(unavailableRoots, root.url, { now });
       const batch = entry.batch;
       postedCount += Array.isArray(batch.posted) ? batch.posted.length : 0;
       const reconciled = reconcileTerafabxOwnPostReplyCoverageSnapshot(entry.snapshot, batch);
@@ -15090,7 +15352,7 @@ async function runTerafabxOwnPostFullCoverageCycle(options = {}) {
       .map((item) => retryable.get(item.url) || item), {
       recentOnly: true,
       now,
-      unavailableRoots,
+      unavailableRoots: activeUnavailableRoots(),
     });
     const completedAt = new Date().toISOString();
     const retryableErrorCount = processed.filter((item) => item.error || item.rejectedCount > 0).length;
@@ -15105,11 +15367,13 @@ async function runTerafabxOwnPostFullCoverageCycle(options = {}) {
       completedProfilePass: discovery.completedPass,
       discoveredRootCount: discovery.discoveredRootCount,
       discoveredReplyRootCount: discovery.discoveredReplyRootCount,
+      reopenedRootCount: Number(discovery.reopenedRootCount || 0),
       processedRootCount: processed.length,
       postedCount,
       remainingEligibleCount,
       backlogCount: backlog.length,
       unavailableRootCount: processed.filter((item) => item.unavailable === true).length,
+      activeUnavailableRootCount: Object.keys(activeUnavailableRoots()).length,
       retryableErrorCount,
       rootConcurrency,
       scanConcurrency: 0,
@@ -16434,8 +16698,14 @@ async function extractThreadPost(sourceUrl, options = {}) {
       const linkText = extraLinks.join("\n");
       text = text ? `${text}\n\n${linkText}` : linkText;
     }
-    if (isThreadsInvalidPageText(text)) {
-      throw new Error("Threads 원문이 삭제·비공개·잘못된 링크 상태라 미디어와 본문을 신뢰할 수 없습니다.");
+    if (
+      mediaUrls.length === 0
+      && (isThreadsInvalidPageText(text) || isThreadsInvalidPageText(data.text))
+    ) {
+      throw new Error(threadsInvalidPageError(text || data.text));
+    }
+    if (isThreadsUnusableExtraction(data.diagnostics, mediaUrls, data.embeddedCaption, text)) {
+      throw new Error("Threads 원문 게시글을 찾지 못해 미디어와 본문을 신뢰할 수 없습니다.");
     }
     if (!text && !options.allowEmptyText) throw new Error("Threads 원문 텍스트를 추출하지 못했습니다.");
     return {
@@ -16793,6 +17063,216 @@ async function downloadMedia(urls, options = {}) {
     cleanupMediaTempDir(dir);
     throw error;
   }
+}
+
+function discoveryMediaSnapshotKey(canonicalUrl) {
+  return crypto.createHash("sha1").update(String(canonicalUrl || "")).digest("hex").slice(0, 20);
+}
+
+function discoveryMediaSnapshotDir(canonicalUrl, options = {}) {
+  const root = path.resolve(options.root || DISCOVERY_MEDIA_SNAPSHOT_DIR);
+  return path.join(root, discoveryMediaSnapshotKey(canonicalUrl));
+}
+
+function loadDiscoveryMediaSnapshot(canonicalUrl, options = {}) {
+  const url = String(canonicalUrl || "").trim();
+  if (!url) return null;
+  const dir = discoveryMediaSnapshotDir(url, options);
+  const manifestPath = path.join(dir, "manifest.json");
+  if (!fs.existsSync(manifestPath)) return null;
+  let manifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  } catch {
+    return null;
+  }
+  const fileNames = Array.isArray(manifest.files) ? manifest.files : [];
+  const files = fileNames
+    .map((name) => path.join(dir, String(name || "")))
+    .filter((file) => file && fs.existsSync(file) && fs.statSync(file).isFile());
+  const expectedMedia = Math.max(
+    0,
+    Number(manifest.mediaCount || 0),
+    Array.isArray(manifest.mediaUrls) ? manifest.mediaUrls.length : 0,
+  );
+  const hasText = Boolean(String(manifest.text || "").trim());
+  const invalidText = isThreadsInvalidPageText(manifest.text);
+  const ready = expectedMedia > 0
+    ? files.length > 0 && files.length >= Math.min(expectedMedia, MAX_MEDIA) && !invalidText
+    : hasText && !invalidText;
+  return {
+    ready,
+    dir,
+    files,
+    expectedMedia,
+    manifest,
+    threadPost: {
+      url,
+      text: String(manifest.text || ""),
+      mediaUrls: Array.isArray(manifest.mediaUrls) ? manifest.mediaUrls : [],
+      imageMediaUrls: Array.isArray(manifest.imageMediaUrls) ? manifest.imageMediaUrls : [],
+      videoMediaUrls: Array.isArray(manifest.videoMediaUrls) ? manifest.videoMediaUrls : [],
+      likeCount: Number.isFinite(Number(manifest.likeCount)) ? Number(manifest.likeCount) : null,
+      diagnostics: {
+        ...(manifest.diagnostics && typeof manifest.diagnostics === "object" ? manifest.diagnostics : {}),
+        source: "local_discovery_media_snapshot",
+        localFiles: files.length,
+      },
+    },
+  };
+}
+
+async function saveDiscoveryMediaSnapshot(canonicalUrl, post = {}, options = {}) {
+  const url = validateThreadsUrl(canonicalUrl);
+  const dir = discoveryMediaSnapshotDir(url, options);
+  fs.mkdirSync(dir, { recursive: true });
+  const mediaUrls = unique(Array.isArray(post.mediaUrls) ? post.mediaUrls : []).slice(0, MAX_MEDIA);
+  const imageMediaUrls = unique(Array.isArray(post.imageMediaUrls) ? post.imageMediaUrls : []).slice(0, MAX_MEDIA);
+  const videoMediaUrls = unique(Array.isArray(post.videoMediaUrls) ? post.videoMediaUrls : []).slice(0, MAX_MEDIA);
+  const text = String(post.text || "").trim();
+  if (!mediaUrls.length && (!text || isThreadsInvalidPageText(text))) {
+    return {
+      ready: false,
+      dir,
+      files: [],
+      expectedMedia: 0,
+      manifest: null,
+      threadPost: null,
+    };
+  }
+  const existing = loadDiscoveryMediaSnapshot(url, options);
+  if (
+    existing?.ready
+    && existing.files.length >= mediaUrls.length
+    && String(existing.manifest?.text || "").trim() === text
+    && options.force !== true
+  ) {
+    return existing;
+  }
+
+  const savedFiles = [];
+  if (mediaUrls.length) {
+    const temp = await downloadMedia(mediaUrls, options);
+    try {
+      for (let index = 0; index < temp.files.length; index += 1) {
+        const source = temp.files[index];
+        const ext = path.extname(source) || ".bin";
+        const destName = `media-${index + 1}${ext}`;
+        const dest = path.join(dir, destName);
+        fs.copyFileSync(source, dest);
+        savedFiles.push(destName);
+      }
+    } finally {
+      cleanupMediaTempDir(temp.dir);
+    }
+  }
+
+  const manifest = {
+    canonicalUrl: url,
+    text,
+    mediaUrls,
+    imageMediaUrls,
+    videoMediaUrls,
+    mediaCount: mediaUrls.length,
+    likeCount: Number.isFinite(Number(post.likeCount)) ? Number(post.likeCount) : null,
+    files: savedFiles,
+    diagnostics: post.diagnostics && typeof post.diagnostics === "object" ? post.diagnostics : {},
+    savedAt: new Date().toISOString(),
+  };
+  fs.writeFileSync(path.join(dir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+  // Remove stale media files no longer referenced.
+  for (const name of fs.readdirSync(dir)) {
+    if (name === "manifest.json") continue;
+    if (!savedFiles.includes(name)) {
+      try { fs.rmSync(path.join(dir, name), { force: true }); } catch {}
+    }
+  }
+  logEvent("discovery_media_snapshot_saved", {
+    canonicalUrl: url,
+    mediaCount: savedFiles.length,
+    textLength: text.length,
+    dir: path.basename(dir),
+  });
+  return loadDiscoveryMediaSnapshot(url, options);
+}
+
+function cleanupDiscoveryMediaSnapshot(canonicalUrl, options = {}) {
+  const url = String(canonicalUrl || "").trim();
+  if (!url) return { removed: false };
+  const dir = discoveryMediaSnapshotDir(url, options);
+  if (!fs.existsSync(dir)) return { removed: false, dir };
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+    if (options.silent !== true) {
+      logEvent("discovery_media_snapshot_cleaned", {
+        canonicalUrl: url,
+        dir: path.basename(dir),
+        reason: options.reason || "success",
+      });
+    }
+    return { removed: true, dir };
+  } catch (error) {
+    logEvent("discovery_media_snapshot_cleanup_error", {
+      canonicalUrl: url,
+      error: error.message,
+    });
+    return { removed: false, dir, error: error.message };
+  }
+}
+
+function cleanupExpiredDiscoveryMediaSnapshots(options = {}) {
+  const root = path.resolve(options.root || DISCOVERY_MEDIA_SNAPSHOT_DIR);
+  const now = Number.isFinite(Number(options.now)) ? Number(options.now) : Date.now();
+  const ttlMs = Math.max(0, Number(options.ttlMs ?? DISCOVERY_MEDIA_SNAPSHOT_TTL_MS));
+  const result = { checked: 0, removed: 0, errors: [] };
+  if (!fs.existsSync(root)) return result;
+  for (const name of fs.readdirSync(root)) {
+    const dir = path.join(root, name);
+    try {
+      if (!fs.statSync(dir).isDirectory()) continue;
+      result.checked += 1;
+      const manifestPath = path.join(dir, "manifest.json");
+      let mtime = fs.statSync(dir).mtimeMs;
+      if (fs.existsSync(manifestPath)) {
+        try {
+          const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+          const savedAt = Date.parse(String(manifest.savedAt || ""));
+          if (Number.isFinite(savedAt)) mtime = savedAt;
+        } catch {}
+      }
+      if (now - mtime < ttlMs) continue;
+      fs.rmSync(dir, { recursive: true, force: true });
+      result.removed += 1;
+    } catch (error) {
+      result.errors.push({ dir: name, error: error.message });
+    }
+  }
+  if (result.removed || result.errors.length) {
+    logEvent("discovery_media_snapshot_ttl_cleanup", result);
+  }
+  return result;
+}
+
+async function persistDiscoveryMediaSnapshotCriteria(canonicalUrl, snapshot) {
+  if (!snapshot?.ready) return;
+  const db = await getDiscoveryDb();
+  const row = await db.prepare(`
+    SELECT criteria FROM thread_discoveries WHERE canonical_url = ?
+  `).get(canonicalUrl);
+  if (!row) return;
+  const criteria = parseDiscoveryCriteria(row.criteria);
+  criteria.mediaSnapshot = {
+    key: discoveryMediaSnapshotKey(canonicalUrl),
+    fileCount: Array.isArray(snapshot.files) ? snapshot.files.length : 0,
+    mediaCount: Number(snapshot.expectedMedia || snapshot.manifest?.mediaCount || 0),
+    savedAt: snapshot.manifest?.savedAt || new Date().toISOString(),
+    ready: true,
+  };
+  await db.prepare(`
+    UPDATE thread_discoveries
+    SET criteria = ?
+    WHERE canonical_url = ?
+  `).run(JSON.stringify(criteria), canonicalUrl);
 }
 
 async function downloadYouTubeVideo(url) {
@@ -18022,7 +18502,8 @@ function isDiscoveryPlaceholderText(value) {
 
 function isDiscoveryFailureLabel(value) {
   const text = String(value || "").trim();
-  return /^(Threads 수집 시간 초과|미디어 없음|예약 실패|예약실패|Threads 수집 실패|수집 중|\(본문 없음\))$/.test(text);
+  return /^(Threads 수집 시간 초과|미디어 없음|예약 실패|예약실패|Threads 수집 실패|수집 중|\(본문 없음\))$/.test(text)
+    || isThreadsInvalidPageText(text);
 }
 
 function discoveryFailurePreviewText(error, kind = "detail") {
@@ -18266,7 +18747,12 @@ async function addThreadToDiscoveryReview(url, options = {}) {
   const canonicalUrl = validateThreadsUrl(url);
   const post = await extractThreadPost(canonicalUrl, { allowEmptyText: true });
   const author = new URL(canonicalUrl).pathname.split("/")[1].replace("@", "");
-  const textPreview = String(options.text || post.text || "").trim() || "(본문 없음)";
+  const incomingText = String(options.text || "").trim();
+  const textPreview = (
+    incomingText && !isDiscoveryFailureLabel(incomingText)
+      ? incomingText
+      : String(post.text || "").trim()
+  ) || "(본문 없음)";
   const allowTextOnly = options.allowTextOnly === true && !isDiscoveryPlaceholderText(textPreview);
   if (post.mediaUrls.length <= 0 && !allowTextOnly) {
     const error = new Error("Threads 원글에서 미디어를 찾지 못해 대시보드에 추가하지 않았습니다.");
@@ -18300,6 +18786,28 @@ async function addThreadToDiscoveryReview(url, options = {}) {
     likeCount,
     mediaCount: post.mediaUrls.length,
   }, post);
+  let mediaSnapshotMeta = null;
+  try {
+    const snapshot = await saveDiscoveryMediaSnapshot(canonicalUrl, {
+      ...post,
+      text: textPreview === "(본문 없음)" ? (post.text || "") : textPreview,
+      url: canonicalUrl,
+    });
+    if (snapshot?.ready) {
+      mediaSnapshotMeta = {
+        key: discoveryMediaSnapshotKey(canonicalUrl),
+        fileCount: snapshot.files.length,
+        mediaCount: Number(snapshot.expectedMedia || post.mediaUrls.length || 0),
+        savedAt: snapshot.manifest?.savedAt || new Date().toISOString(),
+        ready: true,
+      };
+    }
+  } catch (error) {
+    logEvent("discovery_media_snapshot_save_error", {
+      canonicalUrl,
+      error: error.message,
+    });
+  }
   const saved = await saveDiscoveryCandidates([{
     canonicalUrl,
     author,
@@ -18319,6 +18827,7 @@ async function addThreadToDiscoveryReview(url, options = {}) {
       strongMedia: assessment.hasStrongMedia,
       controversy: assessment.hasControversy,
       reasons: assessment.reasons,
+      ...(mediaSnapshotMeta ? { mediaSnapshot: mediaSnapshotMeta } : {}),
     }),
   }]);
   logEvent("share_added_to_discovery", {
@@ -18327,6 +18836,7 @@ async function addThreadToDiscoveryReview(url, options = {}) {
     likeCount,
     mediaCount: post.mediaUrls.length,
     textOnly: post.mediaUrls.length === 0,
+    mediaSnapshotReady: Boolean(mediaSnapshotMeta?.ready),
     ...saved,
   });
   const thumbnailSource = post.imageMediaUrls?.[0]
@@ -18350,6 +18860,7 @@ async function addThreadToDiscoveryReview(url, options = {}) {
       ...post,
       url: canonicalUrl,
     },
+    mediaSnapshot: mediaSnapshotMeta,
     saved,
     message: "대시보드에 추가됨",
   };
@@ -18607,6 +19118,7 @@ async function markDiscoveryPosted(canonicalUrl, mediaCount) {
     SET status = 'posted', posted_at = CURRENT_TIMESTAMP, last_error = NULL, media_count = MAX(media_count, ?)
     WHERE canonical_url = ?
   `).run(mediaCount || 0, canonicalUrl);
+  cleanupDiscoveryMediaSnapshot(canonicalUrl, { reason: "posted" });
 }
 
 async function markDiscoveryPostFailed(canonicalUrl, error) {
@@ -18660,6 +19172,8 @@ async function markDiscoveryScheduled(canonicalUrl, mediaCount, scheduledAt) {
         last_error = NULL, media_count = MAX(media_count, ?)
     WHERE canonical_url = ?
   `).run(scheduledAt || null, mediaCount || 0, canonicalUrl);
+  // Schedule success is the durable completion for auto-schedule retries.
+  cleanupDiscoveryMediaSnapshot(canonicalUrl, { reason: "scheduled" });
 }
 
 async function markDiscoveryScheduleQueueState(canonicalUrl, status) {
@@ -18810,17 +19324,75 @@ async function discardDiscoveredRows() {
 async function discardDiscoveryRow(canonicalUrl) {
   const url = normalizeDiscoveryUrl(canonicalUrl);
   const db = await getDiscoveryDb();
-  const result = await db.prepare(`
-    UPDATE thread_discoveries
-    SET status = 'skipped', last_error = 'discarded_by_user', discovered_at = CURRENT_TIMESTAMP
+  const nowMs = Date.now();
+  const row = await db.prepare(`
+    SELECT canonical_url AS canonicalUrl, status,
+      scheduled_post_at AS scheduledPostAt, posted_at AS postedAt
+    FROM thread_discoveries
     WHERE canonical_url = ?
-      AND status IN ('review', 'draft', 'failed', 'failed_post', 'failed_draft', 'failed_schedule', 'discovered')
-  `).run(url);
-  if (!result.changes) {
+  `).get(url);
+  const historyEntries = loadMirrorHistory().filter((item) => item?.canonicalUrl === url);
+  const historyPublished = historyEntries.some((entry) => Boolean(mirrorHistoryPublishedTime(entry, nowMs)));
+  const rowPublished = Boolean(row && (
+    row.status === "posted"
+    || row.status === "x_draft"
+    || isPublishedDiscoveryRow(row, nowMs)
+  ));
+  const isPublished = rowPublished || historyPublished;
+
+  if (row?.status === "scheduled" && !isPublishedDiscoveryRow(row, nowMs) && !historyPublished) {
+    throw new Error("예약 중인 항목은 예약 취소로 처리하세요.");
+  }
+
+  const discardableReviewStatuses = new Set([
+    "review",
+    "draft",
+    "failed",
+    "failed_post",
+    "failed_draft",
+    "failed_schedule",
+    "discovered",
+  ]);
+  const canUpdateDb = Boolean(row && row.status !== "skipped" && (
+    isPublished || discardableReviewStatuses.has(row.status)
+  ));
+
+  let discardedDb = 0;
+  if (canUpdateDb) {
+    const lastError = isPublished ? "discarded_posted_by_user" : "discarded_by_user";
+    const result = await db.prepare(`
+      UPDATE thread_discoveries
+      SET status = 'skipped',
+          last_error = ?,
+          scheduled_post_at = CASE WHEN ? = 1 THEN NULL ELSE scheduled_post_at END,
+          posted_at = CASE WHEN ? = 1 THEN NULL ELSE posted_at END,
+          discovered_at = CURRENT_TIMESTAMP
+      WHERE canonical_url = ?
+        AND status != 'skipped'
+    `).run(lastError, isPublished ? 1 : 0, isPublished ? 1 : 0, url);
+    discardedDb = result.changes || 0;
+  }
+
+  const historyRemoved = historyEntries.length;
+  if (historyRemoved) removeCompletedMirror(url);
+  cleanupDiscoveryMediaSnapshot(url, { reason: "discarded" });
+
+  if (!discardedDb && !historyRemoved) {
     throw new Error("삭제할 수 있는 대시보드 항목을 찾지 못했습니다.");
   }
-  logEvent("discovery_row_discarded", { canonicalUrl: url });
-  return { canonicalUrl: url, discarded: result.changes || 0 };
+
+  logEvent(isPublished ? "discovery_posted_row_discarded" : "discovery_row_discarded", {
+    canonicalUrl: url,
+    discarded: discardedDb,
+    historyRemoved,
+    previousStatus: row?.status || null,
+  });
+  return {
+    canonicalUrl: url,
+    discarded: discardedDb,
+    historyRemoved,
+    posted: isPublished,
+  };
 }
 
 async function updateDiscoveryTitle(canonicalUrl, text) {
@@ -21052,24 +21624,48 @@ async function mirrorThread(url, options = {}) {
     schedule: Boolean(options.schedule),
     requestedScheduledAt: requestedScheduledAt?.toISOString(),
   });
+  const localSnapshot = loadDiscoveryMediaSnapshot(canonicalUrl);
   const collectedSnapshot = threadPostSnapshotForMirror(canonicalUrl, options.threadPostSnapshot);
-  const threadPost = collectedSnapshot || await extractThreadPost(canonicalUrl, {
-    allowEmptyText: true,
-  });
-  if (collectedSnapshot) {
-    logEvent("thread_collection_snapshot_reused", {
+  let threadPost = null;
+  let usedLocalSnapshot = false;
+  if (localSnapshot?.ready) {
+    threadPost = {
+      ...localSnapshot.threadPost,
+      text: String(
+        (options.textOverride && !isDiscoveryFailureLabel(options.textOverride)
+          ? cleanThreadTextOverride(options.textOverride)
+          : localSnapshot.threadPost.text)
+        || "",
+      ),
+    };
+    usedLocalSnapshot = true;
+    logEvent("thread_local_media_snapshot_reused", {
       canonicalUrl,
-      mediaCount: threadPost.mediaUrls.length,
+      mediaCount: localSnapshot.files.length,
       source: options.source || null,
     });
+  } else {
+    threadPost = collectedSnapshot || await extractThreadPost(canonicalUrl, {
+      allowEmptyText: true,
+    });
+    if (collectedSnapshot) {
+      logEvent("thread_collection_snapshot_reused", {
+        canonicalUrl,
+        mediaCount: threadPost.mediaUrls.length,
+        source: options.source || null,
+      });
+    }
   }
   logEvent("thread_extracted", {
     canonicalUrl,
     textPreview: threadPost.text.slice(0, 120),
-    mediaCount: threadPost.mediaUrls.length,
+    mediaCount: usedLocalSnapshot
+      ? localSnapshot.files.length
+      : threadPost.mediaUrls.length,
     diagnostics: threadPost.diagnostics,
+    usedLocalSnapshot,
   });
-  if (isThreadsMediaRegression(options.expectedMediaCount, threadPost.mediaUrls.length)) {
+  if (!usedLocalSnapshot && isThreadsMediaRegression(options.expectedMediaCount, threadPost.mediaUrls.length)) {
     logEvent("threads_media_regression_blocked", {
       canonicalUrl,
       expectedMediaCount: Number(options.expectedMediaCount || 0),
@@ -21080,10 +21676,11 @@ async function mirrorThread(url, options = {}) {
       `Threads 미디어 재추출 결과가 ${Number(options.expectedMediaCount || 0)}개에서 0개로 감소해 게시를 중단했습니다. 원문 미디어를 다시 확인한 뒤 재시도합니다.`
     );
   }
-  if ((threadPost.diagnostics?.mediaCandidateCount || 0) > 0 && threadPost.mediaUrls.length === 0) {
+  if (!usedLocalSnapshot && (threadPost.diagnostics?.mediaCandidateCount || 0) > 0 && threadPost.mediaUrls.length === 0) {
     throw new Error("Threads 원글에서 미디어 후보를 발견했지만 첨부 대상으로 확정하지 못해 게시를 중단했습니다.");
   }
-  if (!String(threadPost.text || "").trim() && threadPost.mediaUrls.length === 0) {
+  if (!String(threadPost.text || "").trim()
+    && !(usedLocalSnapshot ? localSnapshot.files.length : threadPost.mediaUrls.length)) {
     throw new Error("Threads 원글에서 본문과 미디어를 모두 찾지 못해 게시를 중단했습니다.");
   }
   if (options.textOverride && String(options.textOverride).trim() && !isDiscoveryFailureLabel(options.textOverride)) {
@@ -21092,19 +21689,54 @@ async function mirrorThread(url, options = {}) {
   if (options.schedule) {
     logEvent("schedule_media_strategy", {
       canonicalUrl,
-      reason: "keep_original_media_for_x_scheduled_post",
-      mediaCount: threadPost.mediaUrls.length,
+      reason: usedLocalSnapshot
+        ? "use_local_discovery_media_snapshot"
+        : "keep_original_media_for_x_scheduled_post",
+      mediaCount: usedLocalSnapshot ? localSnapshot.files.length : threadPost.mediaUrls.length,
       videoCount: threadPost.videoMediaUrls?.length || 0,
-      imageCount: threadPost.imageMediaUrls.length,
+      imageCount: threadPost.imageMediaUrls?.length || 0,
     });
   }
-  const media = await downloadMedia(threadPost.mediaUrls);
-  try {
-    logEvent("media_downloaded", {
+  // Prefer durable local files. Fall back to temp download from remote URLs.
+  let media = null;
+  let durableLocal = false;
+  if (usedLocalSnapshot && localSnapshot.files.length) {
+    media = { dir: null, files: localSnapshot.files, durable: true };
+    durableLocal = true;
+    logEvent("media_loaded_from_local_snapshot", {
       canonicalUrl,
-      downloadedCount: media.files.length,
-      files: media.files.map((file) => path.basename(file)),
+      downloadedCount: localSnapshot.files.length,
+      files: localSnapshot.files.map((file) => path.basename(file)),
     });
+  } else {
+    if (!usedLocalSnapshot && (threadPost.mediaUrls || []).length) {
+      try {
+        await saveDiscoveryMediaSnapshot(canonicalUrl, threadPost);
+      } catch (error) {
+        logEvent("discovery_media_snapshot_save_error", {
+          canonicalUrl,
+          error: error.message,
+          stage: "pre_mirror",
+        });
+      }
+      const refreshed = loadDiscoveryMediaSnapshot(canonicalUrl);
+      if (refreshed?.ready && refreshed.files.length) {
+        media = { dir: null, files: refreshed.files, durable: true };
+        durableLocal = true;
+      }
+    }
+    if (!media) {
+      media = await downloadMedia(threadPost.mediaUrls);
+    }
+  }
+  try {
+    if (!durableLocal) {
+      logEvent("media_downloaded", {
+        canonicalUrl,
+        downloadedCount: media.files.length,
+        files: media.files.map((file) => path.basename(file)),
+      });
+    }
     const postResult = await postToX(threadPost, media.files, {
       schedule: Boolean(options.schedule),
       scheduledAt: requestedScheduledAt,
@@ -21116,6 +21748,12 @@ async function mirrorThread(url, options = {}) {
       postUrl: postResult.postUrl || null,
       mediaCount: media.files.length,
     });
+    // markDiscoveryScheduled/Posted also clean, but immediate posts may only hit recordCompletedMirror.
+    if (postResult.scheduledAt || postResult.postUrl || !options.schedule) {
+      cleanupDiscoveryMediaSnapshot(canonicalUrl, {
+        reason: postResult.scheduledAt ? "scheduled" : "posted",
+      });
+    }
     logEvent("mirror_success", { canonicalUrl, mediaCount: media.files.length, scheduledAt: postResult.scheduledAt?.toISOString() });
     return {
       canonicalUrl,
@@ -21124,8 +21762,10 @@ async function mirrorThread(url, options = {}) {
       message: postResult.scheduledAt ? `X 예약됨 · ${postResult.scheduledAt.toLocaleString("ko-KR")}` : "X 게시됨",
     };
   } finally {
-    cleanupMediaTempDir(media.dir);
-    logEvent("cleanup_done", { canonicalUrl, dir: media.dir });
+    if (!durableLocal) {
+      cleanupMediaTempDir(media.dir);
+      logEvent("cleanup_done", { canonicalUrl, dir: media.dir });
+    }
   }
 }
 
@@ -21444,10 +22084,41 @@ function isThreadsMediaRegression(expectedMediaCount, extractedMediaCount) {
 
 function isThreadsInvalidPageText(value) {
   const text = String(value || "").replace(/\s+/g, " ").trim();
-  return /이 페이지는 길을 잃었습니다/i.test(text)
+  if (!text) return false;
+  const missingPage = /이 페이지는 길을 잃었습니다/i.test(text)
     || /링크가 작동하지 않거나 페이지가 존재하지 않습니다/i.test(text)
     || /page (?:isn't|is not) available/i.test(text)
     || /this page (?:isn't|is not) available/i.test(text);
+  const transientError = /문제가 발생했습니다/i.test(text)
+    || /나중에 다시 시도해보세요/i.test(text)
+    || /something went wrong/i.test(text)
+    || /try reloading/i.test(text)
+    || /try again later/i.test(text);
+  const errorChrome = /threads 약관|threads terms/i.test(text)
+    || /개인정보처리방침|쿠키 정책|privacy policy|cookies? policy/i.test(text)
+    || /©\s*\d{4}/i.test(text);
+  const legalFooter = /threads 약관|threads terms/i.test(text)
+    && /개인정보처리방침|쿠키 정책|privacy policy|cookies? policy/i.test(text);
+  return missingPage || legalFooter || (transientError && errorChrome);
+}
+
+function threadsInvalidPageError(value) {
+  const text = String(value || "");
+  if (/이 페이지는 길을 잃었습니다|링크가 작동하지 않거나|page (?:isn't|is not) available/i.test(text)) {
+    return "Threads 원문이 삭제·비공개·잘못된 링크 상태라 미디어와 본문을 신뢰할 수 없습니다.";
+  }
+  return "Threads 페이지가 오류 상태라 미디어와 본문을 신뢰할 수 없습니다.";
+}
+
+function isThreadsUnusableExtraction(diagnostics = {}, mediaUrls = [], embeddedCaption = "", text = "") {
+  if (Array.isArray(mediaUrls) && mediaUrls.length > 0) return false;
+  const caption = String(embeddedCaption || "").trim();
+  if (caption && !isThreadsInvalidPageText(caption)) return false;
+  const cleaned = String(text || "").trim();
+  if (cleaned && !isThreadsInvalidPageText(cleaned) && diagnostics?.targetArticleFound === true && diagnostics?.handleFound === true) {
+    return false;
+  }
+  return diagnostics?.targetArticleFound === false && diagnostics?.handleFound === false;
 }
 
 function isDiscoveryAutoScheduleSource(source) {
@@ -21518,7 +22189,7 @@ function discoveryScheduleRetryDecision(row = {}, nowMs = Date.now(), options = 
   if (/로그인|계정 확인|required X account|올바른 X 계정|권한|접근 제한|account verification/i.test(error)) {
     return { retry: false, reason: "account_constraint", ageMs };
   }
-  if (/본문과 미디어를 모두 찾지 못|미디어 후보.*확정하지 못|원문 미디어.*확인하지 못|첨부.*없|지원하지 않는|잘못된 URL|invalid URL|제외 키워드/i.test(error)) {
+  if (/본문과 미디어를 모두 찾지 못|미디어 후보.*확정하지 못|원문 미디어.*확인하지 못|첨부.*없|지원하지 않는|잘못된 URL|invalid URL|제외 키워드|삭제·비공개|잘못된 링크 상태|미디어를 찾지 못해|미디어 재추출 결과가 .*0개로 감소/i.test(error)) {
     return { retry: false, reason: "content_constraint", ageMs };
   }
   if (/이미 .*게시|이미 .*예약|duplicate/i.test(error)) {
@@ -21684,7 +22355,32 @@ async function processDiscoveryAutoScheduleJob(canonicalUrl, source, text) {
   }
   logEvent("discovery_auto_schedule_async_start", { canonicalUrl, source });
   const previous = await getDiscoveryRow(canonicalUrl);
-  const detail = await addSourceToDiscoveryReview(canonicalUrl, { text: safeText, allowTextOnly: true });
+  const localSnapshot = loadDiscoveryMediaSnapshot(canonicalUrl);
+  let detail = null;
+  if (localSnapshot?.ready && !isThreadsInvalidPageText(localSnapshot.threadPost?.text)) {
+    detail = {
+      canonicalUrl,
+      likeCount: Number(previous?.likeCount || localSnapshot.manifest?.likeCount || 0),
+      mediaCount: localSnapshot.files.length || Number(localSnapshot.expectedMedia || 0),
+      threadPostSnapshot: localSnapshot.threadPost,
+      fromLocalSnapshot: true,
+      saved: { inserted: 0, updated: 0 },
+      message: "로컬 미디어 스냅샷 재사용",
+    };
+    logEvent("discovery_auto_schedule_local_snapshot_hit", {
+      canonicalUrl,
+      source,
+      mediaCount: detail.mediaCount,
+      textLength: String(localSnapshot.threadPost?.text || "").length,
+    });
+  } else {
+    try {
+      detail = await addSourceToDiscoveryReview(canonicalUrl, { text: safeText, allowTextOnly: true });
+    } catch (error) {
+      // If live Threads fetch fails but we somehow have partial local data later, rethrow.
+      throw error;
+    }
+  }
   if (detail.skipped) {
     logEvent("discovery_auto_schedule_async_skipped", {
       canonicalUrl,
@@ -21694,7 +22390,7 @@ async function processDiscoveryAutoScheduleJob(canonicalUrl, source, text) {
     });
     return { skipped: true, detail };
   }
-  if (isThreadsMediaRegression(previous?.mediaCount, detail.mediaCount)) {
+  if (!detail.fromLocalSnapshot && isThreadsMediaRegression(previous?.mediaCount, detail.mediaCount)) {
     logEvent("threads_media_regression_blocked", {
       canonicalUrl,
       source,
@@ -21708,7 +22404,7 @@ async function processDiscoveryAutoScheduleJob(canonicalUrl, source, text) {
   }
   await markDiscoveryScheduleQueueState(canonicalUrl, "scheduling");
   const result = await runDiscoveryAutoSchedule(canonicalUrl, {
-    text: safeText,
+    text: safeText || detail.threadPostSnapshot?.text || previous?.textPreview || "",
     source,
     threadPostSnapshot: detail.threadPostSnapshot || null,
     waitForBusy: true,
@@ -21718,6 +22414,7 @@ async function processDiscoveryAutoScheduleJob(canonicalUrl, source, text) {
     source,
     scheduledAt: result.scheduledAt || null,
     mediaCount: result.mediaCount,
+    fromLocalSnapshot: Boolean(detail.fromLocalSnapshot),
   });
   return { skipped: false, detail, result };
 }
@@ -23253,6 +23950,84 @@ async function futureScheduledDiscoveryRows() {
     }));
 }
 
+function parseScheduledAtFromDiscoveryError(errorText = "") {
+  const match = String(errorText || "").match(/"scheduledAt"\s*:\s*"([^"]+)"/);
+  if (!match) return null;
+  const time = new Date(match[1]).getTime();
+  return Number.isFinite(time) ? new Date(time).toISOString() : null;
+}
+
+async function failedScheduleReconcileCandidates(nowMs = Date.now()) {
+  const db = await getDiscoveryDb();
+  const rows = await db.prepare(`
+    SELECT canonical_url AS canonicalUrl, text_preview AS textPreview,
+      media_count AS mediaCount, last_error AS lastError, status,
+      scheduled_post_at AS scheduledPostAt, discovered_at AS discoveredAt
+    FROM thread_discoveries
+    WHERE status IN ('failed_schedule', 'scheduling', 'queued_schedule')
+    ORDER BY discovered_at DESC
+    LIMIT 50
+  `).all();
+  const out = [];
+  for (const row of rows || []) {
+    const slot = findScheduleSlotForCanonicalUrl(row.canonicalUrl);
+    const scheduledAt = row.scheduledPostAt
+      || slot?.scheduledAt
+      || parseScheduledAtFromDiscoveryError(row.lastError)
+      || null;
+    const time = new Date(scheduledAt || 0).getTime();
+    if (!Number.isFinite(time) || time <= nowMs) continue;
+    out.push({
+      canonicalUrl: row.canonicalUrl,
+      status: row.status,
+      scheduledAt: new Date(time).toISOString(),
+      mediaCount: Number(row.mediaCount || 0),
+      textPreview: isDiscoveryPlaceholderText(row.textPreview) || isDiscoveryFailureLabel(row.textPreview)
+        ? ""
+        : row.textPreview,
+      lastError: row.lastError || null,
+    });
+  }
+  return out;
+}
+
+async function reconcileDiscoveryRowFromXSchedule(expected, actualEntries = []) {
+  const entry = findXScheduledEntry(actualEntries, expected.scheduledAt, expected);
+  const assessment = assessXScheduledEntry({
+    textPreview: expected.textPreview || "",
+    mediaCount: Number(expected.mediaCount || 0),
+  }, entry);
+  if (assessment.status !== "ok") {
+    return { ok: false, assessment, entry: entry || null };
+  }
+  recordCompletedMirror({
+    canonicalUrl: expected.canonicalUrl,
+    status: "scheduled",
+    scheduledAt: expected.scheduledAt,
+    postUrl: null,
+    mediaCount: Number(expected.mediaCount || 0),
+  });
+  await markDiscoveryScheduled(
+    expected.canonicalUrl,
+    Number(expected.mediaCount || 0),
+    expected.scheduledAt,
+  );
+  if (expected.scheduledAt) {
+    recordScheduleSlot(new Date(expected.scheduledAt), {
+      canonicalUrl: expected.canonicalUrl,
+      state: "verified",
+      source: "x_schedule_monitor_reconcile",
+    });
+  }
+  logEvent("x_schedule_monitor_failed_row_reconciled", {
+    canonicalUrl: expected.canonicalUrl,
+    scheduledAt: expected.scheduledAt,
+    previousStatus: expected.status || null,
+    mediaCount: Number(expected.mediaCount || 0),
+  });
+  return { ok: true, assessment, entry: entry || null };
+}
+
 async function recoverMissingXScheduledPost(canonicalUrl) {
   const url = normalizeDiscoveryUrl(canonicalUrl);
   const row = await getDiscoveryRow(url);
@@ -23351,7 +24126,6 @@ async function confirmExistingXScheduledPost(canonicalUrl, scheduledAtValue) {
 }
 
 async function runXScheduleMonitor(options = {}) {
-  return { ok: true, skipped: true, status: "disabled", reason: "disabled_by_user" };
   const globalBackoff = terafabxGlobalXBackoff();
   if (globalBackoff.active && ["startup", "timer"].includes(options.source || "timer")) {
     logEvent("x_schedule_monitor_skipped", { reason: "x_global_backoff", source: options.source || "timer", retryAt: globalBackoff.retryAt });
@@ -23371,6 +24145,7 @@ async function runXScheduleMonitor(options = {}) {
   try {
     return await withTerafabxCommentXLock("x_schedule_monitor", async () => {
       const expectedRows = await futureScheduledDiscoveryRows();
+      const reconcileCandidates = await failedScheduleReconcileCandidates();
       const browserConfig = xScheduleMonitorBrowserConfig();
       let page = null;
       try {
@@ -23384,6 +24159,26 @@ async function runXScheduleMonitor(options = {}) {
         let actualEntries = await readXScheduledEntries(page);
         const anomalies = [];
         const repairs = [];
+        const reconciled = [];
+        // X is source of truth: promote failed/queued schedule rows already visible on X.
+        for (const candidate of reconcileCandidates) {
+          try {
+            const result = await reconcileDiscoveryRowFromXSchedule(candidate, actualEntries);
+            if (result.ok) {
+              reconciled.push({
+                canonicalUrl: candidate.canonicalUrl,
+                scheduledAt: candidate.scheduledAt,
+                previousStatus: candidate.status || null,
+              });
+            }
+          } catch (error) {
+            logEvent("x_schedule_monitor_failed_row_reconcile_error", {
+              canonicalUrl: candidate.canonicalUrl,
+              scheduledAt: candidate.scheduledAt,
+              error: error.message,
+            });
+          }
+        }
         for (const expected of expectedRows) {
           let entry = findXScheduledEntry(actualEntries, expected.scheduledAt, expected);
           let assessment = assessXScheduledEntry(expected, entry);
@@ -23415,16 +24210,23 @@ async function runXScheduleMonitor(options = {}) {
             });
           }
         }
-        const status = anomalies.length ? "degraded" : repairs.length ? "repaired" : "ok";
+        const status = anomalies.length
+          ? "degraded"
+          : (repairs.length || reconciled.length)
+            ? "repaired"
+            : "ok";
         const result = {
           ok: anomalies.length === 0,
           status,
           checkedCount: expectedRows.length,
+          reconcileCandidateCount: reconcileCandidates.length,
+          reconciledCount: reconciled.length,
           actualCount: actualEntries.length,
           anomalyCount: anomalies.length,
           repairedCount: repairs.length,
           anomalies: anomalies.slice(0, 20),
           repairs: repairs.slice(0, 20),
+          reconciled: reconciled.slice(0, 20),
           expectedSlots: expectedRows.map((row) => ({
             canonicalUrl: row.canonicalUrl,
             scheduledAt: row.scheduledAt,
@@ -23433,6 +24235,7 @@ async function runXScheduleMonitor(options = {}) {
           startedAt,
           completedAt: new Date().toISOString(),
           source: options.source || "timer",
+          intervalMs: X_SCHEDULE_MONITOR_INTERVAL_MS,
         };
         saveXScheduleMonitorState({
           lastRunAt: result.completedAt,
@@ -23442,8 +24245,10 @@ async function runXScheduleMonitor(options = {}) {
           actualCount: result.actualCount,
           anomalyCount: result.anomalyCount,
           repairedCount: result.repairedCount,
+          reconciledCount: result.reconciledCount,
           anomalies: result.anomalies,
           repairs: result.repairs,
+          reconciled: result.reconciled,
         });
         logEvent("x_schedule_monitor_complete", result);
         const persistentMissing = result.anomalies.filter((item) =>
@@ -23642,6 +24447,7 @@ function startBackgroundWorkAfterBrowserCleanup() {
         removed: result.removed.map((item) => ({ ...item, dir: path.basename(item.dir) })),
       });
     }
+    cleanupExpiredDiscoveryMediaSnapshots();
   }, MEDIA_TEMP_CLEANUP_INTERVAL_MS);
 }
 
@@ -23653,6 +24459,7 @@ function startBackgroundWork() {
     ...mediaCleanup,
     removed: mediaCleanup.removed.map((item) => ({ ...item, dir: path.basename(item.dir) })),
   });
+  cleanupExpiredDiscoveryMediaSnapshots({ reason: "startup" });
   cleanupOwnedTerafabxGrokBrowserProfiles("startup")
     .then(() => cleanupKnownTerafabxGrokWebSessions("startup"))
     .catch((error) => {
@@ -23713,12 +24520,19 @@ module.exports = {
   TERAFABX_GROK_WEB_URL,
   TERAFABX_GROK_CONTEXT_MODE,
   MEDIA_TEMP_PREFIXES,
+  DISCOVERY_MEDIA_SNAPSHOT_DIR,
   createMediaTempDir,
   cleanupMediaTempDir,
   cleanupOrphanedMediaTempDirs,
   isVideoMediaUrl,
   discoveryThumbnailCachePath,
   downloadMedia,
+  discoveryMediaSnapshotKey,
+  discoveryMediaSnapshotDir,
+  loadDiscoveryMediaSnapshot,
+  saveDiscoveryMediaSnapshot,
+  cleanupDiscoveryMediaSnapshot,
+  cleanupExpiredDiscoveryMediaSnapshots,
   cleanThreadText,
   cleanThreadTextOverride,
   classifyThreadSocialLine,
@@ -23732,6 +24546,7 @@ module.exports = {
   DuplicateMirrorError,
   isPublishedDiscoveryRow,
   mergeDiscoveryRowsWithMirrorHistory,
+  removeCompletedMirror,
   buildTerafabxOwnPostReplyCompletionMetrics,
   enrichDiscoveryRowsWithReplyCompletion,
   buildTerafabxOwnPostReplyCoverageRecord,
@@ -23832,6 +24647,11 @@ module.exports = {
   isTerafabxConversationRootUnavailableError,
   normalizeTerafabxOwnPostUnavailableRoots,
   markTerafabxOwnPostUnavailableRoot,
+  clearTerafabxOwnPostUnavailableRoot,
+  isTerafabxOwnPostRootUnavailable,
+  terafabxOwnPostConversationAllowed,
+  applyTerafabxOwnPostStatusOnlyReplyCount,
+  collectTerafabxOwnPostCoverageReopenRoots,
   normalizeTerafabxOwnPostCoverageBacklog,
   rankTerafabxOwnPostCoverageBacklog,
   selectTerafabxOwnPostCoveragePhase,
@@ -23907,6 +24727,9 @@ module.exports = {
   selectRootPostMediaCandidates,
   selectThreadSourceText,
   shouldAutoRecoverXScheduledAnomaly,
+  parseScheduledAtFromDiscoveryError,
+  failedScheduleReconcileCandidates,
+  runXScheduleMonitor,
   assessXScheduledEntry,
   scheduledVerificationAttemptDisposition,
   findXScheduledEntry,
@@ -23940,6 +24763,9 @@ module.exports = {
   discoveryScheduleRetryDecision,
   isThreadsMediaRegression,
   isThreadsInvalidPageText,
+  isThreadsUnusableExtraction,
+  threadsInvalidPageError,
+  isDiscoveryFailureLabel,
   runDiscoveryScheduleRecovery,
   shouldMarkDiscoveryScheduleFailed,
   shouldReleaseReservedScheduleSlot,
