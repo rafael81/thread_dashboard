@@ -11,6 +11,8 @@ const {
   normalizeCanonicalThreadsUrl,
   resolveThreadsSharedUrl,
 } = require("./lib/threads-shared-url");
+const homeVerifiedCommentLib = require("./lib/home-verified-comment");
+const homeVerifiedCommentPrompts = require("./lib/home-verified-comment-prompts");
 
 function loadDotEnvFile(filePath = path.join(__dirname, ".env")) {
   if (!fs.existsSync(filePath)) return;
@@ -113,8 +115,17 @@ const GROK_BIN = process.env.GROK_BIN || "/Users/user/.local/bin/grok";
 function resolveAgentBrowserBin(options = {}) {
   const configured = String(options.configured ?? process.env.AGENT_BROWSER_BIN ?? "").trim();
   if (configured) return configured;
-  const execPath = String(options.execPath || process.execPath || "");
   const existsSync = options.existsSync || fs.existsSync;
+  // npx --yes 는 버전 드리프트로 옵션 호환이 깨질 수 있음. Homebrew 고정 설치 우선.
+  const brewCandidates = [
+    "/opt/homebrew/opt/agent-browser/bin/agent-browser",
+    "/usr/local/opt/agent-browser/bin/agent-browser",
+    "/opt/homebrew/bin/agent-browser",
+  ];
+  for (const candidate of brewCandidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+  const execPath = String(options.execPath || process.execPath || "");
   const adjacentNpx = path.join(path.dirname(execPath), "npx");
   return adjacentNpx && existsSync(adjacentNpx) ? adjacentNpx : "npx";
 }
@@ -174,6 +185,54 @@ const TERAFABX_AUTO_COMMENT_WRITER_LOCK_PATH = process.env.TERAFABX_AUTO_COMMENT
 const TERAFABX_OWN_POST_REPLY_X_PORT = Number(process.env.TERAFABX_OWN_POST_REPLY_X_PORT || 9239);
 const TERAFABX_OWN_POST_REPLY_X_PROFILE_DIR = process.env.TERAFABX_OWN_POST_REPLY_X_PROFILE_DIR || path.join(__dirname, ".data", "chrome-profiles", "terafabx-own-post-reply-x");
 const TERAFABX_OWN_POST_REPLY_X_LOCK_PATH = process.env.TERAFABX_OWN_POST_REPLY_X_LOCK_PATH || path.join(os.tmpdir(), `terafabx-own-post-reply-x${TERAFABX_OWN_POST_REPLY_X_PORT}.lock`);
+/** following 합성 홈 인증 댓글: 일 목표 500 (환경변수로 조절) */
+const TERAFABX_HOME_VERIFIED_COMMENT_DAILY_TARGET = Math.max(
+  0,
+  Number(process.env.TERAFABX_HOME_VERIFIED_COMMENT_DAILY_TARGET || 500),
+);
+// 500/day ≈ 2.9분 간격(24h). prepare 사이클 2.5분, 게시 최소 갭 3분.
+const TERAFABX_HOME_VERIFIED_COMMENT_INTERVAL_MS = Math.max(
+  60_000,
+  Number(process.env.TERAFABX_HOME_VERIFIED_COMMENT_INTERVAL_MS || 150_000),
+);
+const TERAFABX_HOME_VERIFIED_COMMENT_BATCH_LIMIT = Math.max(
+  1,
+  Math.min(50, Number(process.env.TERAFABX_HOME_VERIFIED_COMMENT_BATCH_LIMIT || 12)),
+);
+// 500건 / 작성자 3 → 약 167명 필요.
+const TERAFABX_HOME_VERIFIED_COMMENT_AUTHOR_DAILY_LIMIT = Math.max(
+  1,
+  Number(process.env.TERAFABX_HOME_VERIFIED_COMMENT_AUTHOR_DAILY_LIMIT || 3),
+);
+const TERAFABX_HOME_VERIFIED_COMMENT_READY_BUFFER = Math.max(
+  5,
+  Number(process.env.TERAFABX_HOME_VERIFIED_COMMENT_READY_BUFFER || 40),
+);
+const TERAFABX_HOME_VERIFIED_COMMENT_DISCOVER_LIMIT = Math.max(
+  20,
+  Number(process.env.TERAFABX_HOME_VERIFIED_COMMENT_DISCOVER_LIMIT || 100),
+);
+const TERAFABX_HOME_VERIFIED_COMMENT_MIN_POST_GAP_MS = Math.max(
+  60_000,
+  Number(process.env.TERAFABX_HOME_VERIFIED_COMMENT_MIN_POST_GAP_MS || 3 * 60 * 1000),
+);
+const TERAFABX_HOME_VERIFIED_COMMENT_WRITE_QUEUE_PATH = process.env.TERAFABX_HOME_VERIFIED_COMMENT_WRITE_QUEUE_PATH
+  || path.join(__dirname, ".data", "terafabx-home-verified-comment-write-queue.json");
+const TERAFABX_HOME_VERIFIED_COMMENT_X_PORT = Number(process.env.TERAFABX_HOME_VERIFIED_COMMENT_X_PORT || 9340);
+const TERAFABX_HOME_VERIFIED_COMMENT_X_PROFILE_DIR = process.env.TERAFABX_HOME_VERIFIED_COMMENT_X_PROFILE_DIR
+  || path.join(__dirname, ".data", "chrome-profiles", "terafabx-home-verified-comment-x");
+const TERAFABX_HOME_VERIFIED_COMMENT_X_LOCK_PATH = process.env.TERAFABX_HOME_VERIFIED_COMMENT_X_LOCK_PATH
+  || path.join(os.tmpdir(), `terafabx-home-verified-comment-x${TERAFABX_HOME_VERIFIED_COMMENT_X_PORT}.lock`);
+const TERAFABX_HOME_VERIFIED_COMMENT_GEMINI_PORT_BASE = Number(process.env.TERAFABX_HOME_VERIFIED_COMMENT_GEMINI_PORT_BASE || 9374);
+const TERAFABX_HOME_VERIFIED_COMMENT_SOURCE = homeVerifiedCommentLib.SOURCE;
+/** 홈 원글 문맥+초안 1단계: gemini(기본, text-only) | web | cli */
+const TERAFABX_HOME_VERIFIED_CONTEXT_PROVIDER = String(
+  process.env.TERAFABX_HOME_VERIFIED_CONTEXT_PROVIDER || "gemini",
+).toLowerCase().trim();
+/** 후보 소스: fxtwitter following 합성 (홈 DOM 아님) */
+const TERAFABX_HOME_VERIFIED_DISCOVER_SOURCE = String(
+  process.env.TERAFABX_HOME_VERIFIED_DISCOVER_SOURCE || "fxtwitter-following",
+).trim();
 const TERAFABX_OWN_POST_REPLY_X_IDLE_TTL_MS = Math.max(60_000, Number(process.env.TERAFABX_OWN_POST_REPLY_X_IDLE_TTL_MS || 5 * 60 * 1000));
 const TERAFABX_OWN_POST_REPLY_X_BACKOFF_MS = Math.max(60_000, Number(process.env.TERAFABX_OWN_POST_REPLY_X_BACKOFF_MS || 10 * 60 * 1000));
 const TERAFABX_OWN_POST_REPLY_TARGET_DOM_MAX_RETRIES = Math.max(0, Number(process.env.TERAFABX_OWN_POST_REPLY_TARGET_DOM_MAX_RETRIES || 3));
@@ -273,6 +332,9 @@ let discoveryDbPromise = null;
 let terafabxBusy = false;
 let terafabxOwnPostReplyBusy = false;
 let terafabxOwnPostReplySchedulerBusy = false;
+let terafabxHomeVerifiedCommentBusy = false;
+let terafabxHomeVerifiedCommentSchedulerBusy = false;
+let terafabxHomeVerifiedCommentXWriterLastCompletedAtMs = 0;
 let terafabxOwnPostHeartBusy = false;
 let terafabxOwnPostHeartCancellationVersion = 0;
 let terafabxCommentPrefillBusy = false;
@@ -328,6 +390,8 @@ const terafabxOwnPostReplyXWriterQueue = createSerialTaskQueue();
 const terafabxOwnPostReplyWriteQueuedIds = new Set();
 let terafabxOwnPostReplyXWriterLastCompletedAtMs = 0;
 let terafabxOwnPostReplyXIdleCleanupTimer = null;
+const terafabxHomeVerifiedCommentXWriterQueue = createSerialTaskQueue();
+const terafabxHomeVerifiedCommentWriteQueuedIds = new Set();
 let scheduledReplyBusy = false;
 let xScheduleMonitorBusy = false;
 let terafabxCommentMonitorBusy = false;
@@ -1601,6 +1665,7 @@ function loadTerafabxState() {
     ownPostReplyCountRefreshLastSummary: null,
     ownPostReplyXWriteBackoffUntil: null,
     ownPostReplyXWriteBackoffError: null,
+    ...homeVerifiedCommentLib.defaultHomeVerifiedStateSlice(),
     ownPostHeartEnabled: false,
     ownPostHeartLastRunAt: null,
     ownPostHeartLastStatus: "idle",
@@ -1617,6 +1682,19 @@ function loadTerafabxState() {
   loaded.commentPrefillOnly = false;
   loaded.verifiedCommentReviewEnabled = false;
   loaded.ownPostReplyEnabled = false;
+  // 홈 인증 원글 자동댓글: 재시작 시 자동 게시 금지. 대시보드에서 명시 enable.
+  loaded.homeVerifiedCommentEnabled = false;
+  loaded.homeVerifiedCommentPrefillOnly = loaded.homeVerifiedCommentPrefillOnly !== false;
+  loaded.homeVerifiedCommentBacklog = homeVerifiedCommentLib.normalizeHomeVerifiedCandidateBacklog(
+    loaded.homeVerifiedCommentBacklog,
+    { normalizeXStatusUrl, parseXStatusUrl, requiredHandle: REQUIRED_X_HANDLE },
+  );
+  loaded.homeVerifiedCommentHistory = Array.isArray(loaded.homeVerifiedCommentHistory)
+    ? loaded.homeVerifiedCommentHistory.slice(0, 500)
+    : [];
+  loaded.homeVerifiedCommentSeenIds = Array.isArray(loaded.homeVerifiedCommentSeenIds)
+    ? loaded.homeVerifiedCommentSeenIds.slice(0, 5000)
+    : [];
   for (const key of [
     "todayPostReplyEnabled",
     "todayPostReplyManualRequested",
@@ -1824,6 +1902,1571 @@ function removeTerafabxOwnPostReplyWrite(id) {
   const next = rows.filter((row) => row.id !== id);
   if (next.length !== rows.length) saveTerafabxOwnPostReplyWriteQueue(next);
   return next.length !== rows.length;
+}
+
+function homeVerifiedCommentHelpers() {
+  return { normalizeXStatusUrl, parseXStatusUrl, cleanSocialText, requiredHandle: REQUIRED_X_HANDLE };
+}
+
+function normalizeTerafabxHomeVerifiedWriteQueue(value) {
+  return homeVerifiedCommentLib.normalizeHomeVerifiedWriteQueue(value, homeVerifiedCommentHelpers());
+}
+
+function loadTerafabxHomeVerifiedWriteQueue() {
+  return normalizeTerafabxHomeVerifiedWriteQueue(
+    readJsonFile(TERAFABX_HOME_VERIFIED_COMMENT_WRITE_QUEUE_PATH, []),
+  );
+}
+
+function saveTerafabxHomeVerifiedWriteQueue(rows) {
+  const normalized = normalizeTerafabxHomeVerifiedWriteQueue(rows);
+  writeJsonFile(TERAFABX_HOME_VERIFIED_COMMENT_WRITE_QUEUE_PATH, normalized);
+  return normalized;
+}
+
+function persistTerafabxHomeVerifiedWrite(record = {}) {
+  const rows = loadTerafabxHomeVerifiedWriteQueue();
+  const targetUrl = normalizeXStatusUrl(record?.target?.url || record.targetUrl || "");
+  const existingIndex = rows.findIndex((row) => row.targetUrl === targetUrl);
+  const nextRecord = normalizeTerafabxHomeVerifiedWriteQueue([{
+    ...(existingIndex >= 0 ? rows[existingIndex] : {}),
+    ...record,
+    id: record.id || (existingIndex >= 0 ? rows[existingIndex].id : `home-verified-write-${parseXStatusUrl(targetUrl)?.id || Date.now()}`),
+    targetUrl,
+    source: TERAFABX_HOME_VERIFIED_COMMENT_SOURCE,
+    stage: record.stage || "pending_post",
+    updatedAt: new Date().toISOString(),
+  }])[0];
+  if (!nextRecord) throw new Error("홈 인증 댓글 영속 큐 저장 실패");
+  if (existingIndex >= 0) rows[existingIndex] = nextRecord;
+  else rows.push(nextRecord);
+  saveTerafabxHomeVerifiedWriteQueue(rows);
+  return nextRecord;
+}
+
+function removeTerafabxHomeVerifiedWrite(id) {
+  const rows = loadTerafabxHomeVerifiedWriteQueue();
+  const next = rows.filter((row) => row.id !== id);
+  if (next.length !== rows.length) saveTerafabxHomeVerifiedWriteQueue(next);
+  return next.length !== rows.length;
+}
+
+/** 삭제/제한 타겟을 seen 에 넣어 재수집·재시도 루프를 끊는다 */
+function markTerafabxHomeVerifiedTargetDiscarded(targetUrl, meta = {}) {
+  const id = parseXStatusUrl(targetUrl)?.id;
+  if (!id) return { ok: false };
+  const state = loadTerafabxState();
+  const seen = Array.from(new Set([id, ...(state.homeVerifiedCommentSeenIds || [])])).slice(0, 5000);
+  saveTerafabxState({
+    homeVerifiedCommentSeenIds: seen,
+    homeVerifiedCommentLastDeadTargetDiscardAt: new Date().toISOString(),
+    homeVerifiedCommentLastDeadTargetDiscard: {
+      targetUrl: normalizeXStatusUrl(targetUrl),
+      id,
+      reason: meta.reason || null,
+      error: String(meta.error || "").slice(0, 400),
+      attempts: meta.attempts || null,
+      at: new Date().toISOString(),
+    },
+  });
+  return { ok: true, id };
+}
+
+/** 큐에 쌓인 영구 실패 타겟 일괄 폐기 (재시도 루프 청소) */
+function purgeHomeVerifiedDeadTargetPending(options = {}) {
+  const maxAttempts = Math.max(1, Number(options.maxAttempts || process.env.TERAFABX_HOME_VERIFIED_MAX_POST_ATTEMPTS || 5));
+  const rows = loadTerafabxHomeVerifiedWriteQueue();
+  const kept = [];
+  const purged = [];
+  for (const row of rows) {
+    const disposition = homeVerifiedCommentLib.homeVerifiedPostFailureDisposition(row.lastError || "", {
+      attempts: Math.max(0, Number(row.attempts || 0)),
+      maxAttempts,
+    });
+    // rate_limit 은 attempts 많아도 유지. disposition.discard 만 폐기.
+    if (disposition.discard) {
+      markTerafabxHomeVerifiedTargetDiscarded(row.targetUrl, {
+        reason: disposition.reason,
+        error: row.lastError,
+        attempts: row.attempts,
+      });
+      purged.push({
+        id: row.id,
+        targetUrl: row.targetUrl,
+        authorHandle: row.authorHandle,
+        reason: disposition.reason,
+        attempts: row.attempts,
+        lastError: String(row.lastError || "").slice(0, 200),
+      });
+      continue;
+    }
+    kept.push(row);
+  }
+  if (purged.length) {
+    saveTerafabxHomeVerifiedWriteQueue(kept);
+    logEvent("terafabx_home_verified_dead_target_purge", {
+      purged: purged.length,
+      remaining: kept.length,
+      sample: purged.slice(0, 12),
+    });
+  }
+  return {
+    purged: purged.length,
+    remaining: kept.length,
+    items: purged.slice(0, Number(options.sample || 30)),
+  };
+}
+
+function terafabxHomeVerifiedAlreadyHandled(state, targetUrl) {
+  const id = parseXStatusUrl(targetUrl)?.id;
+  if (!id) return true;
+  if ((state.homeVerifiedCommentSeenIds || []).includes(id)) return true;
+  if ((state.homeVerifiedCommentHistory || []).some((item) => parseXStatusUrl(item?.targetUrl || item?.url || "")?.id === id)) return true;
+  if ((state.commentHistory || []).some((item) => (
+    item?.source === TERAFABX_HOME_VERIFIED_COMMENT_SOURCE
+    && parseXStatusUrl(item?.targetUrl || item?.url || "")?.id === id
+  ))) return true;
+  if (loadTerafabxHomeVerifiedWriteQueue().some((row) => parseXStatusUrl(row.targetUrl || "")?.id === id)) return true;
+  return false;
+}
+
+function buildTerafabxHomeVerifiedCommentTarget(post) {
+  return homeVerifiedCommentLib.buildHomeVerifiedCommentTarget(post, homeVerifiedCommentHelpers());
+}
+
+function classifyTerafabxHomeVerifiedOriginalCandidate(raw, options = {}) {
+  return homeVerifiedCommentLib.classifyHomeVerifiedOriginalCandidate(raw, {
+    ...options,
+    helpers: homeVerifiedCommentHelpers(),
+    requiredHandle: REQUIRED_X_HANDLE,
+    // 공통 민감 주제 + 홈 전용 욕설/비난/논란 게이트
+    bannedRe: options.bannedRe || TERAFABX_COMMENT_TARGET_BANNED_RE,
+  });
+}
+
+function selectTerafabxHomeVerifiedOriginalCandidates(items, options = {}) {
+  return homeVerifiedCommentLib.selectHomeVerifiedOriginalCandidates(items, {
+    ...options,
+    helpers: homeVerifiedCommentHelpers(),
+    requiredHandle: REQUIRED_X_HANDLE,
+    bannedRe: options.bannedRe || TERAFABX_COMMENT_TARGET_BANNED_RE,
+  });
+}
+
+function ingestTerafabxHomeVerifiedCandidates(items = [], options = {}) {
+  const state = loadTerafabxState();
+  const seenIds = new Set([
+    ...(state.homeVerifiedCommentSeenIds || []),
+    ...((state.homeVerifiedCommentHistory || []).map((item) => parseXStatusUrl(item?.targetUrl || "")?.id).filter(Boolean)),
+  ]);
+  const { selected, rejected } = selectTerafabxHomeVerifiedOriginalCandidates(items, {
+    seenIds,
+    limit: Number(options.limit || TERAFABX_HOME_VERIFIED_COMMENT_BATCH_LIMIT * 4),
+  });
+  const existing = homeVerifiedCommentLib.normalizeHomeVerifiedCandidateBacklog(
+    state.homeVerifiedCommentBacklog,
+    homeVerifiedCommentHelpers(),
+  );
+  const byId = new Map(existing.map((item) => [item.id, item]));
+  for (const post of selected) {
+    if (terafabxHomeVerifiedAlreadyHandled(state, post.url)) continue;
+    byId.set(post.id, { ...post, discoveredAt: new Date().toISOString(), stage: "candidate", source: TERAFABX_HOME_VERIFIED_COMMENT_SOURCE });
+  }
+  const backlog = Array.from(byId.values()).slice(0, 200);
+  saveTerafabxState({ homeVerifiedCommentBacklog: backlog });
+  logEvent("terafabx_home_verified_candidates_ingested", {
+    input: Array.isArray(items) ? items.length : 0,
+    selected: selected.length,
+    rejected: rejected.length,
+    backlog: backlog.length,
+  });
+  return { selected, rejected, backlogCount: backlog.length };
+}
+
+async function enrichHomeVerifiedCandidateFromApi(url) {
+  const metadata = await fetchFxTwitterTweetMetadata(url);
+  return classifyTerafabxHomeVerifiedOriginalCandidate(metadata);
+}
+
+/**
+ * 팔로잉 타임라인 합성 수집 → 개인 파란체크 원글만 homeVerified backlog 적재.
+ * 운영 Chrome 9224를 쓰지 않음 (격리 안전). 홈 DOM 수집은 별도 chromePort 있을 때 optional.
+ */
+function tallyHomeVerifiedRejectReasons(rejected = []) {
+  return homeVerifiedCommentLib.tallyHomeVerifiedRejectReasons(rejected);
+}
+
+/** 큐에서 정책 하드페일 초안 제거 (게시 전 품질 피드백) */
+function purgeHomeVerifiedPolicyFailPending(options = {}) {
+  const rows = loadTerafabxHomeVerifiedWriteQueue();
+  const kept = [];
+  const purged = [];
+  for (const row of rows) {
+    const comment = row?.prepared?.comment || "";
+    const judge = row?.prepared?.geminiReview?.finalJudge || { passed: true, qualityFlagsComplete: true, qualityFlags: {} };
+    const hard = homeVerifiedCommentLib.homeVerifiedJudgeHardFail(judge, comment);
+    const quality = assessTerafabxHomeVerifiedWriteQuality({ prepared: row.prepared, target: row.target });
+    if (!hard.ok || !quality.ok) {
+      purged.push({
+        id: row.id,
+        targetUrl: row.targetUrl,
+        authorHandle: row.authorHandle,
+        comment,
+        reasons: hard.ok ? quality.errors : hard.reasons,
+      });
+      continue;
+    }
+    kept.push(row);
+  }
+  if (purged.length) {
+    saveTerafabxHomeVerifiedWriteQueue(kept);
+    logEvent("terafabx_home_verified_policy_purge", {
+      purged: purged.length,
+      remaining: kept.length,
+      sample: purged.slice(0, 8),
+    });
+  }
+  return { purged: purged.length, remaining: kept.length, items: purged.slice(0, Number(options.sample || 20)) };
+}
+
+async function discoverTerafabxHomeVerifiedCandidates(options = {}) {
+  const limit = Math.max(1, Number(options.limit || TERAFABX_HOME_VERIFIED_COMMENT_DISCOVER_LIMIT || Math.max(12, TERAFABX_HOME_VERIFIED_COMMENT_BATCH_LIMIT * 3)));
+  const maxCheck = Math.max(limit, Number(options.maxCheck || Math.max(120, limit * 2)));
+  logEvent("terafabx_home_verified_discover_start", {
+    limit,
+    maxCheck,
+    source: options.source || TERAFABX_HOME_VERIFIED_DISCOVER_SOURCE || "fxtwitter-following",
+  });
+
+  let raw = [];
+  if (options.candidates && Array.isArray(options.candidates) && options.candidates.length) {
+    raw = options.candidates;
+  } else {
+    const collected = await collectTerafabxFxTwitterFollowingCandidates({
+      persist: options.persist !== false,
+      batchSize: options.batchSize || 40,
+      concurrency: options.concurrency || 5,
+    });
+    raw = Array.isArray(collected.candidates) ? collected.candidates : [];
+  }
+
+  // 소수 작성자 도배 시 enrich 낭비 방지: 핸들 1인 1건 우선
+  // maxCheck보다 넓게 diversify 한 뒤, pre-filter로 탈락한 슬롯을 채운다
+  const preDiversifyCap = Math.max(maxCheck * 2, maxCheck + 80);
+  const diversified = homeVerifiedCommentLib.diversifyHomeVerifiedDiscoverCandidates(raw, preDiversifyCap);
+  const uniqueAuthorFirst = diversified.length;
+  const classified = [];
+  const rejected = [];
+  const seenHandles = new Set();
+  let skippedDuplicateAuthor = 0;
+  let preFiltered = 0;
+  let enriched = 0;
+  for (const item of diversified) {
+    if (classified.length >= limit) break;
+    if (enriched >= maxCheck) break;
+    const url = normalizeXStatusUrl(item.url || item.targetUrl || "");
+    if (!url) continue;
+    // URL 핸들만으로 배치 중복이면 enrich 스킵 (공급 효율)
+    const urlHandle = String(
+      item.authorHandle || item.handle || homeVerifiedCommentLib.authorHandleFromUrl(url) || "",
+    ).replace(/^@/, "").toLowerCase();
+    if (urlHandle && seenHandles.has(urlHandle)) {
+      skippedDuplicateAuthor += 1;
+      rejected.push({ url, reasons: ["author_already_in_batch"] });
+      continue;
+    }
+    // enrich 전 텍스트 사전 필터 (following 스니펫만으로 탈락 가능한 경우)
+    const snippet = cleanSocialText(item.text || item.targetText || "");
+    if (snippet) {
+      const preSafety = homeVerifiedCommentLib.assessHomeVerifiedOriginalContentSafety(snippet, {
+        authorHandle: urlHandle,
+      });
+      if (!preSafety.ok) {
+        preFiltered += 1;
+        rejected.push({ url, reasons: [preSafety.reason || "prefilter_content_safety"] });
+        continue;
+      }
+      if (homeVerifiedCommentLib.isHomeVerifiedLinkOrSpaceOnlyWeakText(snippet)) {
+        preFiltered += 1;
+        rejected.push({ url, reasons: ["link_or_space_only_weak_text"] });
+        continue;
+      }
+      if (homeVerifiedCommentLib.isHomeVerifiedCryptoSpamHandle(urlHandle)) {
+        preFiltered += 1;
+        rejected.push({ url, reasons: ["crypto_spam_handle"] });
+        continue;
+      }
+    }
+    try {
+      enriched += 1;
+      const live = await enrichHomeVerifiedCandidateFromApi(url);
+      if (!live.ok) {
+        rejected.push({ url, reasons: live.reasons });
+        continue;
+      }
+      const handle = String(live.post.authorHandle || urlHandle || "").toLowerCase();
+      if (handle && seenHandles.has(handle)) {
+        skippedDuplicateAuthor += 1;
+        rejected.push({ url, reasons: ["author_already_in_batch"] });
+        continue;
+      }
+      if (handle) seenHandles.add(handle);
+      classified.push({
+        ...live.post,
+        text: live.post.text || item.text || "",
+        source: item.source || "fxtwitter-following-personal",
+        discoveredAt: new Date().toISOString(),
+      });
+    } catch (error) {
+      rejected.push({ url, reasons: ["metadata_error"], error: error.message });
+    }
+  }
+
+  const ingested = ingestTerafabxHomeVerifiedCandidates(classified, { limit });
+  const rejectReasonCounts = tallyHomeVerifiedRejectReasons(rejected);
+  const summary = {
+    scanned: raw.length,
+    checked: enriched + preFiltered + skippedDuplicateAuthor,
+    enriched,
+    preFiltered,
+    uniqueAuthorFirst,
+    personalSelected: classified.length,
+    rejected: rejected.length,
+    skippedDuplicateAuthor,
+    rejectReasonCounts,
+    yieldRate: enriched
+      ? Math.round((classified.length / enriched) * 1000) / 1000
+      : 0,
+    enrichYieldRate: enriched
+      ? Math.round((classified.length / enriched) * 1000) / 1000
+      : 0,
+    backlogCount: ingested.backlogCount,
+    sampleRejected: rejected.slice(0, 12),
+    source: options.source || TERAFABX_HOME_VERIFIED_DISCOVER_SOURCE || "fxtwitter-following",
+  };
+  saveTerafabxState({
+    homeVerifiedCommentLastDiscoveryAt: new Date().toISOString(),
+    homeVerifiedCommentLastDiscoverySummary: summary,
+  });
+  logEvent("terafabx_home_verified_discover_done", summary);
+  return { ok: true, ...summary, selected: classified.slice(0, limit) };
+}
+
+function assessTerafabxHomeVerifiedWriteQuality(record = {}) {
+  // 초안 품질(길이·문체·클리셰)은 LLM 프롬프트+judge만. 여기는 안전 금칙 + judge 결과만.
+  return homeVerifiedCommentLib.assessHomeVerifiedWriteQuality(record, {
+    cleanSocialText,
+    bannedRe: TERAFABX_COMMENT_TARGET_BANNED_RE,
+  });
+}
+
+function resolveHomeVerifiedContextProvider(options = {}) {
+  const raw = String(options.contextProvider || TERAFABX_HOME_VERIFIED_CONTEXT_PROVIDER || "gemini").toLowerCase().trim();
+  if (raw === "web" || raw === "grok" || raw === "grok-web") return "web";
+  if (raw === "cli" || raw === "grok-cli") return "cli";
+  return "gemini";
+}
+
+function isConfirmedHomeVerifiedContext(value) {
+  const provider = String(value?.provider || "");
+  // gemini-web-context: 홈 전용 text-only 1단계. web/cli-context: Grok 폴백.
+  return hasDetailedTerafabxGrokContext(value)
+    && /^(?:(?:web|cli)-context(?:-batch)?|direct-codex-context|gemini-web-context(?:-text)?)$/.test(provider)
+    && !isTerafabxGrokContextFallback(value)
+    && value?.rawPreview !== "local-root-context-fallback";
+}
+
+function assertConfirmedHomeVerifiedContext(value) {
+  if (!isConfirmedHomeVerifiedContext(value)) {
+    const error = new Error("홈 원글 검증 문맥/초안이 없어 진행하지 않습니다.");
+    error.code = "TERAFABX_HOME_VERIFIED_CONTEXT_REQUIRED";
+    throw error;
+  }
+  return value;
+}
+
+// 길이/톤 trim·polish는 사용하지 않음. stage1 초안을 그대로 쓴다.
+
+/**
+ * 홈 원글 문맥+초안 1단계: Gemini headless · 원글 텍스트-only (기본).
+ * Grok 쿼타를 쓰지 않는다. URL fetch/vision 없음.
+ */
+async function analyzeHomeVerifiedContextWithGemini(target, options = {}) {
+  const timeoutMs = Math.max(60_000, Number(options.timeoutMs || 180_000));
+  const maxAttempts = Math.max(1, Math.min(Number(options.maxAttempts || 2), 2));
+  const chromePort = Number(options.chromePort || TERAFABX_HOME_VERIFIED_COMMENT_GEMINI_PORT_BASE);
+  const profileDir = options.profileDir || `${TERAFABX_GEMINI_PROFILE_DIR}-home-verified-1`;
+  const runId = `terafabx-home-verified-gemini-context-${new Date().toISOString().replace(/[:.]/g, "-")}-${target.targetId || "target"}`;
+  const runDir = path.join(TERAFABX_GEMINI_REVIEW_DIR, runId);
+  fs.mkdirSync(runDir, { recursive: true });
+  logEvent("terafabx_home_verified_gemini_context_start", {
+    targetUrl: target.url,
+    textLength: String(target.targetText || "").length,
+    port: chromePort,
+    runDir,
+  });
+  const scriptPath = resolveTerafabxGeminiScriptPath();
+  if (!fs.existsSync(scriptPath)) throw new Error(`Gemini Web 스크립트가 없습니다: ${scriptPath}`);
+  await ensureTerafabxGeminiHeadlessBrowser({ port: chromePort, profileDir });
+  try {
+    for (const [attempt, extraRule] of [
+      [1, "텍스트-only. 원문 본문만 보고 12~30자 짧은 맞장구. 고유 명사·키워드를 일부러 끼워 넣지 마라."],
+      [2, "문맥이 애매하면 추정이라고 쓰고, 본문에서 확인되는 포인트만 12~30자 맞장구로 써라. 명사 박제 금지."],
+    ].slice(0, maxAttempts)) {
+      try {
+        const requestId = `hvc-gem-${crypto.randomUUID()}`;
+        const prompt = homeVerifiedCommentPrompts.homeVerifiedGrokContextPrompt(target, extraRule, requestId);
+        const promptPath = path.join(runDir, `attempt-${attempt}-prompt.md`);
+        const outPath = path.join(runDir, `attempt-${attempt}-out.txt`);
+        fs.writeFileSync(promptPath, prompt);
+        const result = await runTerafabxGeminiScript(
+          scriptPath,
+          ["--prompt", promptPath, "--out", outPath, "--cdp", `http://127.0.0.1:${chromePort}`, "--min-length", "20"],
+          {
+            cwd: terafabxGeminiScriptCwd(scriptPath),
+            timeoutMs,
+            chromePort,
+            profileDir,
+            priority: options.priority || options.geminiPriority || "home-verified",
+            label: `home-verified-context:${target.targetId || "target"}:${attempt}`,
+          },
+        );
+        fs.writeFileSync(path.join(runDir, `attempt-${attempt}.stdout.txt`), result.stdout || "");
+        fs.writeFileSync(path.join(runDir, `attempt-${attempt}.stderr.txt`), result.stderr || "");
+        if (result.code !== 0) throw new Error(result.stderr || result.stdout || "홈 원글 Gemini 문맥 생성 실패");
+        if (!fs.existsSync(outPath)) throw new Error("홈 원글 Gemini 문맥 출력 파일이 없습니다.");
+        const raw = fs.readFileSync(outPath, "utf8");
+        const parsed = parseTerafabxGrokContext(raw);
+        if (!hasDetailedTerafabxGrokContext(parsed) || !parsed.reply) {
+          throw new Error("홈 원글 Gemini 문맥/초안 JSON이 비어 있거나 부족합니다.");
+        }
+        const finalResult = {
+          ...parsed,
+          provider: "gemini-web-context",
+          mode: "home_verified_original",
+          pipeline: TERAFABX_HOME_VERIFIED_COMMENT_SOURCE,
+          runDir,
+        };
+        logEvent("terafabx_home_verified_gemini_context_ok", {
+          attempt,
+          targetUrl: target.url,
+          contextPreview: finalResult.contextSummary.slice(0, 240),
+          reply: finalResult.reply,
+          runDir,
+        });
+        return finalResult;
+      } catch (error) {
+        logEvent("terafabx_home_verified_gemini_context_attempt_failed", {
+          attempt,
+          targetUrl: target.url,
+          error: error.message,
+          runDir,
+        });
+        if (attempt >= maxAttempts) throw error;
+      }
+    }
+    throw new Error("홈 원글 Gemini 문맥·초안 생성 실패");
+  } finally {
+    // prepare 전체에서 같은 브라우저로 review까지 이어갈 수 있게 기본 유지.
+    // cleanup은 buildHomeVerifiedPreparedCommentRecord / review 쪽에서 담당.
+    if (options.cleanupBrowser === true) {
+      await closeTerafabxGeminiHeadlessBrowser({ port: chromePort, profileDir }).catch(() => null);
+    }
+  }
+}
+
+/** 홈 원글 전용 Grok 폴백 — own-post/terafabxGrokContextPrompt 를 호출하지 않음 */
+async function analyzeHomeVerifiedContextWithGrok(target, options = {}) {
+  const provider = options.contextProvider === "cli" || TERAFABX_GROK_PROVIDER === "cli" ? "cli" : "web";
+  const timeoutMs = Number(options.timeoutMs || 90_000);
+  const maxAttempts = Math.max(1, Math.min(Number(options.maxAttempts || 2), 2));
+  const session = options.session || `${TERAFABX_GROK_WEB_SESSION}-home-verified`;
+  logEvent("terafabx_home_verified_grok_start", {
+    provider,
+    targetUrl: target.url,
+    textLength: String(target.targetText || "").length,
+  });
+  for (const [attempt, extraRule] of [
+    [1, "텍스트-only. 원문 본문만 보고 12~30자 짧은 맞장구. 고유 명사·키워드를 일부러 끼워 넣지 마라."],
+    [2, "문맥이 애매하면 추정이라고 표시하고 원글 텍스트에서 확인되는 포인트만 써라. 명사 박제 금지."],
+  ].slice(0, maxAttempts)) {
+    try {
+      const requestId = `hvc-${crypto.randomUUID()}`;
+      const prompt = homeVerifiedCommentPrompts.homeVerifiedGrokContextPrompt(target, extraRule, requestId);
+      const raw = provider === "web"
+        ? await runGrokWebAgent(prompt, {
+          attempt,
+          targetId: `${target.targetId || "target"}-home-verified`,
+          targetUrl: target.url,
+          timeoutMs: options.timeoutMs ? timeoutMs : Math.max(timeoutMs, TERAFABX_GROK_WEB_TIMEOUT_MS),
+          session,
+          skipStateSync: Boolean(options.skipGrokStateSync),
+        })
+        : await runGrokCli(prompt, timeoutMs);
+      if (isTerafabxGrokNonJsonLimitText(raw)) {
+        const error = new Error("Grok 문맥 응답이 JSON이 아닌 limit 문구입니다.");
+        error.code = "TERAFABX_GROK_CONTEXT_LIMIT_TEXT";
+        error.noRetry = true;
+        throw error;
+      }
+      const result = parseTerafabxGrokContext(raw);
+      if (!hasDetailedTerafabxGrokContext(result) || !result.reply) {
+        throw new Error("홈 원글 Grok 문맥/초안 JSON이 비어 있거나 부족합니다.");
+      }
+      logEvent("terafabx_home_verified_grok_ok", {
+        provider,
+        attempt,
+        targetUrl: target.url,
+        contextPreview: result.contextSummary.slice(0, 240),
+        reply: result.reply,
+      });
+      return {
+        ...result,
+        provider: `${provider}-context`,
+        mode: "home_verified_original",
+        pipeline: TERAFABX_HOME_VERIFIED_COMMENT_SOURCE,
+      };
+    } catch (error) {
+      logEvent("terafabx_home_verified_grok_attempt_failed", {
+        provider,
+        attempt,
+        targetUrl: target.url,
+        error: error.message,
+      });
+      if (error.noRetry) throw error;
+    }
+  }
+  throw new Error("홈 원글 Grok 문맥·초안 생성 실패");
+}
+
+/** 홈 원글 문맥+초안 1단계 라우터 (기본: gemini text-only) */
+async function analyzeHomeVerifiedContext(target, options = {}) {
+  const provider = resolveHomeVerifiedContextProvider(options);
+  if (provider === "gemini") {
+    return analyzeHomeVerifiedContextWithGemini(target, options);
+  }
+  return analyzeHomeVerifiedContextWithGrok(target, { ...options, contextProvider: provider });
+}
+
+/** 홈 원글 전용 Gemini 검수·최종 심사 — 대댓글 프롬프트 미사용 */
+async function reviewHomeVerifiedReplyWithGemini(target, grokInput, options = {}) {
+  const grok = normalizeTerafabxGrokResult(grokInput);
+  if (!TERAFABX_GEMINI_REVIEW_ENABLED) {
+    return { finalReply: grok.reply, usedGemini: false, disabled: true, finalJudge: { passed: true, score: 70, qualityFlagsComplete: true } };
+  }
+  const reviewId = `terafabx-home-verified-gemini-${new Date().toISOString().replace(/[:.]/g, "-")}-${target.targetId || "target"}`;
+  const runDir = path.join(TERAFABX_GEMINI_REVIEW_DIR, reviewId);
+  fs.mkdirSync(runDir, { recursive: true });
+  const promptPath = path.join(runDir, "prompt.md");
+  const outPath = path.join(runDir, "gemini-review.txt");
+  const chromePort = Number(options.chromePort || TERAFABX_HOME_VERIFIED_COMMENT_GEMINI_PORT_BASE);
+  const profileDir = options.profileDir || `${TERAFABX_GEMINI_PROFILE_DIR}-home-verified-1`;
+  fs.writeFileSync(promptPath, homeVerifiedCommentPrompts.homeVerifiedGeminiReviewPrompt(target, grok));
+  logEvent("terafabx_home_verified_gemini_review_start", {
+    targetUrl: target.url,
+    grokReply: grok.reply,
+    port: chromePort,
+    runDir,
+  });
+  try {
+    await ensureTerafabxGeminiHeadlessBrowser({ port: chromePort, profileDir });
+    const scriptPath = resolveTerafabxGeminiScriptPath();
+    if (!fs.existsSync(scriptPath)) throw new Error(`Gemini Web 스크립트가 없습니다: ${scriptPath}`);
+    const runScript = async (pPath, oPath, label) => runTerafabxGeminiScript(
+      scriptPath,
+      ["--prompt", pPath, "--out", oPath, "--cdp", `http://127.0.0.1:${chromePort}`, "--min-length", "6"],
+      {
+        cwd: terafabxGeminiScriptCwd(scriptPath),
+        timeoutMs: 240000,
+        chromePort,
+        profileDir,
+        priority: options.priority || options.geminiPriority,
+        label,
+      },
+    );
+    const judgeOnce = async (finalReply, attempt = 0) => {
+      const judgeId = `final-judge-${attempt}`;
+      const judgePromptPath = path.join(runDir, `${judgeId}-prompt.md`);
+      const judgeOutPath = path.join(runDir, `${judgeId}.txt`);
+      fs.writeFileSync(judgePromptPath, homeVerifiedCommentPrompts.homeVerifiedFinalJudgePrompt(target, grok, finalReply));
+      const judgeRun = await runScript(judgePromptPath, judgeOutPath, `home-verified-judge:${target.targetId || "target"}:${attempt}`);
+      if (judgeRun.code !== 0 || !fs.existsSync(judgeOutPath)) {
+        throw new Error(judgeRun.stderr || judgeRun.stdout || "홈 원글 Gemini 최종 심사 실패");
+      }
+      const groundingContext = options.groundingContext || grok;
+      let judged = parseTerafabxFinalJudge(fs.readFileSync(judgeOutPath, "utf8"), finalReply, {
+        ...target,
+        groundingContext,
+      });
+      // 100점대 + 앵커 엄격 매칭만 실패하는 홈 원글 오탈락 복구
+      const reconciled = homeVerifiedCommentLib.reconcileHomeVerifiedFinalJudge(judged, {
+        ...target,
+        groundingContext,
+      }, finalReply);
+      if (reconciled.softGrounding) {
+        logEvent("terafabx_home_verified_judge_soft_grounding", {
+          targetUrl: target.url,
+          finalReply,
+          score: reconciled.score,
+          method: reconciled.sourceAnchorGrounding?.method || null,
+          recoveredFrom: reconciled.sourceAnchorGrounding?.recoveredFrom || null,
+          attempt,
+        });
+      }
+      judged = reconciled;
+      return { ...judged, provider: "gemini-web-home-verified-judge", runDir };
+    };
+
+    // stage1 초안 우선 심사. 정책 하드페일(템플릿/cross-post 등)이면 rewrite 1회, 그래도 실패면 discard.
+    const stage1Draft = grok.reply;
+    let finalReply = stage1Draft;
+    let decision = "keep_stage1";
+    let finalJudge = await judgeOnce(stage1Draft, 0);
+    let hard = homeVerifiedCommentLib.homeVerifiedJudgeHardFail(finalJudge, finalReply);
+
+    const needsRewrite = !finalJudge.passed || !hard.ok;
+    if (needsRewrite && Number(options.repairAttempt || 0) < 1) {
+      const result = await runScript(promptPath, outPath, `home-verified-review:${target.targetId || "target"}`);
+      fs.writeFileSync(path.join(runDir, "gemini.stdout.txt"), result.stdout || "");
+      fs.writeFileSync(path.join(runDir, "gemini.stderr.txt"), result.stderr || "");
+      if (result.code !== 0) throw new Error(result.stderr || result.stdout || "홈 원글 Gemini 검수 실패");
+      if (!fs.existsSync(outPath)) throw new Error("홈 원글 Gemini 검수 출력 파일이 없습니다.");
+      const review = parseTerafabxGeminiReview(fs.readFileSync(outPath, "utf8"));
+      const rewritten = validateTerafabxReply(review.finalReply || stage1Draft);
+      const rewriteJudge = await judgeOnce(rewritten, 1);
+      const rewriteHard = homeVerifiedCommentLib.homeVerifiedJudgeHardFail(rewriteJudge, rewritten);
+      if (rewriteJudge.passed && rewriteHard.ok) {
+        finalReply = rewritten;
+        decision = review.decision || "rewrite";
+        finalJudge = rewriteJudge;
+        hard = rewriteHard;
+      } else {
+        finalJudge = rewriteJudge.passed === false ? rewriteJudge : finalJudge;
+        hard = rewriteHard.ok ? hard : rewriteHard;
+        decision = "discard_after_rewrite";
+      }
+    }
+
+    hard = homeVerifiedCommentLib.homeVerifiedJudgeHardFail(finalJudge, finalReply);
+    if (!finalJudge.passed || !hard.ok) {
+      const reasonBits = [
+        finalJudge.reason || "품질 기준 미달",
+        ...(hard.reasons || []),
+      ].filter(Boolean).join(" | ");
+      const error = new Error(`홈 원글 최종 심사 탈락(discard): ${finalJudge.score ?? "?"}점 - ${reasonBits}`);
+      error.code = "HOME_VERIFIED_JUDGE_DISCARD";
+      error.discard = true;
+      error.hardFailReasons = hard.reasons || [];
+      throw error;
+    }
+    logEvent("terafabx_home_verified_gemini_review_ok", {
+      targetUrl: target.url,
+      finalReply,
+      decision,
+      score: finalJudge.score,
+      stage1Preferred: decision === "keep_stage1",
+      runDir,
+    });
+    return {
+      finalReply,
+      decision,
+      reason: finalJudge.reason || null,
+      score: finalJudge.score,
+      finalJudge: {
+        ...finalJudge,
+        qualityFlagsComplete: finalJudge.qualityFlagsComplete !== false,
+      },
+      usedGemini: true,
+    };
+  } catch (error) {
+    logEvent("terafabx_home_verified_gemini_review_error", {
+      targetUrl: target.url,
+      grokReply: grok.reply,
+      error: error.message,
+      runDir,
+    });
+    if (TERAFABX_GEMINI_REVIEW_REQUIRED) throw error;
+    return {
+      finalReply: grok.reply,
+      usedGemini: false,
+      fallback: true,
+      error: error.message,
+      finalJudge: { passed: false, score: null, qualityFlagsComplete: false, reason: error.message },
+    };
+  } finally {
+    if (options.cleanupBrowser !== false) {
+      const cleanup = await closeTerafabxGeminiHeadlessBrowser({ port: chromePort, profileDir }).catch((err) => ({ error: err.message }));
+      logEvent("terafabx_home_verified_gemini_review_cleanup", { targetUrl: target.url, cleanup });
+    }
+  }
+}
+
+/** own-post buildTerafabxPreparedCommentRecord 와 완전 분리된 홈 원글 prepare */
+async function buildHomeVerifiedPreparedCommentRecord(target, options = {}) {
+  const worker = Math.max(0, Number(options.workerIndex || 0));
+  const chromePort = Number(options.chromePort || (TERAFABX_HOME_VERIFIED_COMMENT_GEMINI_PORT_BASE + worker));
+  const profileDir = options.profileDir || `${TERAFABX_GEMINI_PROFILE_DIR}-home-verified-${worker + 1}`;
+  const contextProvider = resolveHomeVerifiedContextProvider(options);
+  // 1단계: 기본 Gemini text-only 문맥+초안 (Grok 쿼타 회피)
+  const stage1Context = await analyzeHomeVerifiedContext(target, {
+    contextProvider,
+    session: options.grokContextSession || `${TERAFABX_GROK_WEB_SESSION}-home-verified-${worker + 1}`,
+    skipGrokStateSync: Boolean(options.skipGrokStateSync),
+    timeoutMs: options.timeoutMs,
+    chromePort,
+    profileDir,
+    cleanupBrowser: false,
+    geminiPriority: options.geminiPriority,
+  });
+  if (!hasDetailedTerafabxGrokContext(stage1Context) || !stage1Context.reply) {
+    throw new Error("홈 원글 검증 문맥/초안이 없어 진행하지 않습니다.");
+  }
+  assertConfirmedHomeVerifiedContext(stage1Context);
+  const draftResult = {
+    ...normalizeTerafabxGrokResult({
+      reply: stage1Context.reply,
+      contextSummary: stage1Context.contextSummary,
+      keyPoints: stage1Context.keyPoints,
+      rawPreview: stage1Context.rawPreview,
+    }),
+    provider: `${stage1Context.provider || "gemini-web-context"}+home-verified-draft`,
+    mode: "home_verified_original",
+    pipeline: TERAFABX_HOME_VERIFIED_COMMENT_SOURCE,
+  };
+  logEvent("terafabx_home_verified_stage1_draft_ready", {
+    targetUrl: target.url,
+    reply: draftResult.reply,
+    contextPreview: draftResult.contextSummary.slice(0, 240),
+    contextProvider: stage1Context.provider,
+    pipeline: TERAFABX_HOME_VERIFIED_COMMENT_SOURCE,
+  });
+  // 2단계: Gemini 검수+judge (같은 headless 브라우저 재사용)
+  const geminiReview = await reviewHomeVerifiedReplyWithGemini(target, draftResult, {
+    chromePort,
+    profileDir,
+    geminiPriority: options.geminiPriority,
+    cleanupBrowser: options.cleanupBrowser !== false,
+    groundingContext: stage1Context,
+  });
+  assertTerafabxReplyReviewScoreQualified(geminiReview, TERAFABX_REVIEW_COMMENT_MIN_SCORE);
+  // stage1 초안 우선. 길이 trim/톤 polish 하지 않음.
+  const comment = validateTerafabxReply(geminiReview.finalReply || draftResult.reply);
+  const generator = [
+    stage1Context.provider || "gemini-web-context",
+    "home-verified-stage1-draft",
+    geminiReview.decision === "keep_stage1" ? "stage1-kept" : "stage1-rewrite-fallback",
+    geminiReview.usedGemini ? "home-verified-gemini-judge" : "home-verified-gemini-skipped",
+  ].join("+");
+  return {
+    at: new Date().toISOString(),
+    targetUrl: target.url,
+    targetId: target.targetId,
+    targetText: target.targetText,
+    authorHandle: target.authorHandle || null,
+    rootPostUrl: null,
+    rootPostText: null,
+    comment,
+    grokComment: draftResult.reply,
+    grokContext: terafabxGrokContextForRecord({
+      ...draftResult,
+      provider: stage1Context.provider,
+    }),
+    geminiReview: {
+      used: Boolean(geminiReview.usedGemini),
+      score: geminiReview.score ?? null,
+      decision: geminiReview.decision || null,
+      reason: geminiReview.reason || null,
+      fallback: Boolean(geminiReview.fallback),
+      error: geminiReview.error || null,
+      finalJudge: geminiReview.finalJudge || null,
+    },
+    replyUrl: null,
+    generator,
+    contextProvider: stage1Context.provider,
+    manual: Boolean(options.manual),
+    source: TERAFABX_HOME_VERIFIED_COMMENT_SOURCE,
+    kind: "home_verified_original",
+  };
+}
+
+async function prepareTerafabxHomeVerifiedComment(post, options = {}) {
+  const contextProvider = resolveHomeVerifiedContextProvider(options);
+  // Gemini text-only 1단계는 Grok 쿼타와 무관. Grok 폴백일 때만 한도 적용.
+  if (contextProvider !== "gemini") {
+    const quota = homeVerifiedCommentLib.homeVerifiedGrokQuotaDisposition(loadTerafabxState());
+    if (!quota.allowGenerate) {
+      const error = new Error(quota.message || "Grok 사용량 제한");
+      error.code = "GROK_QUOTA";
+      error.backoffUntil = quota.until;
+      throw error;
+    }
+  }
+  // backlog에 이미 들어 있어도 욕설·비난·논란 원글은 prepare 전 재차단
+  const contentSafety = homeVerifiedCommentLib.assessHomeVerifiedOriginalContentSafety(
+    post?.text || post?.targetText || "",
+    { bannedRe: TERAFABX_COMMENT_TARGET_BANNED_RE },
+  );
+  if (!contentSafety.ok) {
+    const error = new Error(`원글 제외: ${contentSafety.reason}`);
+    error.code = "UNSAFE_ORIGINAL";
+    error.reason = contentSafety.reason;
+    throw error;
+  }
+  const target = buildTerafabxHomeVerifiedCommentTarget(post);
+  const authorCap = homeVerifiedCommentLib.authorDailyUsageFromHistory({
+    history: loadTerafabxState().homeVerifiedCommentHistory,
+    pending: loadTerafabxHomeVerifiedWriteQueue(),
+    authorHandle: target.authorHandle,
+    formatKstDateKey,
+    limit: TERAFABX_HOME_VERIFIED_COMMENT_AUTHOR_DAILY_LIMIT,
+  });
+  if (!authorCap.allowed) {
+    const error = new Error(`작성자 일일 한도: @${authorCap.handle} ${authorCap.total}/${authorCap.limit}`);
+    error.code = "AUTHOR_DAILY_CAP";
+    throw error;
+  }
+  const worker = Math.max(0, Number(options.workerIndex || 0));
+  const prepared = await buildHomeVerifiedPreparedCommentRecord(target, {
+    manual: Boolean(options.manual),
+    workerIndex: worker,
+    chromePort: TERAFABX_HOME_VERIFIED_COMMENT_GEMINI_PORT_BASE + worker,
+    profileDir: `${TERAFABX_GEMINI_PROFILE_DIR}-home-verified-${worker + 1}`,
+    grokContextSession: options.grokContextSession || `${TERAFABX_GROK_WEB_SESSION}-home-verified-${worker + 1}`,
+    contextProvider,
+  });
+  const quality = assessTerafabxHomeVerifiedWriteQuality({
+    prepared,
+    target,
+    source: TERAFABX_HOME_VERIFIED_COMMENT_SOURCE,
+  });
+  if (!quality.ok) {
+    const error = new Error(`품질 게이트 탈락: ${(quality.errors || []).join(", ")}`);
+    error.code = "QUALITY_GATE";
+    error.quality = quality;
+    throw error;
+  }
+  return { target, prepared, quality };
+}
+
+function enqueueTerafabxHomeVerifiedWriteRecord({ target, prepared, manual = false } = {}) {
+  const record = persistTerafabxHomeVerifiedWrite({
+    target,
+    prepared,
+    targetUrl: target.url,
+    rootUrl: target.rootPostUrl || target.url,
+    authorHandle: target.authorHandle,
+    status: "queued",
+    stage: "pending_post",
+    source: TERAFABX_HOME_VERIFIED_COMMENT_SOURCE,
+    manual: Boolean(manual),
+    queuedAt: new Date().toISOString(),
+  });
+  pumpTerafabxHomeVerifiedWriteQueue();
+  return record;
+}
+
+function saveTerafabxHomeVerifiedCommentSuccess(record, posted) {
+  const state = loadTerafabxState();
+  const now = new Date().toISOString();
+  const historyRecord = {
+    at: now,
+    targetUrl: record.targetUrl,
+    authorHandle: record.authorHandle || record?.target?.authorHandle || "",
+    comment: record.prepared?.comment,
+    replyUrl: posted?.replyUrl || null,
+    source: TERAFABX_HOME_VERIFIED_COMMENT_SOURCE,
+    generator: record.prepared?.generator || null,
+  };
+  const id = parseXStatusUrl(record.targetUrl)?.id;
+  saveTerafabxState({
+    homeVerifiedCommentHistory: [historyRecord, ...(state.homeVerifiedCommentHistory || [])].slice(0, 500),
+    homeVerifiedCommentSeenIds: id
+      ? Array.from(new Set([id, ...(state.homeVerifiedCommentSeenIds || [])])).slice(0, 5000)
+      : state.homeVerifiedCommentSeenIds,
+    commentHistory: [historyRecord, ...(state.commentHistory || [])].slice(0, TERAFABX_COMMENT_HISTORY_LIMIT),
+    lastCommentRunAt: now,
+    lastCommentStatus: "ok",
+    lastCommentError: null,
+    lastComment: record.prepared?.comment,
+    lastCommentTarget: record.targetUrl,
+    lastReplyUrl: posted?.replyUrl || null,
+  });
+  removeTerafabxHomeVerifiedWrite(record.id);
+  return historyRecord;
+}
+
+async function postTerafabxHomeVerifiedWriteRecord(record) {
+  const latest = persistTerafabxHomeVerifiedWrite({
+    ...record,
+    status: "posting",
+    attempts: Math.max(0, Number(record.attempts || 0)) + 1,
+    lastAttemptAt: new Date().toISOString(),
+  });
+  if (terafabxHomeVerifiedAlreadyHandled(loadTerafabxState(), latest.targetUrl)
+    && (loadTerafabxState().homeVerifiedCommentHistory || []).some((item) => parseXStatusUrl(item.targetUrl)?.id === parseXStatusUrl(latest.targetUrl)?.id)) {
+    removeTerafabxHomeVerifiedWrite(latest.id);
+    return { status: "already_posted", targetUrl: latest.targetUrl };
+  }
+  const quality = assessTerafabxHomeVerifiedWriteQuality(latest);
+  if (!quality.ok) {
+    removeTerafabxHomeVerifiedWrite(latest.id);
+    logEvent("terafabx_home_verified_write_quality_rejected", {
+      id: latest.id,
+      targetUrl: latest.targetUrl,
+      errors: quality.errors,
+    });
+    return { status: "quality_rejected", quality, record: latest };
+  }
+  const state = loadTerafabxState();
+  if (state.homeVerifiedCommentPrefillOnly) {
+    return {
+      status: "prefill_only",
+      record: persistTerafabxHomeVerifiedWrite({
+        ...latest,
+        status: "queued",
+        stage: "pending_post",
+        lastError: "prefill_only: 실제 게시 비활성",
+      }),
+    };
+  }
+  const daily = homeVerifiedCommentLib.homeVerifiedDailyProgress({
+    history: state.homeVerifiedCommentHistory,
+    pending: [],
+    dailyTarget: TERAFABX_HOME_VERIFIED_COMMENT_DAILY_TARGET,
+    formatKstDateKey,
+  });
+  if (daily.atCap) {
+    return {
+      status: "held",
+      record: persistTerafabxHomeVerifiedWrite({
+        ...latest,
+        status: "queued",
+        stage: "held",
+        retryAt: nextKstDateBoundary().toISOString(),
+        lastError: `daily_target_reached:${daily.postedToday}/${daily.dailyTarget}`,
+      }),
+    };
+  }
+  const authorCap = homeVerifiedCommentLib.authorDailyUsageFromHistory({
+    history: state.homeVerifiedCommentHistory,
+    pending: loadTerafabxHomeVerifiedWriteQueue().filter((row) => row.id !== latest.id),
+    authorHandle: latest.authorHandle,
+    formatKstDateKey,
+    limit: TERAFABX_HOME_VERIFIED_COMMENT_AUTHOR_DAILY_LIMIT,
+  });
+  if (!authorCap.allowed) {
+    return {
+      status: "held",
+      record: persistTerafabxHomeVerifiedWrite({
+        ...latest,
+        status: "queued",
+        stage: "held",
+        retryAt: nextKstDateBoundary().toISOString(),
+        lastError: authorCap.reason,
+      }),
+    };
+  }
+  // 일 300 페이스: 최소 게시 간격 (manual post_one 은 짧게)
+  const desiredGapMs = latest.manual
+    ? Math.min(30_000, TERAFABX_HOME_VERIFIED_COMMENT_MIN_POST_GAP_MS)
+    : TERAFABX_HOME_VERIFIED_COMMENT_MIN_POST_GAP_MS;
+  const delayMs = terafabxOwnPostReplyWriterDelayMs({
+    lastCompletedAtMs: terafabxHomeVerifiedCommentXWriterLastCompletedAtMs,
+    desiredGapMs,
+  });
+  if (delayMs > 0) await sleep(delayMs);
+  try {
+    const posted = await postTerafabxReply(latest.targetUrl, latest.prepared.comment, {
+      headless: true,
+      xResourceKind: "homeVerified",
+      lockAction: "home-verified-comment-writer",
+      cleanupHeadless: true,
+      verifyRelationship: true,
+    });
+    if (!posted?.ok || !posted.replyUrl) {
+      const uncertain = persistTerafabxHomeVerifiedWrite({
+        ...latest,
+        status: "queued",
+        stage: "verification_required",
+        lastError: "게시 결과 불확실 — 재게시 금지",
+      });
+      return { status: "verification_required", record: uncertain };
+    }
+    const history = saveTerafabxHomeVerifiedCommentSuccess(latest, posted);
+    terafabxHomeVerifiedCommentXWriterLastCompletedAtMs = Date.now();
+    logEvent("terafabx_home_verified_comment_posted", {
+      targetUrl: latest.targetUrl,
+      replyUrl: posted.replyUrl,
+      comment: latest.prepared.comment,
+    });
+    return { status: "posted", history, posted };
+  } catch (error) {
+    if (isTerafabxReplySubmissionUncertain(error) || error?.code === "TERAFABX_REPLY_SUBMISSION_UNCERTAIN") {
+      const uncertain = persistTerafabxHomeVerifiedWrite({
+        ...latest,
+        status: "queued",
+        stage: "verification_required",
+        lastError: error.message,
+      });
+      return { status: "verification_required", record: uncertain, error: error.message };
+    }
+    if (isTerafabxXRateLimitError(error)) {
+      const retryAt = new Date(Date.now() + TERAFABX_X_GLOBAL_BACKOFF_MS).toISOString();
+      saveTerafabxState({
+        homeVerifiedCommentXWriteBackoffUntil: retryAt,
+        homeVerifiedCommentXWriteBackoffError: error.message,
+        xGlobalBackoffUntil: retryAt,
+        xGlobalBackoffError: error.message,
+        xGlobalBackoffSource: TERAFABX_HOME_VERIFIED_COMMENT_SOURCE,
+      });
+      return {
+        status: "backoff",
+        record: persistTerafabxHomeVerifiedWrite({
+          ...latest,
+          status: "queued",
+          stage: "pending_post",
+          retryAt,
+          lastError: error.message,
+        }),
+      };
+    }
+    // 재발 방지: 삭제/제한/target-not-found 는 재시도 루프에 넣지 않고 영구 폐기
+    const maxAttempts = Math.max(1, Number(process.env.TERAFABX_HOME_VERIFIED_MAX_POST_ATTEMPTS || 5));
+    const disposition = homeVerifiedCommentLib.homeVerifiedPostFailureDisposition(error, {
+      attempts: latest.attempts,
+      maxAttempts,
+    });
+    if (disposition.discard) {
+      markTerafabxHomeVerifiedTargetDiscarded(latest.targetUrl, {
+        reason: disposition.reason,
+        error: error.message,
+        attempts: latest.attempts,
+      });
+      removeTerafabxHomeVerifiedWrite(latest.id);
+      logEvent("terafabx_home_verified_dead_target_discarded", {
+        id: latest.id,
+        targetUrl: latest.targetUrl,
+        authorHandle: latest.authorHandle,
+        reason: disposition.reason,
+        attempts: latest.attempts,
+        error: String(error.message || "").slice(0, 400),
+      });
+      return {
+        status: "discarded_dead_target",
+        reason: disposition.reason,
+        error: error.message,
+        targetUrl: latest.targetUrl,
+      };
+    }
+    const failed = persistTerafabxHomeVerifiedWrite({
+      ...latest,
+      status: "queued",
+      stage: "pending_post",
+      lastError: error.message,
+      retryAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+    });
+    return { status: "retry", record: failed, error: error.message };
+  }
+}
+
+function recoverStuckHomeVerifiedPostingRows(nowMs = Date.now()) {
+  const stuckMs = Math.max(120_000, Number(process.env.TERAFABX_HOME_VERIFIED_POSTING_STUCK_MS || 8 * 60 * 1000));
+  const rows = loadTerafabxHomeVerifiedWriteQueue();
+  let recovered = 0;
+  for (const row of rows) {
+    if (String(row.status) !== "posting") continue;
+    // 현재 프로세스 큐에 아직 실행 중이면 건드리지 않음
+    if (terafabxHomeVerifiedCommentWriteQueuedIds.has(row.id)) continue;
+    const started = Date.parse(row.lastAttemptAt || row.queuedAt || 0);
+    if (!Number.isFinite(started) || (nowMs - started) < stuckMs) continue;
+    persistTerafabxHomeVerifiedWrite({
+      ...row,
+      status: "queued",
+      stage: "pending_post",
+      lastError: `recovered_stuck_posting:${Math.round((nowMs - started) / 1000)}s`,
+      retryAt: null,
+    });
+    recovered += 1;
+    logEvent("terafabx_home_verified_stuck_posting_recovered", {
+      id: row.id,
+      targetUrl: row.targetUrl,
+      stuckMs: nowMs - started,
+    });
+  }
+  return recovered;
+}
+
+function pumpTerafabxHomeVerifiedWriteQueue() {
+  const state = loadTerafabxState();
+  if (state.homeVerifiedCommentPrefillOnly) {
+    return { pumped: 0, reason: "prefill_only" };
+  }
+  if (!state.homeVerifiedCommentEnabled && !loadTerafabxHomeVerifiedWriteQueue().some((row) => row.manual)) {
+    return { pumped: 0, reason: "disabled" };
+  }
+  const recoveredStuck = recoverStuckHomeVerifiedPostingRows();
+  const rows = loadTerafabxHomeVerifiedWriteQueue().filter((row) => {
+    if (row.stage === "verification_required") return false;
+    if (row.stage === "held") {
+      const retryAt = Date.parse(row.retryAt || "");
+      return Number.isFinite(retryAt) && retryAt <= Date.now();
+    }
+    const retryAt = Date.parse(row.retryAt || "");
+    if (Number.isFinite(retryAt) && retryAt > Date.now()) return false;
+    return row.status === "queued" || row.status === "posting";
+  });
+  let pumped = 0;
+  for (const row of rows) {
+    if (terafabxHomeVerifiedCommentWriteQueuedIds.has(row.id)) continue;
+    // 동시 게시는 1건만 (헤드리스 세션/락 경합 방지) — 일 300 페이스는 갭으로 조절
+    if (pumped >= 1) break;
+    terafabxHomeVerifiedCommentWriteQueuedIds.add(row.id);
+    pumped += 1;
+    terafabxHomeVerifiedCommentXWriterQueue.enqueue(async () => {
+      try {
+        await postTerafabxHomeVerifiedWriteRecord(row);
+      } finally {
+        terafabxHomeVerifiedCommentWriteQueuedIds.delete(row.id);
+      }
+    }).catch((error) => {
+      logEvent("terafabx_home_verified_write_queue_error", { id: row.id, error: error.message });
+      terafabxHomeVerifiedCommentWriteQueuedIds.delete(row.id);
+      // 예외 시 posting 잔류 방지
+      try {
+        const fresh = loadTerafabxHomeVerifiedWriteQueue().find((item) => item.id === row.id);
+        if (fresh && String(fresh.status) === "posting") {
+          persistTerafabxHomeVerifiedWrite({
+            ...fresh,
+            status: "queued",
+            stage: "pending_post",
+            lastError: error.message,
+            retryAt: new Date(Date.now() + 60_000).toISOString(),
+          });
+        }
+      } catch {}
+    });
+  }
+  return { pumped, recoveredStuck, durable: loadTerafabxHomeVerifiedWriteQueue().length };
+}
+
+async function runTerafabxHomeVerifiedCommentPrepareCycle(options = {}) {
+  if (terafabxHomeVerifiedCommentBusy) return { ok: false, skipped: "busy" };
+  terafabxHomeVerifiedCommentBusy = true;
+  const startedAt = new Date().toISOString();
+  try {
+    // Gemini text-only 기본 경로에서는 Grok 쿼타로 prepare를 막지 않음
+    const contextProvider = resolveHomeVerifiedContextProvider(options);
+    if (contextProvider !== "gemini") {
+      const quota = homeVerifiedCommentLib.homeVerifiedGrokQuotaDisposition(loadTerafabxState());
+      if (!quota.allowGenerate) {
+        saveTerafabxState({
+          homeVerifiedCommentLastRunAt: startedAt,
+          homeVerifiedCommentLastStatus: "blocked",
+          homeVerifiedCommentLastError: quota.message,
+        });
+        return { ok: false, skipped: "grok_quota", error: quota.message, until: quota.until };
+      }
+    }
+
+    let state = loadTerafabxState();
+    if (Array.isArray(options.candidates) && options.candidates.length) {
+      ingestTerafabxHomeVerifiedCandidates(options.candidates, { limit: options.limit });
+      state = loadTerafabxState();
+    }
+
+    const limit = Math.max(1, Number(options.limit || TERAFABX_HOME_VERIFIED_COMMENT_BATCH_LIMIT));
+    const backlog = homeVerifiedCommentLib.normalizeHomeVerifiedCandidateBacklog(
+      state.homeVerifiedCommentBacklog,
+      homeVerifiedCommentHelpers(),
+    );
+    const batch = backlog.slice(0, limit);
+    const results = { prepared: 0, failed: 0, discarded: 0, held: 0, errors: [], items: [] };
+
+    for (let index = 0; index < batch.length; index += 1) {
+      const post = batch[index];
+      try {
+        if (terafabxHomeVerifiedAlreadyHandled(loadTerafabxState(), post.url)) {
+          results.held += 1;
+          continue;
+        }
+        let candidate = post;
+        try {
+          const live = await enrichHomeVerifiedCandidateFromApi(post.url);
+          if (!live.ok) {
+            results.held += 1;
+            results.errors.push({ url: post.url, reasons: live.reasons });
+            continue;
+          }
+          candidate = live.post;
+        } catch (apiError) {
+          logEvent("terafabx_home_verified_metadata_error", { url: post.url, error: apiError.message });
+        }
+        // prepare 직전 재분류 (P0 필터 — 실패 초안을 큐에 넣지 않음)
+        const reclass = classifyTerafabxHomeVerifiedOriginalCandidate(candidate);
+        if (!reclass.ok) {
+          results.held += 1;
+          results.errors.push({ url: post.url, reasons: reclass.reasons, discarded: true });
+          continue;
+        }
+        const { target, prepared } = await prepareTerafabxHomeVerifiedComment(reclass.post, {
+          workerIndex: index % Math.max(1, terafabxBrowserConcurrency(5)),
+          manual: Boolean(options.manual),
+        });
+        const queued = enqueueTerafabxHomeVerifiedWriteRecord({
+          target,
+          prepared,
+          manual: Boolean(options.manual),
+        });
+        results.prepared += 1;
+        results.items.push({
+          targetUrl: target.url,
+          comment: prepared.comment,
+          id: queued.id,
+          decision: prepared.geminiReview?.decision || null,
+        });
+      } catch (error) {
+        results.failed += 1;
+        const discarded = Boolean(error.discard || error.code === "HOME_VERIFIED_JUDGE_DISCARD");
+        if (discarded) results.discarded = (results.discarded || 0) + 1;
+        results.errors.push({
+          url: post.url,
+          error: error.message,
+          code: error.code || null,
+          discarded,
+          hardFailReasons: error.hardFailReasons || null,
+        });
+        logEvent("terafabx_home_verified_prepare_item_failed", {
+          url: post.url,
+          code: error.code || null,
+          discarded,
+          error: error.message,
+        });
+        if (error.code === "GROK_QUOTA") {
+          const until = error.backoffUntil || parseTerafabxGrokQuotaResetAt(error.message);
+          saveTerafabxState({
+            grokQuotaBackoffUntil: until,
+            grokQuotaMessage: error.message,
+          });
+          break;
+        }
+      }
+    }
+
+    const remainingBacklog = backlog.filter((item) => !batch.some((b) => b.id === item.id));
+    const preparedIds = new Set(results.items.map((item) => parseXStatusUrl(item.targetUrl)?.id).filter(Boolean));
+    saveTerafabxState({
+      homeVerifiedCommentBacklog: remainingBacklog.filter((item) => !preparedIds.has(item.id)),
+      homeVerifiedCommentLastRunAt: startedAt,
+      homeVerifiedCommentLastStatus: results.prepared > 0 ? "ok" : (results.failed ? "error" : "idle"),
+      homeVerifiedCommentLastError: results.errors[0]?.error || null,
+      homeVerifiedCommentLastSummary: {
+        at: startedAt,
+        prepared: results.prepared,
+        failed: results.failed,
+        discarded: results.discarded || 0,
+        held: results.held,
+        pending: loadTerafabxHomeVerifiedWriteQueue().length,
+        prefillOnly: Boolean(loadTerafabxState().homeVerifiedCommentPrefillOnly),
+      },
+    });
+    logEvent("terafabx_home_verified_prepare_cycle", results);
+    return { ok: true, ...results };
+  } catch (error) {
+    saveTerafabxState({
+      homeVerifiedCommentLastRunAt: startedAt,
+      homeVerifiedCommentLastStatus: "error",
+      homeVerifiedCommentLastError: error.message,
+    });
+    logEvent("terafabx_home_verified_prepare_error", { error: error.message });
+    throw error;
+  } finally {
+    terafabxHomeVerifiedCommentBusy = false;
+  }
+}
+
+async function maybeRunTerafabxHomeVerifiedCommentAutomation() {
+  if (terafabxHomeVerifiedCommentSchedulerBusy || terafabxHomeVerifiedCommentBusy) return { skipped: "busy" };
+  const state = loadTerafabxState();
+  if (!state.homeVerifiedCommentEnabled) return { skipped: "disabled" };
+  const lastMs = Date.parse(state.homeVerifiedCommentLastRunAt || "") || 0;
+  if (Date.now() - lastMs < TERAFABX_HOME_VERIFIED_COMMENT_INTERVAL_MS) return { skipped: "interval" };
+  terafabxHomeVerifiedCommentSchedulerBusy = true;
+  try {
+    const pendingRows = loadTerafabxHomeVerifiedWriteQueue();
+    const daily = homeVerifiedCommentLib.homeVerifiedDailyProgress({
+      history: state.homeVerifiedCommentHistory,
+      pending: pendingRows,
+      dailyTarget: TERAFABX_HOME_VERIFIED_COMMENT_DAILY_TARGET,
+      formatKstDateKey,
+    });
+    if (daily.atCap) {
+      logEvent("terafabx_home_verified_daily_target_reached", daily);
+      return { skipped: "daily_target_reached", daily };
+    }
+
+    // live 모드면 게시 큐 드레인 (일 목표 잔량 있을 때만)
+    const pump = state.homeVerifiedCommentPrefillOnly
+      ? { pumped: 0, reason: "prefill_only" }
+      : pumpTerafabxHomeVerifiedWriteQueue();
+
+    const pendingCount = loadTerafabxHomeVerifiedWriteQueue().length;
+    const needPrepare = daily.remainingAfterPending > 0
+      && pendingCount < TERAFABX_HOME_VERIFIED_COMMENT_READY_BUFFER;
+
+    let backlogCount = homeVerifiedCommentLib.normalizeHomeVerifiedCandidateBacklog(
+      loadTerafabxState().homeVerifiedCommentBacklog,
+      homeVerifiedCommentHelpers(),
+    ).length;
+
+    // 게시 전 정책 하드페일 초안 청소 (라이브 품질 피드백)
+    const purge = purgeHomeVerifiedPolicyFailPending({ sample: 12 });
+    if (purge.purged > 0) {
+      logEvent("terafabx_home_verified_auto_policy_purge", purge);
+    }
+    // 삭제/제한 타겟 재시도 루프 청소
+    const deadPurge = purgeHomeVerifiedDeadTargetPending({ sample: 12 });
+    if (deadPurge.purged > 0) {
+      logEvent("terafabx_home_verified_auto_dead_target_purge", deadPurge);
+    }
+
+    // following 합성 discover: 백로그/버퍼 부족 시 공격적으로 보충
+    const needDiscover = needPrepare
+      && (
+        backlogCount < Math.max(TERAFABX_HOME_VERIFIED_COMMENT_BATCH_LIMIT, 8)
+        || pendingCount < Math.floor(TERAFABX_HOME_VERIFIED_COMMENT_READY_BUFFER * 0.6)
+      );
+    let lastDiscover = null;
+    if (needDiscover) {
+      try {
+        lastDiscover = await discoverTerafabxHomeVerifiedCandidates({
+          source: TERAFABX_HOME_VERIFIED_DISCOVER_SOURCE,
+          limit: TERAFABX_HOME_VERIFIED_COMMENT_DISCOVER_LIMIT,
+          maxCheck: Math.max(
+            TERAFABX_HOME_VERIFIED_COMMENT_DISCOVER_LIMIT * 2,
+            160,
+          ),
+          batchSize: 40,
+          concurrency: 5,
+        });
+        backlogCount = homeVerifiedCommentLib.normalizeHomeVerifiedCandidateBacklog(
+          loadTerafabxState().homeVerifiedCommentBacklog,
+          homeVerifiedCommentHelpers(),
+        ).length;
+      } catch (error) {
+        logEvent("terafabx_home_verified_auto_discover_error", { error: error.message });
+      }
+    }
+
+    if (needPrepare && backlogCount > 0) {
+      const prepareLimit = Math.min(
+        TERAFABX_HOME_VERIFIED_COMMENT_BATCH_LIMIT,
+        daily.remainingAfterPending,
+        Math.max(1, TERAFABX_HOME_VERIFIED_COMMENT_READY_BUFFER - pendingCount),
+      );
+      const prepared = await runTerafabxHomeVerifiedCommentPrepareCycle({
+        manual: false,
+        limit: prepareLimit,
+      });
+      return {
+        ok: true,
+        pump,
+        purge,
+        daily,
+        prepareLimit,
+        discover: lastDiscover ? {
+          selected: lastDiscover.personalSelected,
+          rejected: lastDiscover.rejected,
+          skippedDuplicateAuthor: lastDiscover.skippedDuplicateAuthor,
+          rejectReasonCounts: lastDiscover.rejectReasonCounts,
+          yieldRate: lastDiscover.yieldRate,
+        } : null,
+        source: TERAFABX_HOME_VERIFIED_DISCOVER_SOURCE,
+        ...prepared,
+      };
+    }
+    return {
+      skipped: needPrepare ? "empty_backlog" : "buffer_full_or_target_met",
+      pump,
+      purge,
+      daily,
+      pendingCount,
+      backlogCount,
+      discover: lastDiscover ? {
+        selected: lastDiscover.personalSelected,
+        rejected: lastDiscover.rejected,
+        skippedDuplicateAuthor: lastDiscover.skippedDuplicateAuthor,
+        rejectReasonCounts: lastDiscover.rejectReasonCounts,
+        yieldRate: lastDiscover.yieldRate,
+      } : null,
+      source: TERAFABX_HOME_VERIFIED_DISCOVER_SOURCE,
+    };
+  } finally {
+    terafabxHomeVerifiedCommentSchedulerBusy = false;
+  }
+}
+
+function getTerafabxHomeVerifiedCommentStatus(state = loadTerafabxState()) {
+  const pending = loadTerafabxHomeVerifiedWriteQueue();
+  const backlog = homeVerifiedCommentLib.normalizeHomeVerifiedCandidateBacklog(
+    state.homeVerifiedCommentBacklog,
+    homeVerifiedCommentHelpers(),
+  );
+  const contextProvider = resolveHomeVerifiedContextProvider();
+  // Gemini text-only 기본 경로에서는 Grok 쿼타가 생성을 막지 않음.
+  const grokQuotaRaw = homeVerifiedCommentLib.homeVerifiedGrokQuotaDisposition(state);
+  const grokQuota = contextProvider === "gemini"
+    ? { ...grokQuotaRaw, allowGenerate: true, message: grokQuotaRaw.allowGenerate ? null : `Grok 한도(미사용: context=${contextProvider})` }
+    : grokQuotaRaw;
+  const daily = homeVerifiedCommentLib.homeVerifiedDailyProgress({
+    history: state.homeVerifiedCommentHistory,
+    pending,
+    dailyTarget: TERAFABX_HOME_VERIFIED_COMMENT_DAILY_TARGET,
+    formatKstDateKey,
+  });
+  const pipeline = homeVerifiedCommentLib.homeVerifiedPipelineStatus({
+    enabled: Boolean(state.homeVerifiedCommentEnabled),
+    prefillOnly: state.homeVerifiedCommentPrefillOnly !== false,
+    backlogCount: backlog.length,
+    pendingCount: pending.length,
+    postedToday: daily.postedToday,
+    dailyTarget: daily.dailyTarget,
+    grokQuota,
+    lastError: state.homeVerifiedCommentLastError,
+  });
+  return {
+    ...pipeline,
+    contextProvider,
+    discoverSource: TERAFABX_HOME_VERIFIED_DISCOVER_SOURCE,
+    daily,
+    enabled: Boolean(state.homeVerifiedCommentEnabled),
+    prefillOnly: state.homeVerifiedCommentPrefillOnly !== false,
+    busy: terafabxHomeVerifiedCommentBusy,
+    schedulerBusy: terafabxHomeVerifiedCommentSchedulerBusy,
+    intervalMs: TERAFABX_HOME_VERIFIED_COMMENT_INTERVAL_MS,
+    batchLimit: TERAFABX_HOME_VERIFIED_COMMENT_BATCH_LIMIT,
+    authorDailyLimit: TERAFABX_HOME_VERIFIED_COMMENT_AUTHOR_DAILY_LIMIT,
+    dailyTarget: TERAFABX_HOME_VERIFIED_COMMENT_DAILY_TARGET,
+    readyBuffer: TERAFABX_HOME_VERIFIED_COMMENT_READY_BUFFER,
+    discoverLimit: TERAFABX_HOME_VERIFIED_COMMENT_DISCOVER_LIMIT,
+    minPostGapMs: TERAFABX_HOME_VERIFIED_COMMENT_MIN_POST_GAP_MS,
+    backlogCount: backlog.length,
+    pendingCount: pending.length,
+    postedToday: daily.postedToday,
+    pending: pending.slice(0, 20).map((row) => ({
+      id: row.id,
+      targetUrl: row.targetUrl,
+      authorHandle: row.authorHandle,
+      stage: row.stage,
+      status: row.status,
+      comment: row.prepared?.comment || "",
+      lastError: row.lastError,
+      retryAt: row.retryAt,
+      queuedAt: row.queuedAt,
+    })),
+    backlog: backlog.slice(0, 20),
+    history: (state.homeVerifiedCommentHistory || []).slice(0, 10),
+    writerPort: TERAFABX_HOME_VERIFIED_COMMENT_X_PORT,
+    durableQueuePath: TERAFABX_HOME_VERIFIED_COMMENT_WRITE_QUEUE_PATH,
+    lastRunAt: state.homeVerifiedCommentLastRunAt,
+    lastStatus: state.homeVerifiedCommentLastStatus,
+    lastError: state.homeVerifiedCommentLastError,
+    lastSummary: state.homeVerifiedCommentLastSummary,
+    grokQuota,
+    lastDiscoveryAt: state.homeVerifiedCommentLastDiscoveryAt || null,
+    lastDiscovery: state.homeVerifiedCommentLastDiscoverySummary || null,
+    lastDeadTargetDiscard: state.homeVerifiedCommentLastDeadTargetDiscard || null,
+    source: TERAFABX_HOME_VERIFIED_COMMENT_SOURCE,
+    policy: {
+      homeTimelineOriginalOnly: true,
+      blueVerifiedOnly: true,
+      personalBlueVerifiedOnly: true,
+      allowedVerificationTypes: ["individual", "blue"],
+      excludeOrganizationGovernmentBusiness: true,
+      excludeReplies: true,
+      excludeRetweets: true,
+      excludeQuotes: true,
+      excludeProfanityAttackControversy: true,
+      excludeSensitiveBannedTopics: true,
+      contextProvider: TERAFABX_HOME_VERIFIED_CONTEXT_PROVIDER || "gemini",
+      geminiTextOnlyContextAndDraft: TERAFABX_HOME_VERIFIED_CONTEXT_PROVIDER !== "web"
+        && TERAFABX_HOME_VERIFIED_CONTEXT_PROVIDER !== "cli",
+      grokContextAndDraft: TERAFABX_HOME_VERIFIED_CONTEXT_PROVIDER === "web"
+        || TERAFABX_HOME_VERIFIED_CONTEXT_PROVIDER === "cli",
+      geminiReviewAndJudge: true,
+      lengthTonePolish: false,
+      preferStage1Draft: true,
+      draftQualityViaLlmAndPromptOnly: true,
+      noDeterministicDraftPolish: true,
+      noPostWithoutContext: true,
+      discoverSource: TERAFABX_HOME_VERIFIED_DISCOVER_SOURCE,
+      dailyTarget: TERAFABX_HOME_VERIFIED_COMMENT_DAILY_TARGET,
+      followingSynthesisForDailyTarget: true,
+      isolatedFromOps: true,
+      independentFromOwnPostReply: true,
+      ownPrompts: true,
+      sharedOwnPostPrepare: false,
+      tone: "gwajeuplupi_casual_reply_not_news_summary",
+    },
+  };
+}
+
+function buildHomeVerifiedDashboardData(requestUrl = "/api/discovery/home-verified-dashboard") {
+  const parsedUrl = new URL(requestUrl, "http://localhost");
+  const requested = String(parsedUrl.searchParams.get("date") || "").trim();
+  const date = requested === "all" || /^\d{4}-\d{2}-\d{2}$/.test(requested)
+    ? requested
+    : formatKstDateKey();
+  const state = loadTerafabxState();
+  const status = getTerafabxHomeVerifiedCommentStatus(state);
+  const history = (state.homeVerifiedCommentHistory || []).map((item) => ({
+    at: item.at || null,
+    date: item.at ? formatKstDateKey(item.at) : "",
+    targetUrl: item.targetUrl || item.url || "",
+    replyUrl: item.replyUrl || null,
+    authorHandle: item.authorHandle || "",
+    comment: item.comment || "",
+    source: item.source || TERAFABX_HOME_VERIFIED_COMMENT_SOURCE,
+    generator: item.generator || null,
+    manual: item.manual === true,
+  }));
+  const availableDates = [...new Set(history.map((item) => item.date).filter(Boolean))]
+    .sort((left, right) => right.localeCompare(left));
+  const timeline = (date === "all" ? history : history.filter((item) => item.date === date))
+    .slice(0, 250);
+  const pending = loadTerafabxHomeVerifiedWriteQueue().map((row) => ({
+    id: row.id,
+    at: row.queuedAt || row.lastAttemptAt || null,
+    date: formatKstDateKey(row.queuedAt || row.lastAttemptAt || Date.now()),
+    targetUrl: row.targetUrl,
+    authorHandle: row.authorHandle,
+    comment: row.prepared?.comment || "",
+    stage: row.stage,
+    status: row.status,
+    lastError: row.lastError || null,
+    retryAt: row.retryAt || null,
+    attempts: row.attempts || 0,
+  }));
+  return {
+    ok: true,
+    view: "home-verified",
+    date,
+    availableDates,
+    status,
+    terafabx: { homeVerifiedComment: status },
+    timeline,
+    pending,
+    lastDiscoveryAt: state.homeVerifiedCommentLastDiscoveryAt || null,
+    lastDiscovery: state.homeVerifiedCommentLastDiscoverySummary || null,
+    lastDeadTargetDiscard: state.homeVerifiedCommentLastDeadTargetDiscard || null,
+    summary: {
+      postedToday: status.postedToday,
+      pendingCount: status.pendingCount,
+      backlogCount: status.backlogCount,
+      dailyTarget: status.dailyTarget,
+      enabled: status.enabled,
+    },
+    rows: [],
+  };
 }
 
 function kstHour(date = new Date()) {
@@ -4124,6 +5767,11 @@ function terafabxAutoCommentBrowserResources() {
     ownReply: { port: TERAFABX_OWN_POST_REPLY_X_PORT, profileDir: TERAFABX_OWN_POST_REPLY_X_PROFILE_DIR, lockPath: TERAFABX_OWN_POST_REPLY_X_LOCK_PATH },
     ownScan: { port: TERAFABX_OWN_POST_SCAN_X_PORT, profileDir: TERAFABX_OWN_POST_SCAN_X_PROFILE_DIR, lockPath: TERAFABX_OWN_POST_SCAN_X_LOCK_PATH },
     ownHeart: { port: TERAFABX_OWN_POST_HEART_X_PORT, profileDir: TERAFABX_OWN_POST_HEART_X_PROFILE_DIR, lockPath: TERAFABX_OWN_POST_HEART_X_LOCK_PATH },
+    homeVerified: {
+      port: TERAFABX_HOME_VERIFIED_COMMENT_X_PORT,
+      profileDir: TERAFABX_HOME_VERIFIED_COMMENT_X_PROFILE_DIR,
+      lockPath: TERAFABX_HOME_VERIFIED_COMMENT_X_LOCK_PATH,
+    },
   };
 }
 
@@ -5059,7 +6707,7 @@ async function getTerafabxAutoCommentHeadlessPage(kind, url) {
 
 async function getTerafabxIsolatedXHeadlessPage(kind, url) {
   const resource = terafabxAutoCommentBrowserResources()[kind];
-  if (!resource || !["ownReply", "ownScan", "ownHeart"].includes(kind)) {
+  if (!resource || !["ownReply", "ownScan", "ownHeart", "homeVerified"].includes(kind)) {
     throw new Error(`지원하지 않는 격리 X 작업 브라우저 종류: ${kind}`);
   }
   logEvent("terafabx_isolated_x_browser_open_start", { kind, port: resource.port, url });
@@ -5068,7 +6716,18 @@ async function getTerafabxIsolatedXHeadlessPage(kind, url) {
     const browser = await ensureTerafabxIsolatedXBrowser(kind);
     page = await newPageForPort(resource.port, "about:blank");
     await page.send("Page.bringToFront", {}, 3000).catch(() => null);
-    await copyXCookiesToPage(page);
+    // 격리 프로필에 로그인 쿠키가 있으면 그걸 쓴다. 운영/별도 CDP(CHROME_PORT) 쿠키 소스가
+    // 없어도 ECONNREFUSED로 전체 게시를 막지 않는다.
+    try {
+      await copyXCookiesToPage(page);
+    } catch (cookieError) {
+      logEvent("terafabx_isolated_x_cookie_copy_skipped", {
+        kind,
+        port: resource.port,
+        error: cookieError.message,
+        note: "profile cookies only",
+      });
+    }
     await page.navigate(url, 2500);
     logEvent("terafabx_isolated_x_browser_ready", {
       kind,
@@ -8106,7 +9765,17 @@ function runGrokCli(prompt, timeout = 90_000) {
 }
 
 function agentBrowserCommandArgs(args = [], bin = AGENT_BROWSER_BIN) {
-  return path.basename(String(bin || "")) === "npx" ? ["--yes", "agent-browser", ...args] : args;
+  // agent-browser 0.26+ 는 --namespace 제거. --session 만 사용.
+  const cleaned = [];
+  const list = Array.isArray(args) ? args : [];
+  for (let i = 0; i < list.length; i += 1) {
+    if (list[i] === "--namespace") {
+      i += 1; // skip value
+      continue;
+    }
+    cleaned.push(list[i]);
+  }
+  return path.basename(String(bin || "")) === "npx" ? ["--yes", "agent-browser", ...cleaned] : cleaned;
 }
 
 function terafabxGrokStateAgentBrowserNamespace(cdpPort = TERAFABX_GROK_WEB_SOURCE_CDP_PORT) {
@@ -12711,6 +14380,7 @@ function getTerafabxAutomationStatus() {
         lastSummary: state.ownPostCoverageLastSummary,
       },
     },
+    homeVerifiedComment: getTerafabxHomeVerifiedCommentStatus(state),
     ownPostReply: {
       enabled: Boolean(state.ownPostReplyEnabled),
       busy: terafabxOwnPostReplyBusy,
@@ -20627,6 +22297,84 @@ const server = http.createServer(async (req, res) => {
     }
     return;
   }
+  if (req.method === "POST" && req.url === "/api/terafabx/home-verified-comment") {
+    try {
+      const body = await readRequestBody(req);
+      const payload = JSON.parse(body || "{}");
+      const action = String(payload.action || "status");
+      if (!["status", "enable", "disable", "prefill_only", "live", "ingest", "discover", "prepare", "pump", "discard", "post_one", "purge_policy_fail", "purge_dead_targets"].includes(action)) {
+        throw new Error("action은 status, enable, disable, prefill_only, live, ingest, discover, prepare, pump, discard, post_one, purge_policy_fail, purge_dead_targets만 가능합니다.");
+      }
+      let result = null;
+      if (action === "status") {
+        result = getTerafabxHomeVerifiedCommentStatus();
+      } else if (action === "enable") {
+        result = saveTerafabxState({ homeVerifiedCommentEnabled: true });
+      } else if (action === "disable") {
+        result = saveTerafabxState({ homeVerifiedCommentEnabled: false });
+      } else if (action === "prefill_only") {
+        result = saveTerafabxState({ homeVerifiedCommentPrefillOnly: true });
+      } else if (action === "live") {
+        result = saveTerafabxState({ homeVerifiedCommentPrefillOnly: false });
+      } else if (action === "ingest") {
+        const items = Array.isArray(payload.candidates) ? payload.candidates : [];
+        if (!items.length) throw new Error("candidates 배열이 필요합니다.");
+        result = ingestTerafabxHomeVerifiedCandidates(items, { limit: payload.limit });
+      } else if (action === "discover") {
+        result = await discoverTerafabxHomeVerifiedCandidates({
+          limit: payload.limit,
+          maxCheck: payload.maxCheck,
+          batchSize: payload.batchSize,
+        });
+      } else if (action === "prepare") {
+        result = await runTerafabxHomeVerifiedCommentPrepareCycle({
+          manual: true,
+          limit: payload.limit,
+          candidates: payload.candidates,
+        });
+      } else if (action === "pump") {
+        result = pumpTerafabxHomeVerifiedWriteQueue();
+      } else if (action === "post_one") {
+        // 수동 1건 실게시: prefill_only를 잠시 무시하고 FIFO 한 건만 writer 실행
+        const rows = loadTerafabxHomeVerifiedWriteQueue().filter((row) => (
+          row.stage !== "verification_required"
+          && (row.status === "queued" || row.status === "posting")
+        ));
+        const targetUrl = payload.targetUrl ? normalizeXStatusUrl(payload.targetUrl) : "";
+        const pick = targetUrl
+          ? rows.find((row) => row.targetUrl === targetUrl)
+          : rows[0];
+        if (!pick) throw new Error("게시할 pending 초안이 없습니다.");
+        const previousPrefill = loadTerafabxState().homeVerifiedCommentPrefillOnly !== false;
+        saveTerafabxState({ homeVerifiedCommentPrefillOnly: false, homeVerifiedCommentEnabled: true });
+        try {
+          result = await postTerafabxHomeVerifiedWriteRecord({
+            ...pick,
+            manual: true,
+          });
+        } finally {
+          if (previousPrefill) saveTerafabxState({ homeVerifiedCommentPrefillOnly: true });
+        }
+      } else if (action === "discard") {
+        const targetUrl = normalizeXStatusUrl(payload.targetUrl || "");
+        const id = String(payload.id || "");
+        const rows = loadTerafabxHomeVerifiedWriteQueue();
+        const match = rows.find((row) => row.id === id || row.targetUrl === targetUrl);
+        if (!match) throw new Error("폐기할 대기 항목이 없습니다.");
+        removeTerafabxHomeVerifiedWrite(match.id);
+        result = { discarded: match.id, targetUrl: match.targetUrl };
+      } else if (action === "purge_policy_fail") {
+        result = purgeHomeVerifiedPolicyFailPending({ sample: payload.sample });
+      } else if (action === "purge_dead_targets") {
+        result = purgeHomeVerifiedDeadTargetPending({ sample: payload.sample, maxAttempts: payload.maxAttempts });
+      }
+      json(res, 200, { ok: true, action, result, status: getTerafabxHomeVerifiedCommentStatus() });
+    } catch (error) {
+      logEvent("terafabx_home_verified_comment_action_error", { error: error.message });
+      json(res, 500, { ok: false, error: error.message });
+    }
+    return;
+  }
   if (req.method === "POST" && req.url === "/api/terafabx/own-post-reply") {
     try {
       const body = await readRequestBody(req);
@@ -21150,6 +22898,15 @@ const server = http.createServer(async (req, res) => {
       json(res, 200, { ok: true, result, status: getTerafabxAutomationStatus() });
     } catch (error) {
       logEvent("discovery_coupang_affiliate_comment_error", { canonicalUrl, error: error.message });
+      json(res, 500, { ok: false, error: error.message });
+    }
+    return;
+  }
+  if (req.method === "GET" && req.url.startsWith("/api/discovery/home-verified-dashboard")) {
+    try {
+      json(res, 200, buildHomeVerifiedDashboardData(req.url));
+    } catch (error) {
+      logEvent("home_verified_dashboard_api_error", { error: error.message });
       json(res, 500, { ok: false, error: error.message });
     }
     return;
@@ -21817,6 +23574,29 @@ function startBackgroundWorkAfterBrowserCleanup() {
     });
   }, 60 * 1000);
 
+  setTimeout(() => {
+    try {
+      const result = pumpTerafabxHomeVerifiedWriteQueue();
+      logEvent("terafabx_home_verified_write_queue_startup", result);
+    } catch (error) {
+      logEvent("terafabx_home_verified_write_queue_startup_error", { error: error.message });
+    }
+  }, 4000);
+
+  setInterval(() => {
+    try {
+      pumpTerafabxHomeVerifiedWriteQueue();
+    } catch (error) {
+      logEvent("terafabx_home_verified_write_queue_tick_error", { error: error.message });
+    }
+  }, 5_000);
+
+  setInterval(() => {
+    maybeRunTerafabxHomeVerifiedCommentAutomation().catch((error) => {
+      logEvent("terafabx_home_verified_tick_error", { error: error.message });
+    });
+  }, 60 * 1000);
+
   setInterval(() => {
     maybeRunTerafabxOwnPostHeartAutomation().catch((error) => {
       logEvent("terafabx_own_post_heart_tick_error", { error: error.message });
@@ -21986,6 +23766,23 @@ module.exports = {
   assessTerafabxLanguageQuality,
   stripTerafabxListPrefix,
   classifyTerafabxOwnPostReplies,
+  classifyTerafabxHomeVerifiedOriginalCandidate,
+  selectTerafabxHomeVerifiedOriginalCandidates,
+  buildTerafabxHomeVerifiedCommentTarget,
+  assessTerafabxHomeVerifiedWriteQuality,
+  normalizeTerafabxHomeVerifiedWriteQueue,
+  ingestTerafabxHomeVerifiedCandidates,
+  discoverTerafabxHomeVerifiedCandidates,
+  getTerafabxHomeVerifiedCommentStatus,
+  analyzeHomeVerifiedContext,
+  analyzeHomeVerifiedContextWithGemini,
+  buildHomeVerifiedPreparedCommentRecord,
+  prepareTerafabxHomeVerifiedComment,
+  reviewHomeVerifiedReplyWithGemini,
+  closeTerafabxGeminiHeadlessBrowser,
+  ensureTerafabxGeminiHeadlessBrowser,
+  homeVerifiedCommentLib,
+  homeVerifiedCommentPrompts,
   assessTerafabxReplyRelationship,
   findTerafabxOwnReplyToTarget,
   recoverTerafabxUncertainReply,

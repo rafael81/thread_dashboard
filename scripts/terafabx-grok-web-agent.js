@@ -94,12 +94,12 @@ function agentBrowserInvocation(args, options = {}) {
     runtimeDir,
     args: [
       ...prefix,
-      "--namespace", namespace,
+      // agent-browser 0.26+ 는 --namespace 미지원. --session 만 사용.
       "--session", namespace,
       "--headed", headed ? "true" : "false",
       // agent-browser rejects storage_state together with a persistent
       // profile. Grok needs the saved login state, so state-backed runs use
-      // the namespace-owned ephemeral browser; profile-only runs retain the
+      // the session-owned ephemeral browser; profile-only runs retain the
       // deterministic project-owned directory for cleanup.
       ...(!state && !options.resume ? ["--profile", profileDir] : []),
       "--args", "--lang=ko-KR,--window-size=1440,900",
@@ -204,7 +204,7 @@ async function closeAgentBrowserSession(session) {
   const requestedClose = namespaceHasRuntimeArtifacts(namespace);
   if (requestedClose) {
     await new Promise((resolve) => {
-      execFile(bin, [...prefix, "--namespace", namespace, "--session", namespace, "--headed", "false", "close"], {
+      execFile(bin, [...prefix, "--session", namespace, "--headed", "false", "close"], {
         timeout: 15000,
         maxBuffer: 1024 * 1024,
         env: {

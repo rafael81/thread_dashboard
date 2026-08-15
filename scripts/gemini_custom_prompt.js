@@ -33,15 +33,31 @@ function geminiAgentBrowserNamespace(cdp) {
   return `gm-${crypto.createHash("sha1").update(String(cdp || "gemini")).digest("hex").slice(0, 12)}`;
 }
 
+function resolveInstalledAgentBrowserBin() {
+  if (process.env.AGENT_BROWSER_BIN) return process.env.AGENT_BROWSER_BIN;
+  const candidates = [
+    "/opt/homebrew/opt/agent-browser/bin/agent-browser",
+    "/usr/local/opt/agent-browser/bin/agent-browser",
+    "/opt/homebrew/bin/agent-browser",
+  ];
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) return candidate;
+    } catch {}
+  }
+  return "npx";
+}
+
+
 function agentBrowserInvocation(cdp, args, options = {}) {
-  const bin = options.bin || process.env.AGENT_BROWSER_BIN || "npx";
+  const bin = options.bin || resolveInstalledAgentBrowserBin();
   const namespace = options.namespace || geminiAgentBrowserNamespace(cdp);
   return {
     bin,
     namespace,
+    // agent-browser 0.26+ 는 --namespace 미지원. --session 만 사용.
     args: [
       ...(path.basename(String(bin)) === "npx" ? ["--yes", "agent-browser"] : []),
-      "--namespace", namespace,
       "--session", namespace,
       "--cdp", cdp,
       ...args,

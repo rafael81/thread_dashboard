@@ -15,6 +15,7 @@
     "audit:prefill": "node scripts/audit-terafabx-prefill-gemini.js",
     "ab:semantic": "node scripts/semantic-role-shadow-ab.js",
     "mirror-server": "node scripts/start-mirror-server.js",
+    "start:isolated": "node scripts/start-isolated-dev.js",
     "test": "node --test"
   },
   "keywords": [],
