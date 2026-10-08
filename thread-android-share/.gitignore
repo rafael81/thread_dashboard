@@ -1,6 +1,6 @@
-.DS_Store
+.gradle/
 build/
+local.properties
 app/build/
 *.apk
-*.idsig
-*.keystore
+.idea/

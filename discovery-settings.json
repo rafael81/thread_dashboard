@@ -1,4 +1,13 @@
 {
   "autoDiscoveryEnabled": false,
-  "autoStyleScheduleEnabled": false
+  "autoStyleScheduleEnabled": false,
+  "scheduleDeliveryMode": "local_post",
+  "groupApproval": {
+    "enabled": true,
+    "rolloutStage": "manual_batch",
+    "dailyPostCap": 4,
+    "minIntervalMs": 2400000,
+    "standingApprovedGroups": [],
+    "geminiAssistEnabled": true
+  }
 }

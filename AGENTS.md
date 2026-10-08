@@ -27,13 +27,14 @@
 
 ## Discovery Dashboard Rules
 
-- Discovery scans run every 5 minutes by default.
-- Discovery mode is dashboard/manual-review first: collect Threads timeline posts with at least 1000 likes and confirmed media, save them as `review`, and show them on `/discovery`.
-- Do not auto-post discovered items and do not auto-save them to X drafts.
+- Discovery scans run every 5 minutes by default, and auto discovery stops itself after 24 newly saved review items in the current enabled session. A scan also stops scrolling once 24 video candidates are collected.
+- Discovery mode is dashboard/manual-review first: collect Threads timeline videos that are cute animal posts with engagement (views when available, otherwise likes) greater than 1000, whose caption context matches the existing posted style, save them as `review`, and show them on `/discovery`. Image-only, non-Korean, non-animal, and personal diary captions are not candidates. Duplicate URLs and duplicate posted text must not be posted again. Saved titles are a Gemini rewrite in the posted voice, not the Threads caption copied as-is.
+- Do not auto-post discovered items and do not auto-save them to X drafts, except rows in an approved A/B candidate-group batch. Group approval is snapshot-only unless `groupApproval.standingApprovedGroups` includes `A` and `rolloutStage` is `steady`. C and unapproved rows must never be posted or scheduled automatically.
 - Dashboard `게시` posts immediately with no confirmation popup.
 - Dashboard `초안 저장` is manual only; it uses X compose and marks the row `x_draft` only after X draft save succeeds.
-- Dashboard `예약 게시` is manual only; it uses the real X schedule UI with the dashboard-selected time and marks the row `scheduled` only after X schedule confirmation succeeds.
-- Dashboard `자동 예약` is manual only; it schedules at 30 minutes after the latest known future X scheduled slot and marks the row `scheduled` only after X schedule confirmation succeeds.
+- Dashboard `예약 게시` is manual only. Delivery is controlled by `scheduleDeliveryMode` (`ab` / `x_native` / `local_post`, default `ab`): `x_native` uses the real X schedule UI and marks the row `scheduled` only after X schedule confirmation succeeds; `local_post` stores the slot locally and does not open X compose. In `ab` mode, assignment is a stable SHA-1 split of `canonicalUrl`.
+- Dashboard `자동 예약` is manual only; it schedules at least 40 minutes after the latest known future X scheduled slot, with a random 5-minute offset that is never on the hour. The same `scheduleDeliveryMode` assignment applies. `x_native` marks `scheduled` only after X schedule confirmation succeeds; `local_post` marks `scheduled` immediately with `schedule_delivery=local_post`.
+- Local scheduled rows are posted at due time by the dashboard `게시` path (`postDiscoveryRowToX` with `fulfillLocalSchedule`). Do not treat a due local reservation as posted until that dispatcher succeeds. X schedule monitor must ignore `local_post` rows so it does not recreate them on X.
 - Do not show stale `skipped` rows in the dashboard. Old timeline-only previews can differ from the real Threads post if detail extraction failed.
 - Dashboard cards should include fixed-size media previews, playable video controls, posted time for processed rows, and collapsed diagnostics for real errors only.
 

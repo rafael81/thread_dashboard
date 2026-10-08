@@ -83,7 +83,8 @@ test("posted table renders reply completion with direct-scan provenance", () => 
 test("posted table exposes a destructive dashboard delete action", () => {
   const table = fs.readFileSync(path.join(__dirname, "..", "dashboard", "src", "components", "data-table.tsx"), "utf8");
   const main = fs.readFileSync(path.join(__dirname, "..", "dashboard", "src", "main.jsx"), "utf8");
-  assert.match(table, /isPosted \? \([\s\S]*variant="destructive"[\s\S]*삭제/);
+  assert.match(table, /isScheduled \? \([\s\S]*onCancelSchedule[\s\S]*\) : \([\s\S]*onDiscard[\s\S]*삭제/);
+  assert.match(table, /variant="destructive"[\s\S]*삭제/);
   assert.match(table, /대시보드에서 삭제/);
   assert.match(main, /대시보드 게시됨 목록에서 이 항목을 삭제할까요/);
   assert.match(main, /게시됨 항목 삭제됨/);

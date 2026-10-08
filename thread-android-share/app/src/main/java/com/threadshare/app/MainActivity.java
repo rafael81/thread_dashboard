@@ -108,7 +108,7 @@ public class MainActivity extends Activity {
         threadUrlInput.setSingleLine(false);
         threadUrlInput.setMinLines(2);
         threadUrlInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
-        threadUrlInput.setHint("Threads 원글 URL 입력");
+        threadUrlInput.setHint("Threads 또는 YouTube URL 입력");
         root.addView(threadUrlInput, matchWrap());
 
         submitButton = new Button(this);
@@ -162,7 +162,7 @@ public class MainActivity extends Activity {
         if (threadUrl == null) {
             sharedUrlText.setText("");
             setLoading(false);
-            setStatus("공유 텍스트에서 Threads 원글 URL을 찾지 못했습니다.", false);
+            setStatus("공유 텍스트에서 Threads 또는 YouTube URL을 찾지 못했습니다.", false);
             return;
         }
         threadUrlInput.setText(threadUrl);
@@ -174,7 +174,7 @@ public class MainActivity extends Activity {
         if (threadUrl == null) {
             sharedUrlText.setText("");
             setLoading(false);
-            setStatus("Threads 원글 URL을 입력해 주세요.", false);
+            setStatus("Threads 또는 YouTube URL을 입력해 주세요.", false);
             return;
         }
         postImmediately(threadUrl, false);
@@ -370,11 +370,11 @@ public class MainActivity extends Activity {
         for (String candidate : candidates) {
             String normalized = normalizeThreadUrl(candidate);
             if (normalized != null) {
-                Log.i(TAG, "Accepted Threads share URL " + normalized);
+                Log.i(TAG, "Accepted share URL " + normalized);
                 return normalized;
             }
         }
-        Log.w(TAG, "No Threads URL found in share candidates " + candidates);
+        Log.w(TAG, "No Threads/YouTube URL found in share candidates " + candidates);
         return null;
     }
 

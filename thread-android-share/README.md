@@ -13,19 +13,19 @@ one app can never switch to the other action at runtime.
 
 ## Flow
 
-1. In the Threads Android app, open a post and choose Share.
+1. In the Threads or YouTube Android app, open a post/video and choose Share.
 2. Select one of the share targets:
 
    - `대시보드 저장`
    - `자동 예약`
 
-3. The app extracts the Threads post URL and sends it to the local dashboard server.
+3. The app extracts the Threads post URL or YouTube watch/Shorts/`youtu.be` URL and sends it to the local dashboard server.
 
 URL extraction checks Android text/title extras, `CharSequence` values, intent
 data, stream extras, and every `ClipData` item so sender payload changes do not
 silently drop a valid Threads link.
-Full `/@user/post/id` links, legacy `/t/id` links, and current
-`/share/token/` links are accepted. The app forwards the shared URL form directly
+Full `/@user/post/id` links, legacy `/t/id` links, current
+`/share/token/` links, and YouTube watch/Shorts/`youtu.be` links are accepted. The app forwards the shared URL form directly
 to the dashboard server; the server owns redirect resolution and canonical URL
 normalization so future resolver changes do not require an Android app update.
 

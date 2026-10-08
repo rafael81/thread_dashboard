@@ -1180,7 +1180,9 @@ function Dashboard() {
   const initialView = location.pathname.startsWith("/inssider-pending")
     ? "inssider-pending"
     : new URLSearchParams(location.search).get("view") || "discovered";
+  const initialGroup = new URLSearchParams(location.search).get("group") || "";
   const [view, setView] = useState(initialView);
+  const [group, setGroup] = useState(initialGroup);
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState("");
@@ -1219,7 +1221,7 @@ function Dashboard() {
             ? { ok: true, adpost: await api(`/api/naver-adpost/revenue?startDate=${compactCoupangDate(adpostRange.startDate)}&endDate=${compactCoupangDate(adpostRange.endDate)}${options.force ? "&refresh=1" : ""}`) }
           : nextView === "home-verified"
             ? await api(`/api/discovery/home-verified-dashboard?date=${encodeURIComponent(options.automationDate || automationDate)}`)
-          : await api(`/api/discovery/dashboard?view=${encodeURIComponent(nextView)}${nextView === "automation" ? `&date=${encodeURIComponent(options.automationDate || automationDate)}` : ""}`);
+          : await api(`/api/discovery/dashboard?view=${encodeURIComponent(nextView)}${nextView === "discovered" && (options.group ?? group) ? `&group=${encodeURIComponent(options.group ?? group)}` : ""}${nextView === "automation" ? `&date=${encodeURIComponent(options.automationDate || automationDate)}` : ""}`);
     setData(result);
     setTitleEdits((current) => Object.fromEntries((result.rows || []).map((row) => [
       row.canonicalUrl,
@@ -1241,14 +1243,16 @@ function Dashboard() {
     } else {
       url.pathname = "/discovery";
       url.searchParams.set("view", view);
+      if (view === "discovered" && group) url.searchParams.set("group", group);
+      else url.searchParams.delete("group");
     }
     history.replaceState(null, "", url);
     setLoading(true);
-    load(view).catch((err) => {
+    load(view, { group }).catch((err) => {
       setError(err.message);
       setLoading(false);
     });
-  }, [view, automationDate, coupangRange.startDate, coupangRange.endDate, adpostRange.startDate, adpostRange.endDate]);
+  }, [view, group, automationDate, coupangRange.startDate, coupangRange.endDate, adpostRange.startDate, adpostRange.endDate]);
 
   useEffect(() => {
     if (!autoRefresh) return undefined;
@@ -1459,6 +1463,88 @@ function Dashboard() {
     }
   }
 
+  async function discardDiscoveryRowsBatch(selectedRows) {
+    const rowsToDiscard = selectedRows.filter((row) => row?.canonicalUrl);
+    if (!rowsToDiscard.length) return;
+    const ok = window.confirm(
+      `선택한 ${rowsToDiscard.length}개 항목을 발굴됨 목록에서 삭제할까요?\nX/Threads 원글은 삭제하지 않으며, 목록에서만 숨깁니다.`,
+    );
+    if (!ok) return;
+    setBusy("batch-discard");
+    setError("");
+    const failed = [];
+    let discarded = 0;
+    try {
+      for (const row of rowsToDiscard) {
+        try {
+          await api("/api/discovery/discard", {
+            method: "POST",
+            body: JSON.stringify({ url: row.canonicalUrl }),
+          });
+          discarded += 1;
+          setTitleEdits((current) => {
+            const next = { ...current };
+            delete next[row.canonicalUrl];
+            return next;
+          });
+          setScheduleEdits((current) => {
+            const next = { ...current };
+            delete next[row.canonicalUrl];
+            return next;
+          });
+        } catch (err) {
+          failed.push({ row, error: err.message });
+        }
+      }
+      await load(view);
+      if (discarded) toast.success(`${discarded}건 삭제됨`);
+      if (failed.length) {
+        const message = `${failed.length}건 삭제 실패 · ${failed.map((item) => item.row.author || item.row.canonicalUrl).join(", ")}`;
+        setError(message);
+        toast.error(message);
+      }
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function cancelDiscoveryScheduledRowsBatch(selectedRows) {
+    const rowsToCancel = selectedRows.filter((row) => row?.status === "scheduled" && row?.scheduledPostAt && row?.canonicalUrl);
+    if (!rowsToCancel.length) return;
+    const localCount = rowsToCancel.filter((row) => row.scheduleDelivery === "local_post").length;
+    const xCount = rowsToCancel.length - localCount;
+    const confirmMessage = localCount && xCount
+      ? `선택한 ${rowsToCancel.length}개 예약을 취소할까요? X 예약 ${xCount}건은 X에서 삭제하고, 로컬 예약 ${localCount}건은 대시보드에서만 되돌립니다.`
+      : localCount
+        ? `선택한 ${localCount}개 로컬 예약을 취소하고 발굴됨으로 되돌릴까요? X에는 예약이 없습니다.`
+        : `선택한 ${rowsToCancel.length}개 예약글을 X에서 취소하고 발굴됨으로 되돌릴까요?`;
+    const ok = window.confirm(confirmMessage);
+    if (!ok) return;
+    setBusy("batch-cancel-schedule");
+    setError("");
+    try {
+      const result = await api("/api/discovery/cancel-schedule-batch", {
+        method: "POST",
+        body: JSON.stringify({ urls: rowsToCancel.map((row) => row.canonicalUrl) }),
+      });
+      await load(view);
+      const cancelled = Number(result.cancelledCount || 0);
+      const failed = result.failed || [];
+      if (cancelled) toast.success(`${cancelled}건 예약 취소됨 · 발굴됨으로 이동했습니다`);
+      if (failed.length) {
+        const message = `${failed.length}건 예약 취소 실패 · ${failed.map((item) => item.canonicalUrl).join(", ")}`;
+        setError(message);
+        toast.error(message);
+      }
+    } catch (err) {
+      setError(err.message);
+      toast.error(err.message);
+      await load(view).catch(() => undefined);
+    } finally {
+      setBusy("");
+    }
+  }
+
   async function runTerafabx(job, action) {
     await runAction(`terafabx-${job}-${action}`, async () => {
       const result = await api("/api/terafabx/automation", {
@@ -1586,12 +1672,31 @@ function Dashboard() {
     <DataTable
       rows={rows}
       view={view}
+      group={group}
+      groupCounts={summary.groupCounts || {}}
+      approvalEnabled={Boolean(summary.groupApproval?.enabled) && summary.groupApproval?.rolloutStage !== "shadow"}
       counts={summary}
       titleEdits={titleEdits}
       scheduleEdits={scheduleEdits}
       busy={busy}
       autoScheduleSubmitting={autoScheduleSubmitting}
       onViewChange={changeView}
+      onGroupChange={setGroup}
+      onApproveGroup={(nextGroup, groupRows) =>
+        runAction(`approve-${nextGroup}`, () => api("/api/discovery/approve-group", {
+          method: "POST",
+          body: JSON.stringify({
+            group: nextGroup,
+            canonicalUrls: groupRows.map((row) => row.canonicalUrl),
+          }),
+        }), `${nextGroup} 그룹 승인됨`)
+      }
+      onUnapprove={(groupRows) =>
+        runAction("unapprove", () => api("/api/discovery/unapprove", {
+          method: "POST",
+          body: JSON.stringify({ canonicalUrls: groupRows.map((row) => row.canonicalUrl) }),
+        }), "승인 취소됨")
+      }
       onTitleChange={setTitleEdits}
       onScheduleChange={setScheduleEdits}
       onSaveTitle={saveDiscoveryTitle}
@@ -1615,10 +1720,12 @@ function Dashboard() {
             text: rowText(row, text),
             scheduledAt: scheduledAt || scheduleEdits[row.canonicalUrl],
           }),
-        }), "X 예약됨")
+        }), "예약됨")
       }
       onAutoSchedule={queueDiscoveryAutoSchedule}
       onBatchAutoSchedule={queueDiscoveryAutoScheduleBatch}
+      onBatchDiscard={discardDiscoveryRowsBatch}
+      onBatchCancelSchedule={cancelDiscoveryScheduledRowsBatch}
       onCancelSchedule={(row) =>
         runAction(`cancel-schedule-${row.canonicalUrl}`, () => api("/api/discovery/cancel-schedule", {
           method: "POST",
@@ -1871,21 +1978,46 @@ function Dashboard() {
                     </Button>
                     <Button
                       className="col-span-2"
-                      variant={summary.autoStyleScheduleEnabled ? "outline" : "default"}
+                      variant={summary.groupApproval?.enabled ? "outline" : "default"}
                       disabled={controlsBusy}
                       onClick={() =>
-                        runAction("auto-style-schedule", () => api("/api/discovery/auto-style-schedule", {
+                        runAction("group-approval", () => api("/api/discovery/group-approval", {
                           method: "POST",
-                          body: JSON.stringify({ enabled: !summary.autoStyleScheduleEnabled }),
-                        }), "스타일 자동예약 설정 변경됨")
+                          body: JSON.stringify({ enabled: !summary.groupApproval?.enabled }),
+                        }), "그룹 승인 게시 설정 변경됨")
                       }
                     >
-                      {summary.autoStyleScheduleEnabled ? <PauseCircleIcon data-icon="inline-start" /> : <PlayCircleIcon data-icon="inline-start" />}
-                      {summary.autoStyleScheduleEnabled ? "스타일 자동예약 중지" : "스타일 자동예약 시작"}
+                      {summary.groupApproval?.enabled ? <PauseCircleIcon data-icon="inline-start" /> : <PlayCircleIcon data-icon="inline-start" />}
+                      {summary.groupApproval?.enabled ? "그룹 승인 게시 중지" : "그룹 승인 게시 시작"}
                     </Button>
                     <p className="col-span-2 text-xs text-muted-foreground">
-                      좋아요 1천+ · 미디어 확인 · 스타일 점수 {summary.autoStyleMinScore || 6}+ · 회당 최대 {summary.autoStyleScheduleMaxPerScan || 1}개 · {summary.autoStyleMaxFutureHours || 18}시간 앞까지만 예약
+                      단계 {summary.groupApproval?.rolloutStage || "shadow"} · 일일 상한 {summary.groupApproval?.dailyPostCap || 8} · 승인된 A/B만 예약. C와 미승인 행은 게시하지 않습니다.
                     </p>
+                    <div className="col-span-2 grid gap-2">
+                      <Label htmlFor="schedule-delivery-mode">예약 전달 A/B</Label>
+                      <Select
+                        value={summary.scheduleDeliveryMode || "ab"}
+                        onValueChange={(mode) =>
+                          runAction("schedule-delivery-mode", () => api("/api/discovery/schedule-delivery-mode", {
+                            method: "POST",
+                            body: JSON.stringify({ mode }),
+                          }), "예약 전달 방식 변경됨")
+                        }
+                        disabled={controlsBusy}
+                      >
+                        <SelectTrigger id="schedule-delivery-mode" className="w-full">
+                          <SelectValue placeholder="예약 전달 방식" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="ab">A/B 50:50 · URL 해시 고정</SelectItem>
+                          <SelectItem value="x_native">X 네이티브 예약만</SelectItem>
+                          <SelectItem value="local_post">로컬 직접게시만</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <p className="text-xs text-muted-foreground">
+                        로컬은 예약 시각이 되면 대시보드 `게시`와 같은 경로로 올립니다. 현재 예약 {summary.xNativeScheduledCount || 0}건 X / {summary.localScheduledCount || 0}건 로컬.
+                      </p>
+                    </div>
                     <Button
                       className="col-span-2"
                       disabled={controlsBusy}

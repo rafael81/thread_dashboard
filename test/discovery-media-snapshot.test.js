@@ -64,10 +64,11 @@ test("expired discovery media snapshots are removed by TTL cleanup", async (t) =
     files: [],
   }));
   fs.writeFileSync(path.join(oldDir, "media-1.jpg"), "x");
-  const result = cleanupExpiredDiscoveryMediaSnapshots({
+  const result = await cleanupExpiredDiscoveryMediaSnapshots({
     root,
     now: Date.now(),
     ttlMs: 7 * 24 * 60 * 60 * 1000,
+    statusCheck: false,
   });
   assert.equal(result.removed, 1);
   assert.equal(fs.existsSync(oldDir), false);

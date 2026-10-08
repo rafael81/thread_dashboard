@@ -88,6 +88,9 @@ const {
   normalizeFxTwitterV2Status,
   fetchFxTwitterConversation,
   flattenFxTwitterConversationReplies,
+  isTerafabxOwnPostConversationComplete,
+  mergeTerafabxFxTwitterConversations,
+  buildTerafabxOwnPostReplyCoverageRecord,
   normalizeTerafabxOwnPostReplyManualQueue,
   terafabxOwnPostReplyQueueItemForUrl,
   terafabxReplyReviewFinalScore,
@@ -963,6 +966,92 @@ test("FxEmbed conversation pagination survives one empty page and deduplicates r
   assert.equal(requests[0].searchParams.get("exclude_author"), "true");
   assert.equal(requests[1].searchParams.get("cursor"), "cursor-1");
   assert.equal(requests[2].searchParams.get("cursor"), "cursor-2");
+});
+
+test("FxEmbed conversation pagination marks remaining cursors as truncated after two empty pages", async () => {
+  const pages = [
+    {
+      code: 200,
+      status: {
+        id: "100",
+        url: "https://x.com/terafabXai/status/100",
+        text: "원글",
+        author: { screen_name: "terafabXai" },
+        replies: 50,
+      },
+      replies: [{ id: "101", url: "https://x.com/alice/status/101", author: { screen_name: "alice" } }],
+      cursor: { bottom: "cursor-1" },
+    },
+    {
+      code: 200,
+      status: { id: "100", replies: 50 },
+      replies: [],
+      cursor: { bottom: "cursor-2" },
+    },
+    {
+      code: 200,
+      status: { id: "100", replies: 50 },
+      replies: [],
+      cursor: { bottom: "cursor-3" },
+    },
+  ];
+  const conversation = await fetchFxTwitterConversation(
+    "https://x.com/terafabXai/status/100",
+    { fetchJson: async () => pages.shift() },
+  );
+  assert.equal(conversation.pageCount, 3);
+  assert.equal(conversation.collectedReplyCount, 1);
+  assert.equal(conversation.truncated, true);
+  assert.equal(conversation.partial, false);
+  assert.equal(isTerafabxOwnPostConversationComplete(conversation), false);
+
+  const record = buildTerafabxOwnPostReplyCoverageRecord({
+    postUrl: "https://x.com/terafabXai/status/100",
+    rootPost: conversation.rootPost,
+    tweets: conversation.tweets,
+    rows: conversation.tweets,
+    collectionSource: conversation.source,
+    collectedReplyCount: conversation.collectedReplyCount,
+    truncated: conversation.truncated,
+    partial: conversation.partial,
+    alreadyReplied: [],
+    candidates: [{ url: "https://x.com/alice/status/101" }],
+    directReplies: [{ id: "101" }],
+  }, { commentHistory: [], ownPostReplyHistory: [] });
+  assert.equal(record.fullScan, false);
+  assert.equal(record.rawReplyCount, 50);
+  assert.equal(record.lastConversationRawReplyCount, 1);
+
+  const metric = buildTerafabxOwnPostReplyCompletionMetrics({
+    commentHistory: [],
+    ownPostReplyHistory: [],
+    ownPostReplyCoverage: { [record.rootPostUrl]: record },
+  }).get(record.rootPostUrl);
+  assert.equal(metric.exact, false);
+  assert.equal(metric.totalCount, 50);
+  assert.equal(metric.xDisplayReplyCount, 50);
+});
+
+test("likes and recency conversation pages merge new replies without dropping earlier ones", () => {
+  const merged = mergeTerafabxFxTwitterConversations({
+    rootPost: { id: "100", replyCount: 5 },
+    tweets: [{ id: "100" }, { id: "101" }],
+    collectedReplyCount: 1,
+    truncated: true,
+    source: "fxtwitter-v2-conversation",
+    pageCount: 3,
+  }, {
+    rootPost: { id: "100", replyCount: 5 },
+    tweets: [{ id: "100" }, { id: "199" }],
+    collectedReplyCount: 1,
+    truncated: false,
+    source: "fxtwitter-v2-conversation",
+    pageCount: 1,
+  });
+  assert.equal(merged.collectedReplyCount, 2);
+  assert.equal(merged.truncated, true);
+  assert.deepEqual(merged.tweets.map((item) => item.id).sort(), ["100", "101", "199"]);
+  assert.match(merged.source, /recency-merge/);
 });
 
 test("manual own-post reply queue survives restart and resolves the latest item per post", () => {

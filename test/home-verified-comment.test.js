@@ -1,4 +1,6 @@
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 const test = require("node:test");
 
 const {
@@ -13,6 +15,9 @@ const {
   authorDailyUsageFromHistory,
   homeVerifiedDailyProgress,
   homeVerifiedPipelineStatus,
+  homeVerifiedActionablePendingCount,
+  homeVerifiedVerificationRequiredCount,
+  homeVerifiedVerificationHoldDisposition,
 } = require("../lib/home-verified-comment");
 
 const {
@@ -274,6 +279,11 @@ test("pipeline status reflects off / prefill / grok block", () => {
 
 test("home verified daily progress targets 500 with following synthesis mode", () => {
   const today = "2026-08-02";
+  const progressPending = [
+    { status: "queued", stage: "pending_post" },
+    { status: "queued", stage: "pending_post" },
+    { status: "queued", stage: "verification_required" },
+  ];
   const progress = homeVerifiedDailyProgress({
     dailyTarget: 500,
     formatKstDateKey: () => today,
@@ -281,11 +291,7 @@ test("home verified daily progress targets 500 with following synthesis mode", (
       { at: "2026-08-02T01:00:00.000Z", source: SOURCE },
       { at: "2026-08-02T02:00:00.000Z", source: SOURCE },
     ],
-    pending: [
-      { status: "queued", stage: "pending_post" },
-      { status: "queued", stage: "pending_post" },
-      { status: "queued", stage: "verification_required" },
-    ],
+    pending: progressPending,
   });
   assert.equal(progress.dailyTarget, 500);
   assert.equal(progress.postedToday, 2);
@@ -294,6 +300,18 @@ test("home verified daily progress targets 500 with following synthesis mode", (
   assert.equal(progress.remainingAfterPending, 496);
   assert.equal(progress.atCap, false);
   assert.equal(progress.sourceMode, "fxtwitter_following_synthesis");
+  assert.equal(homeVerifiedActionablePendingCount(progressPending), 2);
+  assert.equal(homeVerifiedVerificationRequiredCount(progressPending), 1);
+  const freshHold = homeVerifiedVerificationHoldDisposition({
+    stage: "verification_required",
+    lastAttemptAt: new Date().toISOString(),
+  }, Date.now(), { ttlMs: 15 * 60 * 1000 });
+  assert.equal(freshHold.action, "hold");
+  const expiredHold = homeVerifiedVerificationHoldDisposition({
+    stage: "verification_required",
+    lastAttemptAt: "2026-08-05T00:00:00.000Z",
+  }, Date.parse("2026-08-15T00:00:00.000Z"), { ttlMs: 15 * 60 * 1000 });
+  assert.equal(expiredHold.action, "expire");
 
   const capped = homeVerifiedDailyProgress({
     dailyTarget: 500,
@@ -338,6 +356,16 @@ test("mirror_server re-exports home-verified classifiers", () => {
   assert.equal(status.policy.draftQualityViaLlmAndPromptOnly, true);
   assert.equal(status.policy.noDeterministicDraftPolish, true);
   assert.equal(status.policy.geminiReviewAndJudge, true);
+});
+
+test("server load turns on live home-verified comments on other people's posts", () => {
+  const source = fs.readFileSync(path.join(__dirname, "../mirror_server.js"), "utf8");
+  assert.match(source, /loaded\.homeVerifiedCommentEnabled = true/);
+  assert.match(source, /loaded\.homeVerifiedCommentPrefillOnly = false/);
+  assert.match(source, /fallback: "local"/);
+  const defaults = homeVerifiedCommentLib.defaultHomeVerifiedStateSlice();
+  assert.equal(defaults.homeVerifiedCommentEnabled, true);
+  assert.equal(defaults.homeVerifiedCommentPrefillOnly, false);
 });
 
 test("normalize strips non-original timeline noise", () => {
@@ -424,8 +452,11 @@ test("home verified draft quality gate is LLM/judge only (no deterministic style
         },
       },
     },
-    target: { targetText: "아무 원글" },
+    target: { targetText: "휴게소 충전 편해졌다" },
   };
+  base.prepared.geminiReview.finalJudge = homeVerifiedCommentLib.applyHomeVerifiedSourceAudit({
+    ...base.prepared.geminiReview.finalJudge, sourceAnchor: "휴게소 충전",
+  }, base.target, base.prepared.comment, { ambiguous_reference_error: false, temporal_context_error: false, time_sensitive: false });
   const ok = assessHomeVerifiedWriteQuality(base, {
     cleanSocialText: (v) => String(v || "").trim(),
     bannedRe: /$a/,

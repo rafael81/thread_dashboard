@@ -38,4 +38,26 @@ public class ThreadsUrlNormalizerTest {
     public void rejectsNonThreadsUrl() {
         assertNull(ThreadsUrlNormalizer.normalizeSharedUrl("https://example.com/share/BAOz5GWDCK"));
     }
+
+    @Test
+    public void acceptsYouTubeWatchUrlInsideSharedText() {
+        assertEquals(
+                "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                ThreadsUrlNormalizer.normalizeSharedUrl(
+                        "한국 KF 21하고 미국 F 35 https://www.youtube.com/watch?v=dQw4w9WgXcQ&feature=share"
+                )
+        );
+    }
+
+    @Test
+    public void acceptsYouTubeShortsAndShortLinks() {
+        assertEquals(
+                "https://www.youtube.com/shorts/Fe44xglvqbg",
+                ThreadsUrlNormalizer.normalizeSharedUrl("https://m.youtube.com/shorts/Fe44xglvqbg?si=abc")
+        );
+        assertEquals(
+                "https://www.youtube.com/watch?v=Fe44xglvqbg",
+                ThreadsUrlNormalizer.normalizeSharedUrl("제목 보세요 https://youtu.be/Fe44xglvqbg?si=xyz")
+        );
+    }
 }

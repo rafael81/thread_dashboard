@@ -87,6 +87,51 @@ function runAgentBrowser(cdp, args, timeoutMs = 30000, namespace = geminiAgentBr
   });
 }
 
+function prepareUploadScript() {
+  return `(async () => {
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const visible = (node) => { const r = node && node.getBoundingClientRect(); return Boolean(r && r.width > 8 && r.height > 8); };
+    const labelOf = (node) => String((node.getAttribute && (node.getAttribute('aria-label') || node.getAttribute('mattooltip') || '')) || node.innerText || node.textContent || '').replace(/\\s+/g, ' ').trim();
+    const clickMatching = async (pattern) => {
+      const nodes = [...document.querySelectorAll('button, [role="button"], [role="menuitem"], div[role="button"]')].filter(visible);
+      const target = nodes.find((node) => pattern.test(labelOf(node)));
+      if (!target) return false;
+      target.click();
+      await sleep(700);
+      return true;
+    };
+    await clickMatching(/업로드 및 도구|Open upload|Upload files|Add files|첨부|Insert assets/i);
+    await clickMatching(/파일 업로드|Upload file|Upload from computer|내 컴퓨터|From device|Photos|이미지 업로드/i);
+    let input = document.querySelector('input[type="file"]');
+    if (!input) {
+      await sleep(800);
+      input = document.querySelector('input[type="file"]');
+    }
+    if (input) {
+      try { input.style.display = 'block'; } catch {}
+      try { input.removeAttribute('hidden'); } catch {}
+      try { input.disabled = false; } catch {}
+    }
+    const loginWall = /로그인|Sign in/i.test(document.body.innerText || '');
+    return JSON.stringify({
+      ok: Boolean(input),
+      inputCount: document.querySelectorAll('input[type="file"]').length,
+      loginWall,
+      disabledUpload: [...document.querySelectorAll('[role="menuitem"]')].some((node) => /파일 업로드|Upload file/i.test(labelOf(node)) && node.getAttribute('aria-disabled') === 'true'),
+    });
+  })()`;
+}
+
+function waitUploadsScript(expectedCount) {
+  return `(() => {
+    const chips = document.querySelectorAll('[data-test-id="file-name"], .uploaded-image, img[src^="blob:"], [class*="uploaded"] img, [class*="attachment"] img');
+    const files = document.querySelectorAll('input[type="file"]');
+    let selected = 0;
+    for (const input of files) selected += (input.files && input.files.length) || 0;
+    return JSON.stringify({ ok: true, chipCount: chips.length, selectedCount: selected, ready: chips.length >= ${Number(expectedCount)} || selected >= ${Number(expectedCount)} });
+  })()`;
+}
+
 function fillScript(prompt) {
   return `(async () => {
     const prompt = ${JSON.stringify(prompt)};
@@ -139,6 +184,42 @@ function readScript(minLength) {
   })()`;
 }
 
+function collectImageArgs(argv) {
+  const images = [];
+  for (let index = 0; index < argv.length; index += 1) {
+    if (argv[index] === "--image" && argv[index + 1] && !argv[index + 1].startsWith("--")) {
+      images.push(path.resolve(argv[++index]));
+    }
+  }
+  return images;
+}
+
+async function uploadGeminiImages(cdp, namespace, imagePaths) {
+  const files = (imagePaths || []).filter((file) => file && fs.existsSync(file));
+  if (!files.length) return { uploaded: 0 };
+  const prepared = normalizeEvalOutput(await runAgentBrowser(cdp, ["eval", "-b", encodeEval(prepareUploadScript())], 45000, namespace));
+  if (!prepared?.ok) {
+    const hint = prepared?.loginWall || prepared?.disabledUpload
+      ? " (Gemini 로그인/업로드 권한 필요)"
+      : "";
+    throw new Error(`Gemini 파일 입력창을 찾지 못했습니다${hint}: ${JSON.stringify(prepared)}`);
+  }
+  await runAgentBrowser(cdp, ["upload", "input[type=file]", ...files], 60000, namespace);
+  const startedAt = Date.now();
+  let last = null;
+  while (Date.now() - startedAt < 45000) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    last = normalizeEvalOutput(await runAgentBrowser(cdp, ["eval", "-b", encodeEval(waitUploadsScript(files.length))], 20000, namespace));
+    if (last?.ready) return { uploaded: files.length, chipCount: last.chipCount, selectedCount: last.selectedCount };
+  }
+  // Gemini sometimes accepts files without a durable chip selector. Proceed if the
+  // file input retained the selection; otherwise fail closed so captions alone are not used.
+  if (Number(last?.selectedCount || 0) >= files.length) {
+    return { uploaded: files.length, chipCount: last?.chipCount || 0, selectedCount: last.selectedCount, soft: true };
+  }
+  throw new Error(`Gemini 이미지 업로드 확인 실패: ${JSON.stringify(last)}`);
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (!args.prompt || !args.out || !args.cdp) throw new Error("--prompt, --out, --cdp가 필요합니다.");
@@ -146,8 +227,14 @@ async function main() {
   const minLength = Math.max(1, Number(args["min-length"] || 6));
   const timeoutMs = Math.max(60000, Number(process.env.TERAFABX_GEMINI_SCRIPT_TIMEOUT_MS || 300000));
   const namespace = geminiAgentBrowserNamespace(args.cdp);
+  const imagePaths = collectImageArgs(process.argv.slice(2));
   await runAgentBrowser(args.cdp, ["open", process.env.TERAFABX_GEMINI_WEB_URL || "https://gemini.google.com/app"], 45000, namespace);
   await runAgentBrowser(args.cdp, ["wait", "3500"], 15000, namespace);
+  if (imagePaths.length) {
+    const upload = await uploadGeminiImages(args.cdp, namespace, imagePaths);
+    process.stderr.write(`gemini_images_uploaded ${JSON.stringify(upload)}\n`);
+    await runAgentBrowser(args.cdp, ["wait", "1500"], 10000, namespace);
+  }
   const filled = normalizeEvalOutput(await runAgentBrowser(args.cdp, ["eval", "-b", encodeEval(fillScript(prompt))], 45000, namespace));
   if (!filled?.ok) throw new Error(`Gemini 입력 실패: ${JSON.stringify(filled)}`);
   await runAgentBrowser(args.cdp, ["press", "Enter"], 15000, namespace);

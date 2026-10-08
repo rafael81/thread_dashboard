@@ -16,6 +16,22 @@ final class ThreadsUrlNormalizer {
             "https?://(?:www\\.)?threads\\.(?:com|net)/share/([^\\s/?#]+)",
             Pattern.CASE_INSENSITIVE
     );
+    private static final Pattern YOUTUBE_BE_URL = Pattern.compile(
+            "https?://(?:www\\.)?youtu\\.be/([A-Za-z0-9_-]{6,})",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern YOUTUBE_WATCH_URL = Pattern.compile(
+            "https?://(?:www\\.|m\\.)?youtube\\.com/watch\\?(?:[^\\s]*)\\bv=([A-Za-z0-9_-]{6,})",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern YOUTUBE_SHORTS_URL = Pattern.compile(
+            "https?://(?:www\\.|m\\.)?youtube\\.com/shorts/([A-Za-z0-9_-]{6,})",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern YOUTUBE_EMBED_LIVE_URL = Pattern.compile(
+            "https?://(?:www\\.|m\\.)?youtube\\.com/(?:embed|live)/([A-Za-z0-9_-]{6,})",
+            Pattern.CASE_INSENSITIVE
+    );
 
     private ThreadsUrlNormalizer() {
     }
@@ -23,7 +39,30 @@ final class ThreadsUrlNormalizer {
     static String normalizeSharedUrl(String text) {
         String canonicalUrl = normalizeCanonicalUrl(text);
         if (canonicalUrl != null) return canonicalUrl;
-        return normalizeRedirectUrl(text);
+        String redirectUrl = normalizeRedirectUrl(text);
+        if (redirectUrl != null) return redirectUrl;
+        return normalizeYouTubeUrl(text);
+    }
+
+    static String normalizeYouTubeUrl(String text) {
+        if (text == null) return null;
+        Matcher shorts = YOUTUBE_SHORTS_URL.matcher(text);
+        if (shorts.find()) {
+            return "https://www.youtube.com/shorts/" + shorts.group(1);
+        }
+        Matcher watch = YOUTUBE_WATCH_URL.matcher(text);
+        if (watch.find()) {
+            return "https://www.youtube.com/watch?v=" + watch.group(1);
+        }
+        Matcher embed = YOUTUBE_EMBED_LIVE_URL.matcher(text);
+        if (embed.find()) {
+            return "https://www.youtube.com/watch?v=" + embed.group(1);
+        }
+        Matcher shortLink = YOUTUBE_BE_URL.matcher(text);
+        if (shortLink.find()) {
+            return "https://www.youtube.com/watch?v=" + shortLink.group(1);
+        }
+        return null;
     }
 
     static String normalizeCanonicalUrl(String text) {

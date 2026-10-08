@@ -94,11 +94,25 @@ export type DashboardRow = {
     controversy?: boolean
   }
   status: string
+  candidateGroup?: "A" | "B" | "C" | string | null
+  scheduleDelivery?: "x_native" | "local_post" | string | null
   scheduledPostAt?: string | null
   postedAt?: string | null
   lastError?: string | null
   canPost?: boolean
   xPostUrl?: string | null
+  story?: {
+    id: string
+    type: "fiction" | "curation"
+    body: string
+    replies: string[]
+    status: string
+    completedReplyCount: number
+    format?: string
+    rootMediaUrls?: string[]
+    replyMediaUrls?: string[][]
+    operatingDate: string
+  }
   replyCompletion?: {
     rootPostUrl: string
     completedCount: number
@@ -118,12 +132,18 @@ export type DashboardRow = {
 type DataTableProps = {
   rows: DashboardRow[]
   view: string
+  group?: string
+  groupCounts?: Record<string, number>
+  approvalEnabled?: boolean
   counts: Record<string, unknown>
   titleEdits: Record<string, string>
   scheduleEdits: Record<string, string>
   busy: string
   autoScheduleSubmitting: string[]
   onViewChange: (view: string) => void
+  onGroupChange?: (group: string) => void
+  onApproveGroup?: (group: string, rows: DashboardRow[]) => void
+  onUnapprove?: (rows: DashboardRow[]) => void
   onTitleChange: React.Dispatch<React.SetStateAction<Record<string, string>>>
   onScheduleChange: React.Dispatch<React.SetStateAction<Record<string, string>>>
   onSaveTitle: (row: DashboardRow, text?: string) => void
@@ -132,6 +152,8 @@ type DataTableProps = {
   onSchedule: (row: DashboardRow, text?: string, scheduledAt?: string) => void
   onAutoSchedule: (row: DashboardRow, text?: string) => void
   onBatchAutoSchedule: (rows: DashboardRow[]) => Promise<void>
+  onBatchDiscard: (rows: DashboardRow[]) => Promise<void>
+  onBatchCancelSchedule: (rows: DashboardRow[]) => Promise<void>
   onCancelSchedule: (row: DashboardRow) => void
   onRefetch: (row: DashboardRow) => void
   onDiscard: (row: DashboardRow) => void
@@ -146,20 +168,27 @@ const views = [
 ]
 
 function isVideo(url = "") {
-  return /\.mp4|\/o1\/v\/t16\//i.test(url)
+  return /\.mp4|\.mov|\.webm|\/o1\/v\/|\/t2\/f2\/m86\/|\/t16\/f2\/m69\//i.test(url)
 }
 
 function mediaDownloadUrl(url = "") {
+  if (url.startsWith("/api/story-schedules/media?")) return url
   return `/api/discovery/media-download?url=${encodeURIComponent(url)}`
 }
 
 function mediaThumbnailUrl(url = "") {
+  if (url.startsWith("/api/story-schedules/media?")) return `${url}&thumbnail=1`
   return `/api/discovery/media-thumbnail?url=${encodeURIComponent(url)}`
+}
+
+function storyStatusLabel(status: string) {
+  return ({ scheduled: "예약됨", awaiting_approval: "미리보기 승인 대기", continuing: "결말 연결 중", needs_review: "확인 필요", failed: "게시 실패", missed: "예약 시각 지남", posted: "게시 완료" } as Record<string, string>)[status] || status
 }
 
 function statusLabel(status: string) {
   const labels: Record<string, string> = {
     review: "검토",
+    approved: "승인됨",
     scheduled: "예약됨",
     posted: "게시됨",
     x_draft: "초안",
@@ -172,10 +201,31 @@ function statusLabel(status: string) {
   return labels[status] || status
 }
 
-function MediaPreview({ row, large = false }: { row: DashboardRow; large?: boolean }) {
+function isLocalScheduleDelivery(row: { scheduleDelivery?: string | null }) {
+  return row.scheduleDelivery === "local_post"
+}
+
+function scheduleDeliveryLabel(row: { scheduleDelivery?: string | null; scheduledPostAt?: string | null; postedAt?: string | null }) {
+  if (isLocalScheduleDelivery(row)) {
+    return row.scheduledPostAt ? "로컬 예약" : "로컬 게시"
+  }
+  if (row.scheduledPostAt) return "X 예약"
+  if (row.postedAt) return "처리"
+  return "미처리"
+}
+
+function MediaPreview({
+  row,
+  large = false,
+  autoPlay = false,
+}: {
+  row: DashboardRow
+  large?: boolean
+  autoPlay?: boolean
+}) {
   const className = large
     ? "flex aspect-video w-full items-center justify-center overflow-hidden rounded-lg bg-muted"
-    : "flex size-16 items-center justify-center overflow-hidden rounded-md bg-muted"
+    : row.story ? "flex h-28 w-20 items-center justify-center overflow-hidden rounded-md bg-muted" : "flex size-16 items-center justify-center overflow-hidden rounded-md bg-muted"
 
   if (!row.mediaPreviewUrl) {
     return (
@@ -198,7 +248,7 @@ function MediaPreview({ row, large = false }: { row: DashboardRow; large?: boole
       <div className={`${className} relative`}>
         {thumbnailSource ? (
           <img
-            className="size-full object-cover"
+            className={row.story ? "size-full object-contain" : "size-full object-cover"}
             src={mediaThumbnailUrl(thumbnailSource)}
             alt=""
             width={64}
@@ -208,11 +258,19 @@ function MediaPreview({ row, large = false }: { row: DashboardRow; large?: boole
             fetchPriority="low"
           />
         ) : (
-          <div className="flex size-full flex-col items-center justify-center gap-1 text-xs text-muted-foreground">
-            <PlayIcon className="size-5" aria-hidden="true" />
-            <span>영상</span>
-          </div>
+          <video
+            className="size-full object-cover"
+            src={row.mediaPreviewUrl}
+            muted
+            playsInline
+            preload="metadata"
+          />
         )}
+        {isVideo(row.mediaPreviewUrl) ? (
+          <span className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/25">
+            <PlayIcon className="size-5 text-white drop-shadow" />
+          </span>
+        ) : null}
       </div>
     )
   }
@@ -225,19 +283,20 @@ function MediaPreview({ row, large = false }: { row: DashboardRow; large?: boole
           src={row.mediaPreviewUrl}
           muted
           playsInline
-          controls={large}
+          controls
           loop
+          autoPlay={autoPlay}
           preload="metadata"
         />
         <Button
           variant="secondary"
-          size={large ? "sm" : "icon-sm"}
+          size="sm"
           className="absolute bottom-2 right-2 shadow-md"
           asChild
         >
           <a href={mediaDownloadUrl(row.mediaPreviewUrl)} aria-label="영상 다운로드">
-            <DownloadIcon data-icon={large ? "inline-start" : undefined} />
-            {large ? "영상 다운로드" : null}
+            <DownloadIcon data-icon="inline-start" />
+            영상 다운로드
           </a>
         </Button>
       </div>
@@ -255,16 +314,124 @@ function MediaPreview({ row, large = false }: { row: DashboardRow; large?: boole
       />
       <Button
         variant="secondary"
-        size={large ? "sm" : "icon-sm"}
+        size="sm"
         className="absolute bottom-2 right-2 shadow-md"
         asChild
       >
         <a href={mediaDownloadUrl(row.mediaPreviewUrl)} aria-label="미디어 다운로드">
-          <DownloadIcon data-icon={large ? "inline-start" : undefined} />
-          {large ? "미디어 다운로드" : null}
+          <DownloadIcon data-icon="inline-start" />
+          미디어 다운로드
         </a>
       </Button>
     </div>
+  )
+}
+
+function ListMediaPreview({ row, onOpenStory }: { row: DashboardRow; onOpenStory?: () => void }) {
+  const [open, setOpen] = React.useState(false)
+  const hasMedia = Boolean(row.mediaPreviewUrl)
+  const video = hasMedia && isVideo(row.mediaPreviewUrl)
+
+  if (row.story) return (
+    <button type="button" className="rounded-md focus-visible:ring-2 focus-visible:ring-ring" aria-label={`${row.textPreview} 이미지와 글 보기`} onClick={onOpenStory}>
+      <MediaPreview row={row} />
+    </button>
+  )
+
+  return (
+    <>
+      <button
+        type="button"
+        className="rounded-md text-left outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring"
+        aria-label={video ? "영상 미리보기" : hasMedia ? "미디어 미리보기" : "미리보기 없음"}
+        onClick={(event) => {
+          event.stopPropagation()
+          if (hasMedia) setOpen(true)
+        }}
+      >
+        <MediaPreview row={row} />
+      </button>
+      {hasMedia ? (
+        <Sheet open={open} onOpenChange={setOpen}>
+          <SheetContent side="bottom" className="max-h-[88vh] rounded-t-xl">
+            <SheetHeader className="gap-1">
+              <SheetTitle>{video ? "영상 미리보기" : "미디어 미리보기"}</SheetTitle>
+              <SheetDescription>
+                @{row.author || "unknown"} · 좋아요 {row.likeCount ?? 0}
+              </SheetDescription>
+            </SheetHeader>
+            <div className="px-4 pb-2">
+              <MediaPreview row={row} large autoPlay={Boolean(video)} />
+            </div>
+            <SheetFooter>
+              <Button variant="outline" asChild>
+                <a href={row.canonicalUrl} target="_blank" rel="noreferrer">
+                  <ExternalLinkIcon data-icon="inline-start" />
+                  원문 열기
+                </a>
+              </Button>
+              <Button variant="outline" onClick={() => setOpen(false)}>닫기</Button>
+            </SheetFooter>
+          </SheetContent>
+        </Sheet>
+      ) : null}
+    </>
+  )
+}
+
+function StorySheet({ row, formatDate, onClose }: { row: DashboardRow; formatDate: DataTableProps["formatDate"]; onClose: () => void }) {
+  const story = row.story!
+  return (
+    <Sheet open onOpenChange={(open) => { if (!open) onClose() }}>
+      <SheetContent side="bottom" className="max-h-[92vh] rounded-t-xl">
+        <SheetHeader>
+          <SheetTitle>{row.textPreview}</SheetTitle>
+          <SheetDescription>
+            {story.type === "fiction" ? "수제 사연" : "큐레이션"} · @{row.author} · 로컬 예약 · {formatDate(row.scheduledPostAt)} (한국시간)
+          </SheetDescription>
+        </SheetHeader>
+        <div className="grid gap-6 overflow-y-auto px-4 pb-4 lg:grid-cols-[minmax(0,440px)_minmax(0,1fr)]">
+          <div className="space-y-2">
+            {story.format === "image_carousel" ? <div className="space-y-4">
+              {[story.rootMediaUrls || [], ...(story.replyMediaUrls || [])].map((urls, group) => <section key={group} className="space-y-2">
+                <h3 className="text-sm font-semibold">{group === 0 ? "본문 이미지" : `이어지는 댓글 이미지 ${group}`}</h3>
+                <div className="flex snap-x snap-mandatory gap-3 overflow-x-auto pb-2">
+                  {urls.map((url, index) => <a key={url} href={url} target="_blank" rel="noreferrer" className="w-[85%] shrink-0 snap-start rounded-lg bg-muted">
+                    <img src={url} alt={`${group === 0 ? "본문" : "댓글"} 카드 ${index + 1}`} className="w-full object-contain" loading="lazy" />
+                  </a>)}
+                </div>
+              </section>)}
+            </div> : <>
+            <a href={row.mediaPreviewUrl} target="_blank" rel="noreferrer" className="block rounded-lg bg-muted" aria-label="사연 이미지 원본 열기">
+              <img src={row.mediaPreviewUrl} alt={`${row.textPreview} 사연 이미지`} className="max-h-[65vh] w-full object-contain" />
+            </a>
+            <a href={row.mediaPreviewUrl} target="_blank" rel="noreferrer" className="text-sm underline">이미지 크게 열기</a>
+            </>}
+          </div>
+          <div className="min-w-0 space-y-5 text-sm">
+            <div className="flex flex-wrap gap-2">
+              <Badge variant="outline">{storyStatusLabel(story.status)}</Badge>
+              <Badge variant="secondary">결말 답글 {story.completedReplyCount}/{story.replies.length}</Badge>
+            </div>
+            <section className="space-y-2">
+              <h3 className="font-semibold">이미지 속 본문</h3>
+              <p className="whitespace-pre-wrap break-words leading-relaxed">{story.body || "이미지에서 본문을 확인할 수 있습니다."}</p>
+            </section>
+            {story.replies.map((reply, index) => (
+              <section className="space-y-2 rounded-lg border p-4" key={index}>
+                <h3 className="font-semibold">결말 답글{story.replies.length > 1 ? ` ${index + 1}` : ""}</h3>
+                <p className="whitespace-pre-wrap break-words leading-relaxed">{reply}</p>
+              </section>
+            ))}
+            {row.lastError ? <details className="rounded-lg border p-3 text-destructive"><summary className="cursor-pointer">게시 오류 확인</summary><p className="mt-2 whitespace-pre-wrap">{row.lastError}</p></details> : null}
+          </div>
+        </div>
+        <SheetFooter>
+          {row.xPostUrl ? <Button variant="outline" asChild><a href={row.xPostUrl} target="_blank" rel="noreferrer">X 게시글 보기</a></Button> : null}
+          <Button variant="outline" onClick={onClose}>닫기</Button>
+        </SheetFooter>
+      </SheetContent>
+    </Sheet>
   )
 }
 
@@ -328,6 +495,11 @@ function ThreadSheet({
               {row.criteria?.source === "youtube" ? <Badge variant="secondary">YouTube</Badge> : null}
               {row.scheduledPostAt ? (
                 <Badge variant="secondary">예약 {formatDate(row.scheduledPostAt)}</Badge>
+              ) : null}
+              {row.status === "scheduled" ? (
+                <Badge variant={isLocalScheduleDelivery(row) ? "outline" : "secondary"}>
+                  {isLocalScheduleDelivery(row) ? "로컬 직접게시" : "X 예약"}
+                </Badge>
               ) : null}
               {row.postedAt && !row.scheduledPostAt ? (
                 <Badge variant="secondary">게시 {formatDate(row.postedAt)}</Badge>
@@ -436,6 +608,9 @@ export function DataTable(props: DataTableProps) {
   const {
     rows,
     view,
+    group = "",
+    groupCounts = {},
+    approvalEnabled = false,
     counts,
     busy,
     onViewChange,
@@ -477,14 +652,14 @@ export function DataTable(props: DataTableProps) {
     () => [
       {
         id: "select",
-        header: ({ table }) => view === "discovered" ? (
+        header: ({ table }) => view === "discovered" || view === "scheduled" ? (
           <Checkbox
             aria-label="현재 페이지 전체 선택"
             checked={table.getIsAllPageRowsSelected() || (table.getIsSomePageRowsSelected() && "indeterminate")}
             onCheckedChange={(value) => table.toggleAllPageRowsSelected(Boolean(value))}
           />
         ) : null,
-        cell: ({ row }) => view === "discovered" ? (
+        cell: ({ row }) => view === "discovered" || view === "scheduled" ? (
           <Checkbox
             aria-label={`${row.original.author || "항목"} 선택`}
             checked={row.getIsSelected()}
@@ -498,21 +673,25 @@ export function DataTable(props: DataTableProps) {
       {
         id: "media",
         header: "미디어",
-        cell: ({ row }) => <MediaPreview row={row.original} />,
+        cell: ({ row }) => <ListMediaPreview row={row.original} onOpenStory={() => setOpenRowUrl(row.original.canonicalUrl)} />,
         enableSorting: false,
         enableHiding: false,
       },
       {
         accessorKey: "textPreview",
-        header: "Threads",
+        header: "게시글",
         cell: ({ row }) => (
           <Button
             variant="link"
             className="h-auto min-w-0 px-0 text-left text-foreground"
             onClick={() => setOpenRowUrl(row.original.canonicalUrl)}
           >
-            <span className="line-clamp-2 max-w-[34rem] whitespace-normal">
+            <span className="max-w-[34rem] whitespace-normal">
+              {row.original.story ? <span className="mb-1 block text-xs text-muted-foreground">{row.original.story.type === "fiction" ? "수제 사연" : "큐레이션"} · 결말 답글 {row.original.story.replies.length}개</span> : null}
+              <span className="line-clamp-2">
               {props.titleEdits[row.original.canonicalUrl] || row.original.textPreview || "(본문 없음)"}
+              </span>
+              {row.original.story?.body ? <span className="mt-1 line-clamp-2 text-xs font-normal text-muted-foreground">{row.original.story.body}</span> : null}
             </span>
           </Button>
         ),
@@ -522,11 +701,21 @@ export function DataTable(props: DataTableProps) {
         accessorKey: "status",
         header: "상태",
         cell: ({ row }) => (
-          <Badge variant={row.original.canPost ? "outline" : "secondary"}>
-            {row.original.status === "scheduled" ? <CalendarClockIcon /> : null}
-            {row.original.status === "posted" ? <CheckCircle2Icon /> : null}
-            {statusLabel(row.original.status)}
-          </Badge>
+          <div className="flex flex-wrap items-center gap-1">
+            <Badge variant={row.original.canPost ? "outline" : "secondary"}>
+              {row.original.status === "scheduled" ? <CalendarClockIcon /> : null}
+              {row.original.status === "posted" ? <CheckCircle2Icon /> : null}
+              {row.original.story ? storyStatusLabel(row.original.story.status) : statusLabel(row.original.status)}
+            </Badge>
+            {row.original.candidateGroup ? (
+              <Badge variant="secondary">{row.original.candidateGroup}</Badge>
+            ) : null}
+            {row.original.status === "scheduled" ? (
+              <Badge variant={isLocalScheduleDelivery(row.original) ? "outline" : "secondary"}>
+                {isLocalScheduleDelivery(row.original) ? "로컬" : "X"}
+              </Badge>
+            ) : null}
+          </div>
         ),
       },
       ...(view === "posted" ? [{
@@ -576,31 +765,15 @@ export function DataTable(props: DataTableProps) {
         },
       }] : []),
       {
-        accessorKey: "likeCount",
-        header: () => <div className="text-right">좋아요</div>,
-        cell: ({ row }) => (
-          <div className="text-right tabular-nums">
-            {compact(row.original.likeCount)}
-          </div>
-        ),
-      },
-      {
-        accessorKey: "mediaCount",
-        header: () => <div className="text-right">미디어</div>,
-        cell: ({ row }) => (
-          <div className="text-right tabular-nums">
-            {compact(row.original.mediaCount)}
-          </div>
-        ),
-      },
-      {
         id: "time",
         header: "시간",
         cell: ({ row }) => (
           <div className="min-w-36 text-sm">
             <div>{row.original.scheduledPostAt ? formatDate(row.original.scheduledPostAt) : formatDate(row.original.postedAt)}</div>
             <div className="text-xs text-muted-foreground">
-              {row.original.scheduledPostAt ? "예약" : row.original.postedAt ? "처리" : "미처리"}
+              {row.original.scheduledPostAt || row.original.postedAt
+                ? scheduleDeliveryLabel(row.original)
+                : "미처리"}
             </div>
           </div>
         ),
@@ -608,7 +781,9 @@ export function DataTable(props: DataTableProps) {
       {
         id: "actions",
         cell: ({ row }) => {
+          if (row.original.story) return <Button variant="outline" size="sm" onClick={() => setOpenRowUrl(row.original.canonicalUrl)}>이미지·글 보기</Button>
           const isPosted = row.original.status === "posted"
+          const isScheduled = row.original.status === "scheduled" && Boolean(row.original.scheduledPostAt)
           const autoSchedulePending = props.autoScheduleSubmitting.includes(row.original.canonicalUrl)
           const autoScheduleDisabled = !row.original.canPost || autoSchedulePending
 
@@ -630,17 +805,29 @@ export function DataTable(props: DataTableProps) {
                       Threads 원문
                     </a>
                   </Button>
-                  <Button
-                    variant="destructive"
-                    size="sm"
-                    onClick={() => props.onDiscard(row.original)}
-                    disabled={Boolean(busy)}
-                  >
-                    <Trash2Icon data-icon="inline-start" />
-                    삭제
-                  </Button>
                 </>
               ) : null}
+              {isScheduled ? (
+                <Button
+                  variant="destructive"
+                  size="sm"
+                  onClick={() => props.onCancelSchedule(row.original)}
+                  disabled={Boolean(busy)}
+                >
+                  <CalendarX2Icon data-icon="inline-start" />
+                  예약 취소
+                </Button>
+              ) : (
+                <Button
+                  variant="destructive"
+                  size="sm"
+                  onClick={() => props.onDiscard(row.original)}
+                  disabled={Boolean(busy)}
+                >
+                  <Trash2Icon data-icon="inline-start" />
+                  삭제
+                </Button>
+              )}
               <Button
                 variant="outline"
                 size="sm"
@@ -730,8 +917,12 @@ export function DataTable(props: DataTableProps) {
     autoResetPageIndex: false,
     onRowSelectionChange: setRowSelection,
     enableRowSelection: (row) => view === "discovered"
-      && Boolean(row.original.canPost)
-      && !props.autoScheduleSubmitting.includes(row.original.canonicalUrl),
+      ? Boolean(row.original.canPost)
+        && !props.autoScheduleSubmitting.includes(row.original.canonicalUrl)
+      : view === "scheduled"
+        && !row.original.story
+        && row.original.status === "scheduled"
+        && Boolean(row.original.scheduledPostAt),
     getCoreRowModel: getCoreRowModel(),
     getFilteredRowModel: getFilteredRowModel(),
     getPaginationRowModel: getPaginationRowModel(),
@@ -751,21 +942,79 @@ export function DataTable(props: DataTableProps) {
               </Badge>
             </TabsTrigger>
           ))}
-        </TabsList>
+          </TabsList>
         <div className="flex flex-wrap items-center gap-2">
           {view === "discovered" ? (
+            <>
+              {(["A", "B", "C"] as const).map((item) => (
+                <Button
+                  key={item}
+                  variant={group === item ? "default" : "outline"}
+                  size="sm"
+                  onClick={() => props.onGroupChange?.(group === item ? "" : item)}
+                >
+                  {item === "A" ? "A 추천" : item === "B" ? "B 검토" : "C 보류"}
+                  <Badge variant="secondary">{compact(groupCounts[item] || 0)}</Badge>
+                </Button>
+              ))}
+              {group === "A" || group === "B" ? (
+                <Button
+                  variant="default"
+                  size="sm"
+                  disabled={!approvalEnabled || rows.filter((row) => row.status === "review").length === 0 || Boolean(busy)}
+                  onClick={() => props.onApproveGroup?.(group, rows.filter((row) => row.status === "review"))}
+                >
+                  이 그룹 승인 ({rows.filter((row) => row.status === "review").length})
+                </Button>
+              ) : null}
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={table.getSelectedRowModel().rows.every((row) => row.original.status !== "approved") || Boolean(busy)}
+                onClick={() => props.onUnapprove?.(table.getSelectedRowModel().rows.map((row) => row.original).filter((row) => row.status === "approved"))}
+              >
+                승인 취소
+              </Button>
+              <Button
+                variant="default"
+                size="sm"
+                disabled={table.getSelectedRowModel().rows.length === 0}
+                onClick={async () => {
+                  const selectedRows = table.getSelectedRowModel().rows.map((row) => row.original)
+                  await props.onBatchAutoSchedule(selectedRows)
+                  setRowSelection({})
+                }}
+              >
+                <CalendarClockIcon data-icon="inline-start" />
+                선택 {table.getSelectedRowModel().rows.length}개 자동 예약
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={table.getSelectedRowModel().rows.length === 0 || Boolean(props.busy)}
+                onClick={async () => {
+                  const selectedRows = table.getSelectedRowModel().rows.map((row) => row.original)
+                  await props.onBatchDiscard(selectedRows)
+                  setRowSelection({})
+                }}
+              >
+                <Trash2Icon data-icon="inline-start" />
+                선택 {table.getSelectedRowModel().rows.length}개 삭제
+              </Button>
+            </>
+          ) : view === "scheduled" ? (
             <Button
-              variant="default"
+              variant="destructive"
               size="sm"
-              disabled={table.getSelectedRowModel().rows.length === 0}
+              disabled={table.getSelectedRowModel().rows.length === 0 || Boolean(props.busy)}
               onClick={async () => {
                 const selectedRows = table.getSelectedRowModel().rows.map((row) => row.original)
-                await props.onBatchAutoSchedule(selectedRows)
+                await props.onBatchCancelSchedule(selectedRows)
                 setRowSelection({})
               }}
             >
-              <CalendarClockIcon data-icon="inline-start" />
-              선택 {table.getSelectedRowModel().rows.length}개 자동 예약
+              <CalendarX2Icon data-icon="inline-start" />
+              선택 {table.getSelectedRowModel().rows.length}개 예약 취소
             </Button>
           ) : null}
           <DropdownMenu>
@@ -914,7 +1163,9 @@ export function DataTable(props: DataTableProps) {
         </div>
       </TabsContent>
     </Tabs>
-    {openRow ? (
+    {openRow?.story ? (
+      <StorySheet row={openRow} formatDate={formatDate} onClose={() => setOpenRowUrl(null)} />
+    ) : openRow ? (
       <ThreadSheet
         row={openRow}
         {...props}

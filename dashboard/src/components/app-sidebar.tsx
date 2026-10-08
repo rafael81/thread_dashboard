@@ -10,6 +10,7 @@ import {
   ScaleIcon,
   SparklesIcon,
   BadgeCheckIcon,
+  BookOpenIcon,
 } from "lucide-react"
 
 import { NavMain } from "@/components/nav-main"
@@ -34,6 +35,7 @@ const viewItems = [
   { id: "automation", title: "자동화", icon: <Settings2Icon /> },
   { id: "home-verified", title: "파란체크 자동댓글", icon: <BadgeCheckIcon /> },
   { id: "inssider-pending", title: "인싸이더 판결중", icon: <ScaleIcon /> },
+  { id: "saved-articles", title: "아티클", icon: <BookOpenIcon />, href: "/articles" },
 ]
 
 export function AppSidebar({
@@ -72,8 +74,12 @@ export function AppSidebar({
                   ? (terafabx as { homeVerifiedComment?: { postedToday?: number } } | undefined)?.homeVerifiedComment?.postedToday ?? "파란"
                 : item.id === "inssider-pending"
                   ? summary.totalCount
-                  : "운영",
-    onClick: () => onViewChange(item.id),
+                  : item.id === "saved-articles"
+                    ? "보기"
+                    : "운영",
+    onClick: item.href
+      ? () => { window.location.assign(item.href); }
+      : () => onViewChange(item.id),
   }))
 
   const navSecondary = [

@@ -7,12 +7,42 @@ const path = require("path");
 const { URL } = require("url");
 const { execFile, spawn } = require("child_process");
 const WebSocket = require("ws");
+const { createStoryQueue } = require("./lib/story-local-queue");
+const { createStoryPublisher } = require("./lib/story-x-publisher");
+const { mergeStoryDashboardRows, storyMediaPath } = require("./lib/story-dashboard");
 const {
   normalizeCanonicalThreadsUrl,
   resolveThreadsSharedUrl,
 } = require("./lib/threads-shared-url");
 const homeVerifiedCommentLib = require("./lib/home-verified-comment");
 const homeVerifiedCommentPrompts = require("./lib/home-verified-comment-prompts");
+const {
+  isHomeVerifiedUpstreamPath,
+  normalizeHomeVerifiedUpstream,
+  proxyHomeVerifiedUpstream,
+} = require("./lib/home-verified-upstream");
+const {
+  renderSavedArticlesPage,
+  resolveSavedArticleMedia,
+} = require("./lib/saved-articles-page");
+const {
+  DISCOVERY_TITLE_VOICE,
+  isVagueDiscoveryCaption,
+  buildDiscoveryTitleRefinePrompt,
+  parseRefinedDiscoveryTitle,
+  sanitizeRefinedDiscoveryTitle,
+  validateRefinedDiscoveryTitle,
+} = require("./lib/discovery-title-refine");
+const {
+  isPersonalDiscoveryCaption,
+  isCuteAnimalDiscoveryCaption,
+  discoveryEngagementCount,
+  classifyDiscoveryGroupByRules,
+  buildGroupClassifierPrompt,
+  parseGroupClassification,
+  validateGroupClassification,
+  GROUP_CLASSIFIER_VERSION,
+} = require("./lib/discovery-group-classifier");
 
 function loadDotEnvFile(filePath = path.join(__dirname, ".env")) {
   if (!fs.existsSync(filePath)) return;
@@ -80,6 +110,7 @@ const DISCOVERY_MEDIA_SNAPSHOT_TTL_MS = Math.max(
 );
 const activeMediaTempDirs = new Set();
 const DISCOVERY_MIN_LIKES = Number(process.env.DISCOVERY_MIN_LIKES || 1000);
+const DISCOVERY_MIN_VIEWS = Number(process.env.DISCOVERY_MIN_VIEWS || 1001);
 const DISCOVERY_POST_INTERVAL_MS = Number(process.env.DISCOVERY_POST_INTERVAL_MS || 10 * 60 * 1000);
 const DISCOVERY_WORKER_INTERVAL_MS = Number(process.env.DISCOVERY_WORKER_INTERVAL_MS || 60 * 1000);
 const DISCOVERY_SCAN_INTERVAL_MS = Number(process.env.DISCOVERY_SCAN_INTERVAL_MS || 5 * 60 * 1000);
@@ -92,6 +123,13 @@ const DISCOVERY_SCHEDULE_STALE_MS = Math.max(60_000, Number(process.env.DISCOVER
 const DISCOVERY_SCHEDULE_RETRY_COOLDOWN_MS = Math.max(60_000, Number(process.env.DISCOVERY_SCHEDULE_RETRY_COOLDOWN_MS || 10 * 60 * 1000));
 const DISCOVERY_SCHEDULE_RATE_LIMIT_COOLDOWN_MS = Math.max(5 * 60 * 1000, Number(process.env.DISCOVERY_SCHEDULE_RATE_LIMIT_COOLDOWN_MS || 30 * 60 * 1000));
 const DISCOVERY_SCHEDULE_MAX_ATTEMPTS = Math.max(1, Number(process.env.DISCOVERY_SCHEDULE_MAX_ATTEMPTS || 3));
+const LOCAL_SCHEDULE_DISPATCH_INTERVAL_MS = Math.max(
+  5_000,
+  Number(process.env.LOCAL_SCHEDULE_DISPATCH_INTERVAL_MS || 15_000),
+);
+const SCHEDULE_DELIVERY_X_NATIVE = "x_native";
+const SCHEDULE_DELIVERY_LOCAL_POST = "local_post";
+const SCHEDULE_DELIVERY_AB = "ab";
 const X_SCHEDULE_MONITOR_STATE_PATH = process.env.X_SCHEDULE_MONITOR_STATE_PATH || path.join(__dirname, ".data", "x-schedule-monitor-state.json");
 const TERAFABX_COMMENT_MONITOR_INTERVAL_MS = Number(process.env.TERAFABX_COMMENT_MONITOR_INTERVAL_MS || 10 * 60 * 1000);
 const TERAFABX_COMMENT_MONITOR_STATE_PATH = process.env.TERAFABX_COMMENT_MONITOR_STATE_PATH || path.join(__dirname, ".data", "terafabx-comment-monitor-state.json");
@@ -117,6 +155,7 @@ const TERAFABX_WEIGHTED_REPLY_RETRY_MS = 5 * 60 * 1000;
 const TERAFABX_TODAY_OWN_ROOT_DISCOVERY_MAX_SCROLLS = Number(process.env.TERAFABX_TODAY_OWN_ROOT_DISCOVERY_MAX_SCROLLS || 36);
 const DISCOVERY_MIN_VIRAL_SCORE = Number(process.env.DISCOVERY_MIN_VIRAL_SCORE || 3);
 const DISCOVERY_MAX_SCROLLS = Number(process.env.DISCOVERY_MAX_SCROLLS || 20);
+const DISCOVERY_AUTO_BATCH_LIMIT = Number(process.env.DISCOVERY_AUTO_BATCH_LIMIT || 24);
 const GROK_BIN = process.env.GROK_BIN || "/Users/user/.local/bin/grok";
 function resolveAgentBrowserBin(options = {}) {
   const configured = String(options.configured ?? process.env.AGENT_BROWSER_BIN ?? "").trim();
@@ -136,11 +175,67 @@ function resolveAgentBrowserBin(options = {}) {
   return adjacentNpx && existsSync(adjacentNpx) ? adjacentNpx : "npx";
 }
 
+function homebrewBinFromNodeExecPath(execPath = process.execPath) {
+  const values = [];
+  const raw = String(execPath || "");
+  if (raw) values.push(raw);
+  try {
+    if (raw) values.push(fs.realpathSync(raw));
+  } catch {}
+  for (const value of values) {
+    const normalized = String(value).replace(/\\/g, "/");
+    const cellar = normalized.match(/^(.*)\/Cellar\/[^/]+\/[^/]+\/bin\/[^/]+$/);
+    if (cellar && cellar[1]) return path.join(cellar[1], "bin");
+  }
+  return "";
+}
+
 function ensureNodeExecutablePath(currentPath = process.env.PATH || "", execPath = process.execPath) {
   const nodeDir = path.dirname(String(execPath || ""));
+  const brewBin = homebrewBinFromNodeExecPath(execPath);
+  const extras = [brewBin, nodeDir].filter((dir) => dir && dir !== ".");
   const entries = String(currentPath || "").split(path.delimiter).filter(Boolean);
-  if (!nodeDir || nodeDir === "." || entries.includes(nodeDir)) return entries.join(path.delimiter);
-  return [nodeDir, ...entries].join(path.delimiter);
+  const seen = new Set(entries);
+  const prepend = [];
+  for (const dir of extras) {
+    if (seen.has(dir)) continue;
+    seen.add(dir);
+    prepend.push(dir);
+  }
+  return [...prepend, ...entries].join(path.delimiter);
+}
+
+function resolveHomebrewTool(name, options = {}) {
+  const tool = String(name || "").trim();
+  if (!tool) return "";
+  const existsSync = options.existsSync || fs.existsSync;
+  const execPath = options.execPath || process.execPath;
+  const pathEnv = options.pathEnv || process.env.PATH || "";
+  const candidates = [];
+  const brewBin = homebrewBinFromNodeExecPath(execPath);
+  if (brewBin) candidates.push(path.join(brewBin, tool));
+  candidates.push(path.join("/opt/homebrew/bin", tool), path.join("/usr/local/bin", tool));
+  for (const dir of String(pathEnv).split(path.delimiter).filter(Boolean)) {
+    candidates.push(path.join(dir, tool));
+  }
+  const seen = new Set();
+  for (const candidate of candidates) {
+    if (!candidate || seen.has(candidate)) continue;
+    seen.add(candidate);
+    try {
+      if (existsSync(candidate)) return candidate;
+    } catch {}
+  }
+  return tool;
+}
+
+function youtubeDownloadFailureDetail(result = {}) {
+  const parts = [
+    result.error,
+    result.code && result.code !== 0 ? `code=${result.code}` : "",
+    String(result.stderr || "").trim(),
+  ].filter(Boolean);
+  return parts.join(" ").slice(-800);
 }
 
 process.env.PATH = ensureNodeExecutablePath();
@@ -191,6 +286,7 @@ const TERAFABX_AUTO_COMMENT_WRITER_LOCK_PATH = process.env.TERAFABX_AUTO_COMMENT
 const TERAFABX_OWN_POST_REPLY_X_PORT = Number(process.env.TERAFABX_OWN_POST_REPLY_X_PORT || 9239);
 const TERAFABX_OWN_POST_REPLY_X_PROFILE_DIR = process.env.TERAFABX_OWN_POST_REPLY_X_PROFILE_DIR || path.join(__dirname, ".data", "chrome-profiles", "terafabx-own-post-reply-x");
 const TERAFABX_OWN_POST_REPLY_X_LOCK_PATH = process.env.TERAFABX_OWN_POST_REPLY_X_LOCK_PATH || path.join(os.tmpdir(), `terafabx-own-post-reply-x${TERAFABX_OWN_POST_REPLY_X_PORT}.lock`);
+const HOME_VERIFIED_UPSTREAM = normalizeHomeVerifiedUpstream(process.env.HOME_VERIFIED_UPSTREAM);
 /** following 합성 홈 인증 댓글: 일 목표 500 (환경변수로 조절) */
 const TERAFABX_HOME_VERIFIED_COMMENT_DAILY_TARGET = Math.max(
   0,
@@ -222,6 +318,10 @@ const TERAFABX_HOME_VERIFIED_COMMENT_MIN_POST_GAP_MS = Math.max(
   60_000,
   Number(process.env.TERAFABX_HOME_VERIFIED_COMMENT_MIN_POST_GAP_MS || 3 * 60 * 1000),
 );
+const TERAFABX_HOME_VERIFIED_VERIFICATION_TTL_MS = Math.max(
+  60_000,
+  Number(process.env.TERAFABX_HOME_VERIFIED_VERIFICATION_TTL_MS || 15 * 60 * 1000),
+);
 const TERAFABX_HOME_VERIFIED_COMMENT_WRITE_QUEUE_PATH = process.env.TERAFABX_HOME_VERIFIED_COMMENT_WRITE_QUEUE_PATH
   || path.join(__dirname, ".data", "terafabx-home-verified-comment-write-queue.json");
 const TERAFABX_HOME_VERIFIED_COMMENT_X_PORT = Number(process.env.TERAFABX_HOME_VERIFIED_COMMENT_X_PORT || 9340);
@@ -230,6 +330,27 @@ const TERAFABX_HOME_VERIFIED_COMMENT_X_PROFILE_DIR = process.env.TERAFABX_HOME_V
 const TERAFABX_HOME_VERIFIED_COMMENT_X_LOCK_PATH = process.env.TERAFABX_HOME_VERIFIED_COMMENT_X_LOCK_PATH
   || path.join(os.tmpdir(), `terafabx-home-verified-comment-x${TERAFABX_HOME_VERIFIED_COMMENT_X_PORT}.lock`);
 const TERAFABX_HOME_VERIFIED_COMMENT_GEMINI_PORT_BASE = Number(process.env.TERAFABX_HOME_VERIFIED_COMMENT_GEMINI_PORT_BASE || 9374);
+const DISCOVERY_TITLE_REFINE_GEMINI_PORT = Number(process.env.DISCOVERY_TITLE_REFINE_GEMINI_PORT || 9384);
+const DISCOVERY_TITLE_REFINE_TIMEOUT_MS = Math.max(60_000, Number(process.env.DISCOVERY_TITLE_REFINE_TIMEOUT_MS || 180_000));
+const DISCOVERY_GROUP_CLASSIFY_GEMINI_PORT = Number(process.env.DISCOVERY_GROUP_CLASSIFY_GEMINI_PORT || 9385);
+const DISCOVERY_SCAN_CHROME_PORT = Number(process.env.DISCOVERY_SCAN_CHROME_PORT || 9386);
+const DISCOVERY_SCAN_PROFILE_DIR = process.env.DISCOVERY_SCAN_PROFILE_DIR
+  || path.join(__dirname, ".data", "chrome-profiles", "discovery-scan-headless");
+const DISCOVERY_GROUP_CLASSIFY_TIMEOUT_MS = Math.max(60_000, Number(process.env.DISCOVERY_GROUP_CLASSIFY_TIMEOUT_MS || 90_000));
+const DISCOVERY_APPROVED_STATUS = "approved";
+const DISCOVERY_MEDIA_SNAPSHOT_KEEP_STATUSES = new Set([
+  "review",
+  "discovered",
+  "approved",
+  "draft",
+  "queued_schedule",
+  "scheduling",
+  "scheduled",
+  "failed",
+  "failed_post",
+  "failed_draft",
+  "failed_schedule",
+]);
 const TERAFABX_HOME_VERIFIED_COMMENT_SOURCE = homeVerifiedCommentLib.SOURCE;
 /** 홈 원글 문맥+초안 1단계: gemini(기본, text-only) | web | cli */
 const TERAFABX_HOME_VERIFIED_CONTEXT_PROVIDER = String(
@@ -308,6 +429,8 @@ const TERAFABX_QUIET_POSTING_START_HOUR = Number(process.env.TERAFABX_QUIET_POST
 const TERAFABX_QUIET_POSTING_END_HOUR = Number(process.env.TERAFABX_QUIET_POSTING_END_HOUR || 7);
 const AUTO_SCHEDULE_QUIET_START_HOUR = Number(process.env.AUTO_SCHEDULE_QUIET_START_HOUR || 1);
 const AUTO_SCHEDULE_QUIET_END_HOUR = Number(process.env.AUTO_SCHEDULE_QUIET_END_HOUR || 7);
+const AUTO_SCHEDULE_INTERVAL_MS = Math.max(5 * 60 * 1000, Number(process.env.AUTO_SCHEDULE_INTERVAL_MS || 40 * 60 * 1000));
+const AUTO_SCHEDULE_MINUTE_STEP = 5;
 const TERAFABX_HEART_INTERVAL_MS = Number(process.env.TERAFABX_HEART_INTERVAL_MS || 10 * 60 * 1000);
 const TERAFABX_HEART_LIMIT = Number(process.env.TERAFABX_HEART_LIMIT || 5);
 const TERAFABX_AFFILIATE_DEFAULT_LINK = process.env.TERAFABX_AFFILIATE_DEFAULT_LINK || "";
@@ -341,7 +464,7 @@ const TERAFABX_GEMINI_REVIEW_DIR = process.env.TERAFABX_GEMINI_REVIEW_DIR || pat
 const TERAFABX_VERIFIED_REVIEW_GROK_TIMEOUT_MS = Number(process.env.TERAFABX_VERIFIED_REVIEW_GROK_TIMEOUT_MS || 90_000);
 const FXTWITTER_API_BASE = process.env.FXTWITTER_API_BASE || "https://api.fxtwitter.com";
 const FXTWITTER_CONVERSATION_API_BASE = process.env.FXTWITTER_CONVERSATION_API_BASE
-  || "https://fxembed-guest.kron-fxembed.workers.dev/api";
+  || "https://fxembed-guest.spacexai.workers.dev/api";
 
 let naverAdpostRevenueCache = null;
 
@@ -413,6 +536,8 @@ let terafabxOwnPostReplyXIdleCleanupTimer = null;
 const terafabxHomeVerifiedCommentXWriterQueue = createSerialTaskQueue();
 const terafabxHomeVerifiedCommentWriteQueuedIds = new Set();
 let scheduledReplyBusy = false;
+let localScheduleDispatchBusy = false;
+const localScheduleDispatchBackoff = new Map();
 let xScheduleMonitorBusy = false;
 let terafabxCommentMonitorBusy = false;
 let terafabxReplyCountRefreshBusy = false;
@@ -421,48 +546,230 @@ const activeAutomationChildProcesses = new Set();
 const xScheduleRecoveryInFlight = new Set();
 const DISCOVERY_STARTUP_RECOVERY_WINDOW_MS = 24 * 60 * 60 * 1000;
 
+function normalizeGroupApprovalSettings(value = {}) {
+  const rolloutStages = new Set(["shadow", "manual_batch", "steady"]);
+  const defaults = {
+    enabled: false,
+    rolloutStage: "shadow",
+    dailyPostCap: 8,
+    minIntervalMs: 2_400_000,
+    standingApprovedGroups: [],
+    geminiAssistEnabled: true,
+  };
+  const input = value && typeof value === "object" ? value : {};
+  const rolloutStage = rolloutStages.has(String(input.rolloutStage || "").trim())
+    ? String(input.rolloutStage).trim()
+    : defaults.rolloutStage;
+  const dailyPostCapRaw = Number(input.dailyPostCap);
+  const dailyPostCap = Number.isFinite(dailyPostCapRaw) && dailyPostCapRaw >= 0
+    ? Math.floor(dailyPostCapRaw)
+    : defaults.dailyPostCap;
+  const minIntervalRaw = Number(input.minIntervalMs);
+  const minIntervalMs = Number.isFinite(minIntervalRaw) && minIntervalRaw > 0
+    ? minIntervalRaw
+    : defaults.minIntervalMs;
+  const standingApprovedGroups = Array.isArray(input.standingApprovedGroups)
+    ? input.standingApprovedGroups.filter((group) => group === "A")
+    : defaults.standingApprovedGroups;
+  return {
+    enabled: input.enabled === true,
+    rolloutStage,
+    dailyPostCap,
+    minIntervalMs,
+    standingApprovedGroups,
+    geminiAssistEnabled: input.geminiAssistEnabled !== false,
+  };
+}
+
+let discoveryAutoStyleScheduleDisabledLogged = false;
+
 function loadDiscoverySettings() {
+  let raw = {};
   try {
-    const settings = JSON.parse(fs.readFileSync(DISCOVERY_SETTINGS_PATH, "utf8"));
-    return {
-      autoDiscoveryEnabled: settings.autoDiscoveryEnabled !== false,
-      autoStyleScheduleEnabled: settings.autoStyleScheduleEnabled === true,
-    };
-  } catch {
-    return { autoDiscoveryEnabled: true, autoStyleScheduleEnabled: false };
+    raw = JSON.parse(fs.readFileSync(DISCOVERY_SETTINGS_PATH, "utf8"));
+  } catch {}
+  const normalized = {
+    autoDiscoveryEnabled: raw.autoDiscoveryEnabled !== false,
+    autoStyleScheduleEnabled: raw.autoStyleScheduleEnabled === true,
+    scheduleDeliveryMode: normalizeScheduleDeliveryMode(raw.scheduleDeliveryMode),
+    groupApproval: normalizeGroupApprovalSettings(raw.groupApproval),
+  };
+  if (normalized.autoStyleScheduleEnabled) {
+    normalized.autoStyleScheduleEnabled = false;
+    if (!discoveryAutoStyleScheduleDisabledLogged) {
+      discoveryAutoStyleScheduleDisabledLogged = true;
+      logEvent("discovery_auto_style_schedule_disabled_by_group_approval", {
+        previous: true,
+        rolloutStage: normalized.groupApproval.rolloutStage,
+      });
+    }
+    try {
+      fs.writeFileSync(DISCOVERY_SETTINGS_PATH, JSON.stringify({
+        ...raw,
+        autoStyleScheduleEnabled: false,
+        groupApproval: normalized.groupApproval,
+      }, null, 2));
+    } catch {}
   }
+  return normalized;
 }
 
 function saveDiscoverySettings(settings) {
-  fs.writeFileSync(DISCOVERY_SETTINGS_PATH, JSON.stringify(settings, null, 2));
+  const normalized = {
+    autoDiscoveryEnabled: settings.autoDiscoveryEnabled !== false,
+    autoStyleScheduleEnabled: false,
+    scheduleDeliveryMode: normalizeScheduleDeliveryMode(settings.scheduleDeliveryMode),
+    groupApproval: normalizeGroupApprovalSettings(settings.groupApproval),
+  };
+  fs.writeFileSync(DISCOVERY_SETTINGS_PATH, JSON.stringify(normalized, null, 2));
+  return normalized;
+}
+
+function getGroupApprovalSettings() {
+  return loadDiscoverySettings().groupApproval;
+}
+
+function setGroupApprovalSettings(patch = {}) {
+  const settings = loadDiscoverySettings();
+  settings.groupApproval = normalizeGroupApprovalSettings({
+    ...settings.groupApproval,
+    ...(patch && typeof patch === "object" ? patch : {}),
+  });
+  saveDiscoverySettings(settings);
+  logEvent("discovery_group_approval_settings_changed", settings.groupApproval);
+  return settings.groupApproval;
 }
 
 function isAutoDiscoveryEnabled() {
   return loadDiscoverySettings().autoDiscoveryEnabled;
 }
 
+function discoveryAutoBatchAfterSave(savedSoFar, inserted, limit = DISCOVERY_AUTO_BATCH_LIMIT) {
+  const saved = Number(savedSoFar || 0) + Number(inserted || 0);
+  const stopAt = Math.max(1, Number(limit || DISCOVERY_AUTO_BATCH_LIMIT));
+  return { saved, limit: stopAt, stop: saved >= stopAt };
+}
+
 function setAutoDiscoveryEnabled(enabled) {
   const settings = loadDiscoverySettings();
-  settings.autoDiscoveryEnabled = Boolean(enabled);
+  const next = Boolean(enabled);
+  if (next && settings.autoDiscoveryEnabled !== true) settings.autoDiscoveryBatchSaved = 0;
+  settings.autoDiscoveryEnabled = next;
   saveDiscoverySettings(settings);
-  logEvent("discovery_auto_scan_setting_changed", { autoDiscoveryEnabled: settings.autoDiscoveryEnabled });
+  logEvent("discovery_auto_scan_setting_changed", {
+    autoDiscoveryEnabled: settings.autoDiscoveryEnabled,
+    autoDiscoveryBatchSaved: Number(settings.autoDiscoveryBatchSaved || 0),
+  });
   return settings;
+}
+
+function noteAutoDiscoveryBatchSaved(inserted = 0) {
+  const settings = loadDiscoverySettings();
+  const batch = discoveryAutoBatchAfterSave(settings.autoDiscoveryBatchSaved, inserted);
+  settings.autoDiscoveryBatchSaved = batch.saved;
+  if (batch.stop) settings.autoDiscoveryEnabled = false;
+  saveDiscoverySettings(settings);
+  if (batch.stop) {
+    logEvent("discovery_auto_scan_batch_stopped", { saved: batch.saved, limit: batch.limit });
+  }
+  return batch;
 }
 
 function isAutoStyleScheduleEnabled() {
   return loadDiscoverySettings().autoStyleScheduleEnabled === true;
 }
 
-function setAutoStyleScheduleEnabled(enabled) {
+function setAutoStyleScheduleEnabled() {
   const settings = loadDiscoverySettings();
-  settings.autoStyleScheduleEnabled = Boolean(enabled);
-  if (settings.autoStyleScheduleEnabled) settings.autoDiscoveryEnabled = true;
+  settings.autoStyleScheduleEnabled = false;
   saveDiscoverySettings(settings);
-  logEvent("discovery_auto_style_schedule_setting_changed", {
-    autoDiscoveryEnabled: settings.autoDiscoveryEnabled,
-    autoStyleScheduleEnabled: settings.autoStyleScheduleEnabled,
+  logEvent("discovery_auto_style_schedule_retired", {
+    autoStyleScheduleEnabled: false,
   });
   return settings;
+}
+
+function normalizeScheduleDelivery(value) {
+  return String(value || "").trim() === SCHEDULE_DELIVERY_LOCAL_POST
+    ? SCHEDULE_DELIVERY_LOCAL_POST
+    : SCHEDULE_DELIVERY_X_NATIVE;
+}
+
+function normalizeScheduleDeliveryMode(value) {
+  const mode = String(value || "").trim();
+  if (mode === SCHEDULE_DELIVERY_LOCAL_POST) return SCHEDULE_DELIVERY_LOCAL_POST;
+  if (mode === SCHEDULE_DELIVERY_X_NATIVE) return SCHEDULE_DELIVERY_X_NATIVE;
+  return SCHEDULE_DELIVERY_AB;
+}
+
+function scheduleDeliveryOf(value) {
+  if (!value) return SCHEDULE_DELIVERY_X_NATIVE;
+  if (typeof value === "string") return normalizeScheduleDelivery(value);
+  let criteriaDelivery = "";
+  if (value.criteria && typeof value.criteria === "object") {
+    criteriaDelivery = value.criteria.scheduleDelivery || "";
+  }
+  return normalizeScheduleDelivery(
+    value.scheduleDelivery || value.schedule_delivery || criteriaDelivery,
+  );
+}
+
+function isLocalScheduleDelivery(value) {
+  return scheduleDeliveryOf(value) === SCHEDULE_DELIVERY_LOCAL_POST;
+}
+
+function getScheduleDeliveryMode() {
+  return loadDiscoverySettings().scheduleDeliveryMode;
+}
+
+function setScheduleDeliveryMode(mode) {
+  const settings = loadDiscoverySettings();
+  settings.scheduleDeliveryMode = normalizeScheduleDeliveryMode(mode);
+  saveDiscoverySettings(settings);
+  logEvent("discovery_schedule_delivery_mode_changed", {
+    scheduleDeliveryMode: settings.scheduleDeliveryMode,
+  });
+  return settings;
+}
+
+function assignScheduleDelivery(canonicalUrl, mode = getScheduleDeliveryMode()) {
+  const normalized = normalizeScheduleDeliveryMode(mode);
+  if (normalized !== SCHEDULE_DELIVERY_AB) return normalized;
+  const hash = crypto.createHash("sha1").update(String(canonicalUrl || "")).digest();
+  return (hash[0] & 1) === 0 ? SCHEDULE_DELIVERY_X_NATIVE : SCHEDULE_DELIVERY_LOCAL_POST;
+}
+
+function isDueLocalScheduledRow(row, nowMs = Date.now()) {
+  if (!row || row.status !== "scheduled") return false;
+  if (!isLocalScheduleDelivery(row)) return false;
+  const time = new Date(row.scheduledPostAt || row.scheduledAt || 0).getTime();
+  return Number.isFinite(time) && time <= nowMs;
+}
+
+function canFulfillLocalScheduledMirror(completed, options = {}) {
+  return options.fulfillLocalSchedule === true
+    && Boolean(completed)
+    && completed.status === "scheduled"
+    && isLocalScheduleDelivery(completed);
+}
+
+function shouldConvertScheduledRowToLocal(row, nowMs = Date.now()) {
+  if (!row || row.status !== "scheduled") return false;
+  if (isLocalScheduleDelivery(row)) return false;
+  const time = new Date(row.scheduledAt || row.scheduledPostAt || 0).getTime();
+  return Number.isFinite(time) && time > nowMs;
+}
+
+function scheduleDeliveryForMirrorRecord(options = {}) {
+  if (options.fulfillLocalSchedule) return SCHEDULE_DELIVERY_LOCAL_POST;
+  if (options.schedule) return normalizeScheduleDelivery(options.scheduleDelivery || SCHEDULE_DELIVERY_X_NATIVE);
+  return "";
+}
+
+function localScheduleHistoryTime(options = {}) {
+  if (!options.fulfillLocalSchedule || !options.scheduledAt) return null;
+  const time = new Date(options.scheduledAt).getTime();
+  return Number.isFinite(time) ? new Date(time).toISOString() : null;
 }
 
 function logEvent(type, data = {}) {
@@ -975,7 +1282,34 @@ function proxyMediaDownload(url, res, redirectCount = 0) {
 }
 
 function isVideoMediaUrl(url = "") {
-  return /\.mp4|\.mov|\.webm|\/o1\/v\/t16\//i.test(String(url || ""));
+  return /\.mp4|\.mov|\.webm|\/o1\/v\/|\/t2\/f2\/m86\/|\/t16\/f2\/m69\//i.test(String(url || ""));
+}
+
+/**
+ * Threads/Instagram CDN image URLs that are video first-frame posters, not still photos.
+ * Posting these as photos drops the real video and confuses viewers.
+ */
+function isThreadsVideoPosterUrl(url = "") {
+  const value = String(url || "");
+  if (!value) return false;
+  let decoded = value;
+  try {
+    decoded = decodeURIComponent(value);
+  } catch {}
+  if (/video_first_frame(?:_thumbnail)?/i.test(decoded) || /video_first_frame(?:_thumbnail)?/i.test(value)) {
+    return true;
+  }
+  try {
+    const efg = new URL(value).searchParams.get("efg");
+    if (!efg) return false;
+    const padded = efg.replace(/-/g, "+").replace(/_/g, "/");
+    const json = typeof Buffer !== "undefined"
+      ? Buffer.from(padded, "base64").toString("utf8")
+      : (typeof atob === "function" ? atob(padded) : "");
+    return /video_first_frame/i.test(json);
+  } catch {
+    return false;
+  }
 }
 
 function discoveryThumbnailCachePath(url = "") {
@@ -1702,9 +2036,9 @@ function loadTerafabxState() {
   loaded.commentPrefillOnly = false;
   loaded.verifiedCommentReviewEnabled = false;
   loaded.ownPostReplyEnabled = false;
-  // 홈 인증 원글 자동댓글: 재시작 시 자동 게시 금지. 대시보드에서 명시 enable.
-  loaded.homeVerifiedCommentEnabled = false;
-  loaded.homeVerifiedCommentPrefillOnly = loaded.homeVerifiedCommentPrefillOnly !== false;
+  // 상대방 파란체크 원글 자동댓글은 서버 로드 시 항상 켜고 실제 게시까지 수행한다.
+  loaded.homeVerifiedCommentEnabled = true;
+  loaded.homeVerifiedCommentPrefillOnly = false;
   loaded.homeVerifiedCommentBacklog = homeVerifiedCommentLib.normalizeHomeVerifiedCandidateBacklog(
     loaded.homeVerifiedCommentBacklog,
     { normalizeXStatusUrl, parseXStatusUrl, requiredHandle: REQUIRED_X_HANDLE },
@@ -2037,6 +2371,75 @@ function purgeHomeVerifiedDeadTargetPending(options = {}) {
   };
 }
 
+/**
+ * verification_required 교착 해제.
+ * 1) FxTwitter로 실제 게시 여부 확인 → 있으면 성공 처리
+ * 2) TTL 지난 미확인 건은 큐에서 제거(seen 처리)해 버퍼를 비운다
+ */
+async function reconcileHomeVerifiedVerificationRequired(options = {}) {
+  const ttlMs = Math.max(60_000, Number(options.ttlMs || TERAFABX_HOME_VERIFIED_VERIFICATION_TTL_MS));
+  const limit = Math.max(1, Number(options.limit || 20));
+  const nowMs = Number.isFinite(Number(options.nowMs)) ? Number(options.nowMs) : Date.now();
+  const rows = loadTerafabxHomeVerifiedWriteQueue();
+  const held = rows.filter((row) => String(row.stage) === "verification_required");
+  let recovered = 0;
+  let expired = 0;
+  let checked = 0;
+  const sample = [];
+  for (const row of held) {
+    if (checked >= limit) break;
+    checked += 1;
+    const comment = row.prepared?.comment || row.comment || "";
+    let found = null;
+    try {
+      found = await recoverTerafabxUncertainReply(row.targetUrl, comment);
+    } catch (error) {
+      logEvent("terafabx_home_verified_verification_lookup_error", {
+        id: row.id,
+        targetUrl: row.targetUrl,
+        error: error.message,
+      });
+    }
+    if (found?.url) {
+      saveTerafabxHomeVerifiedCommentSuccess(row, { ok: true, replyUrl: found.url });
+      recovered += 1;
+      sample.push({ id: row.id, action: "recovered", replyUrl: found.url, authorHandle: row.authorHandle });
+      continue;
+    }
+    const disposition = homeVerifiedCommentLib.homeVerifiedVerificationHoldDisposition(row, nowMs, { ttlMs });
+    if (disposition.action !== "expire") continue;
+    markTerafabxHomeVerifiedTargetDiscarded(row.targetUrl, {
+      reason: "verification_expired_unconfirmed",
+      error: row.lastError,
+      attempts: row.attempts,
+    });
+    removeTerafabxHomeVerifiedWrite(row.id);
+    expired += 1;
+    sample.push({
+      id: row.id,
+      action: "expired",
+      authorHandle: row.authorHandle,
+      lastError: String(row.lastError || "").slice(0, 160),
+    });
+  }
+  if (recovered || expired) {
+    logEvent("terafabx_home_verified_verification_reconcile", {
+      checked,
+      recovered,
+      expired,
+      remaining: loadTerafabxHomeVerifiedWriteQueue().filter((row) => row.stage === "verification_required").length,
+      sample: sample.slice(0, 12),
+    });
+  }
+  return {
+    checked,
+    recovered,
+    expired,
+    remaining: loadTerafabxHomeVerifiedWriteQueue().filter((row) => row.stage === "verification_required").length,
+    items: sample.slice(0, Number(options.sample || 20)),
+  };
+}
+
 function terafabxHomeVerifiedAlreadyHandled(state, targetUrl) {
   const id = parseXStatusUrl(targetUrl)?.id;
   if (!id) return true;
@@ -2122,10 +2525,12 @@ function purgeHomeVerifiedPolicyFailPending(options = {}) {
   const kept = [];
   const purged = [];
   for (const row of rows) {
+    if (row.status === "posting" || row.stage === "verification_required") { kept.push(row); continue; }
     const comment = row?.prepared?.comment || "";
     const judge = row?.prepared?.geminiReview?.finalJudge || { passed: true, qualityFlagsComplete: true, qualityFlags: {} };
     const hard = homeVerifiedCommentLib.homeVerifiedJudgeHardFail(judge, comment);
     const quality = assessTerafabxHomeVerifiedWriteQuality({ prepared: row.prepared, target: row.target });
+    if (hard.ok && homeVerifiedCommentLib.homeVerifiedNeedsReviewRefresh(quality)) { kept.push(row); continue; }
     if (!hard.ok || !quality.ok) {
       purged.push({
         id: row.id,
@@ -2356,6 +2761,7 @@ async function analyzeHomeVerifiedContextWithGemini(target, options = {}) {
         if (result.code !== 0) throw new Error(result.stderr || result.stdout || "홈 원글 Gemini 문맥 생성 실패");
         if (!fs.existsSync(outPath)) throw new Error("홈 원글 Gemini 문맥 출력 파일이 없습니다.");
         const raw = fs.readFileSync(outPath, "utf8");
+        homeVerifiedCommentLib.assertHomeVerifiedReplyNotDeclined(JSON.parse(extractJsonObjectText(raw)));
         const parsed = parseTerafabxGrokContext(raw);
         if (!hasDetailedTerafabxGrokContext(parsed) || !parsed.reply) {
           throw new Error("홈 원글 Gemini 문맥/초안 JSON이 비어 있거나 부족합니다.");
@@ -2382,7 +2788,7 @@ async function analyzeHomeVerifiedContextWithGemini(target, options = {}) {
           error: error.message,
           runDir,
         });
-        if (attempt >= maxAttempts) throw error;
+        if (error.discard || attempt >= maxAttempts) throw error;
       }
     }
     throw new Error("홈 원글 Gemini 문맥·초안 생성 실패");
@@ -2429,6 +2835,7 @@ async function analyzeHomeVerifiedContextWithGrok(target, options = {}) {
         error.noRetry = true;
         throw error;
       }
+      homeVerifiedCommentLib.assertHomeVerifiedReplyNotDeclined(JSON.parse(extractJsonObjectText(raw)));
       const result = parseTerafabxGrokContext(raw);
       if (!hasDetailedTerafabxGrokContext(result) || !result.reply) {
         throw new Error("홈 원글 Grok 문맥/초안 JSON이 비어 있거나 부족합니다.");
@@ -2508,20 +2915,25 @@ async function reviewHomeVerifiedReplyWithGemini(target, grokInput, options = {}
       const judgeId = `final-judge-${attempt}`;
       const judgePromptPath = path.join(runDir, `${judgeId}-prompt.md`);
       const judgeOutPath = path.join(runDir, `${judgeId}.txt`);
-      fs.writeFileSync(judgePromptPath, homeVerifiedCommentPrompts.homeVerifiedFinalJudgePrompt(target, grok, finalReply));
+      const judgedAtMs = Date.now();
+      fs.writeFileSync(judgePromptPath, homeVerifiedCommentPrompts.homeVerifiedFinalJudgePrompt(target, grok, finalReply, judgedAtMs));
       const judgeRun = await runScript(judgePromptPath, judgeOutPath, `home-verified-judge:${target.targetId || "target"}:${attempt}`);
       if (judgeRun.code !== 0 || !fs.existsSync(judgeOutPath)) {
         throw new Error(judgeRun.stderr || judgeRun.stdout || "홈 원글 Gemini 최종 심사 실패");
       }
-      const groundingContext = options.groundingContext || grok;
-      let judged = parseTerafabxFinalJudge(fs.readFileSync(judgeOutPath, "utf8"), finalReply, {
+      const rawJudgeText = fs.readFileSync(judgeOutPath, "utf8");
+      const rawJudge = JSON.parse(extractJsonObjectText(rawJudgeText));
+      // Generated summaries are hypotheses, not independent source evidence.
+      let judged = parseTerafabxFinalJudge(rawJudgeText, finalReply, {
         ...target,
-        groundingContext,
+        groundingContext: null,
+        grokContext: null,
       });
       // 100점대 + 앵커 엄격 매칭만 실패하는 홈 원글 오탈락 복구
       const reconciled = homeVerifiedCommentLib.reconcileHomeVerifiedFinalJudge(judged, {
         ...target,
-        groundingContext,
+        groundingContext: null,
+        grokContext: null,
       }, finalReply);
       if (reconciled.softGrounding) {
         logEvent("terafabx_home_verified_judge_soft_grounding", {
@@ -2533,7 +2945,7 @@ async function reviewHomeVerifiedReplyWithGemini(target, grokInput, options = {}
           attempt,
         });
       }
-      judged = reconciled;
+      judged = homeVerifiedCommentLib.applyHomeVerifiedSourceAudit(reconciled, target, finalReply, rawJudge, judgedAtMs);
       return { ...judged, provider: "gemini-web-home-verified-judge", runDir };
     };
 
@@ -2546,12 +2958,15 @@ async function reviewHomeVerifiedReplyWithGemini(target, grokInput, options = {}
 
     const needsRewrite = !finalJudge.passed || !hard.ok;
     if (needsRewrite && Number(options.repairAttempt || 0) < 1) {
+      fs.writeFileSync(promptPath, homeVerifiedCommentPrompts.homeVerifiedGeminiReviewPrompt(target, grok, [finalJudge.reason, ...(finalJudge.flaggedQualityIssues || [])].filter(Boolean).join(" | ")));
       const result = await runScript(promptPath, outPath, `home-verified-review:${target.targetId || "target"}`);
       fs.writeFileSync(path.join(runDir, "gemini.stdout.txt"), result.stdout || "");
       fs.writeFileSync(path.join(runDir, "gemini.stderr.txt"), result.stderr || "");
       if (result.code !== 0) throw new Error(result.stderr || result.stdout || "홈 원글 Gemini 검수 실패");
       if (!fs.existsSync(outPath)) throw new Error("홈 원글 Gemini 검수 출력 파일이 없습니다.");
-      const review = parseTerafabxGeminiReview(fs.readFileSync(outPath, "utf8"));
+      const rawReview = fs.readFileSync(outPath, "utf8");
+      homeVerifiedCommentLib.assertHomeVerifiedReplyNotDeclined(JSON.parse(extractJsonObjectText(rawReview)), "final_reply");
+      const review = parseTerafabxGeminiReview(rawReview);
       const rewritten = validateTerafabxReply(review.finalReply || stage1Draft);
       const rewriteJudge = await judgeOnce(rewritten, 1);
       const rewriteHard = homeVerifiedCommentLib.homeVerifiedJudgeHardFail(rewriteJudge, rewritten);
@@ -2749,8 +3164,8 @@ async function prepareTerafabxHomeVerifiedComment(post, options = {}) {
   const prepared = await buildHomeVerifiedPreparedCommentRecord(target, {
     manual: Boolean(options.manual),
     workerIndex: worker,
-    chromePort: TERAFABX_HOME_VERIFIED_COMMENT_GEMINI_PORT_BASE + worker,
-    profileDir: `${TERAFABX_GEMINI_PROFILE_DIR}-home-verified-${worker + 1}`,
+    chromePort: Number(options.chromePort || TERAFABX_HOME_VERIFIED_COMMENT_GEMINI_PORT_BASE + worker),
+    profileDir: options.profileDir || `${TERAFABX_GEMINI_PROFILE_DIR}-home-verified-${worker + 1}`,
     grokContextSession: options.grokContextSession || `${TERAFABX_GROK_WEB_SESSION}-home-verified-${worker + 1}`,
     contextProvider,
   });
@@ -2815,8 +3230,33 @@ function saveTerafabxHomeVerifiedCommentSuccess(record, posted) {
   return historyRecord;
 }
 
+/** No X side effects: reusable for queued-draft migration and nonpublishing regression checks. */
+async function refreshHomeVerifiedWriteReview(record, options = {}) {
+  const quality = assessTerafabxHomeVerifiedWriteQuality(record);
+  if (!homeVerifiedCommentLib.homeVerifiedNeedsReviewRefresh(quality)) return { record, refreshed: false };
+  const review = await reviewHomeVerifiedReplyWithGemini(record.target, {
+    reply: record.prepared.comment,
+    contextSummary: record.prepared.grokContext?.summary || "원문 기준으로 다시 확인",
+    keyPoints: record.prepared.grokContext?.keyPoints || [],
+  }, {
+    chromePort: TERAFABX_HOME_VERIFIED_COMMENT_GEMINI_PORT_BASE + 10,
+    profileDir: `${TERAFABX_GEMINI_PROFILE_DIR}-home-verified-prepost`,
+    ...options,
+  });
+  const updated = { ...record, prepared: { ...record.prepared,
+    comment: review.finalReply,
+    geminiReview: { ...record.prepared.geminiReview, ...review, used: review.usedGemini },
+  } };
+  logEvent("terafabx_home_verified_prepost_rechecked", {
+    targetUrl: record.targetUrl, reasons: quality.errors,
+    before: record.prepared.comment, after: review.finalReply,
+    sourceAudit: review.finalJudge?.sourceAudit,
+  });
+  return { record: updated, refreshed: true };
+}
+
 async function postTerafabxHomeVerifiedWriteRecord(record) {
-  const latest = persistTerafabxHomeVerifiedWrite({
+  let latest = persistTerafabxHomeVerifiedWrite({
     ...record,
     status: "posting",
     attempts: Math.max(0, Number(record.attempts || 0)) + 1,
@@ -2828,7 +3268,7 @@ async function postTerafabxHomeVerifiedWriteRecord(record) {
     return { status: "already_posted", targetUrl: latest.targetUrl };
   }
   const quality = assessTerafabxHomeVerifiedWriteQuality(latest);
-  if (!quality.ok) {
+  if (!quality.ok && !homeVerifiedCommentLib.homeVerifiedNeedsReviewRefresh(quality)) {
     removeTerafabxHomeVerifiedWrite(latest.id);
     logEvent("terafabx_home_verified_write_quality_rejected", {
       id: latest.id,
@@ -2896,12 +3336,49 @@ async function postTerafabxHomeVerifiedWriteRecord(record) {
   });
   if (delayMs > 0) await sleep(delayMs);
   try {
+    // Recheck after pacing delays: an old queue approval is not approval for today's context.
+    const refreshed = await refreshHomeVerifiedWriteReview(latest);
+    latest = refreshed.record;
+    if (refreshed.refreshed) latest = persistTerafabxHomeVerifiedWrite(latest);
+    const finalQuality = assessTerafabxHomeVerifiedWriteQuality(latest);
+    if (!finalQuality.ok) {
+      if (homeVerifiedCommentLib.homeVerifiedNeedsReviewRefresh(finalQuality)) {
+        throw new Error(`댓글 재검수 유효시간 경과: ${finalQuality.errors.join(",")}`);
+      }
+      const error = new Error(`댓글 게시 직전 검수 탈락: ${finalQuality.errors.join(",")}`);
+      error.code = "HOME_VERIFIED_JUDGE_DISCARD";
+      throw error;
+    }
+    // 같은 브라우저 세션에서 원글 하트 후 댓글 게시. 하트 실패(deferred)는 게시를 막지 않는다.
+    const heart = await attemptTerafabxReplyHeart(latest.targetUrl, {
+      rootUrl: latest.rootUrl || latest.targetUrl,
+      manual: false,
+      source: "home_verified_comment",
+      xResourceKind: "homeVerified",
+      cleanupHeadless: false,
+      lockAction: "home-verified-heart-before-post",
+    });
+    logEvent("terafabx_home_verified_heart_before_post", {
+      targetUrl: latest.targetUrl,
+      liked: heart.liked,
+      alreadyLiked: heart.alreadyLiked,
+      deferred: heart.deferred,
+      error: heart.error,
+    });
     const posted = await postTerafabxReply(latest.targetUrl, latest.prepared.comment, {
       headless: true,
       xResourceKind: "homeVerified",
       lockAction: "home-verified-comment-writer",
       cleanupHeadless: true,
       verifyRelationship: true,
+      beforeSubmit: () => {
+        const check = assessTerafabxHomeVerifiedWriteQuality(latest);
+        if (!check.ok) {
+          const error = new Error(`댓글 제출 전 검수 만료: ${check.errors.join(",")}`);
+          error.code = "HOME_VERIFIED_REVIEW_EXPIRED";
+          throw error;
+        }
+      },
     });
     if (!posted?.ok || !posted.replyUrl) {
       const uncertain = persistTerafabxHomeVerifiedWrite({
@@ -2918,9 +3395,17 @@ async function postTerafabxHomeVerifiedWriteRecord(record) {
       targetUrl: latest.targetUrl,
       replyUrl: posted.replyUrl,
       comment: latest.prepared.comment,
+      liked: heart.liked,
+      alreadyLiked: heart.alreadyLiked,
+      heartDeferred: heart.deferred,
     });
     return { status: "posted", history, posted };
   } catch (error) {
+    if (error.code === "HOME_VERIFIED_JUDGE_DISCARD") {
+      removeTerafabxHomeVerifiedWrite(latest.id);
+      logEvent("terafabx_home_verified_write_quality_rejected", { id: latest.id, targetUrl: latest.targetUrl, error: error.message });
+      return { status: "quality_rejected", error: error.message, record: latest };
+    }
     if (isTerafabxReplySubmissionUncertain(error) || error?.code === "TERAFABX_REPLY_SUBMISSION_UNCERTAIN") {
       const uncertain = persistTerafabxHomeVerifiedWrite({
         ...latest,
@@ -3102,12 +3587,12 @@ async function runTerafabxHomeVerifiedCommentPrepareCycle(options = {}) {
     const batch = backlog.slice(0, limit);
     const results = { prepared: 0, failed: 0, discarded: 0, held: 0, errors: [], items: [] };
 
-    for (let index = 0; index < batch.length; index += 1) {
-      const post = batch[index];
+    let grokQuotaHit = false;
+    const processHomeVerifiedPrepareItem = async (post, resource) => {
       try {
         if (terafabxHomeVerifiedAlreadyHandled(loadTerafabxState(), post.url)) {
           results.held += 1;
-          continue;
+          return;
         }
         let candidate = post;
         try {
@@ -3115,7 +3600,7 @@ async function runTerafabxHomeVerifiedCommentPrepareCycle(options = {}) {
           if (!live.ok) {
             results.held += 1;
             results.errors.push({ url: post.url, reasons: live.reasons });
-            continue;
+            return;
           }
           candidate = live.post;
         } catch (apiError) {
@@ -3126,10 +3611,13 @@ async function runTerafabxHomeVerifiedCommentPrepareCycle(options = {}) {
         if (!reclass.ok) {
           results.held += 1;
           results.errors.push({ url: post.url, reasons: reclass.reasons, discarded: true });
-          continue;
+          return;
         }
         const { target, prepared } = await prepareTerafabxHomeVerifiedComment(reclass.post, {
-          workerIndex: index % Math.max(1, terafabxBrowserConcurrency(5)),
+          workerIndex: resource.workerIndex,
+          chromePort: resource.chromePort,
+          profileDir: resource.profileDir,
+          grokContextSession: resource.grokContextSession,
           manual: Boolean(options.manual),
         });
         const queued = enqueueTerafabxHomeVerifiedWriteRecord({
@@ -3167,9 +3655,48 @@ async function runTerafabxHomeVerifiedCommentPrepareCycle(options = {}) {
             grokQuotaBackoffUntil: until,
             grokQuotaMessage: error.message,
           });
-          break;
+          grokQuotaHit = true;
         }
       }
+    };
+
+    // 내글 대댓글과 동일한 consumer group(pub/sub) 소비: 빈 워커가 다음 작업을 pull한다.
+    // 같은 작성자 글은 한 작업으로 묶어 작성자 일일 한도 검사의 동시 경쟁을 막는다.
+    const authorGroups = new Map();
+    for (const post of batch) {
+      const key = String(post.authorHandle || post.url || "").toLowerCase();
+      if (!authorGroups.has(key)) authorGroups.set(key, []);
+      authorGroups.get(key).push(post);
+    }
+    const prepareConcurrency = Math.max(1, terafabxBrowserConcurrency(5));
+    const prepareGroup = createTerafabxGeminiConsumerGroup(prepareConcurrency, {
+      resourceFactory: (workerIndex) => ({
+        workerIndex,
+        chromePort: TERAFABX_HOME_VERIFIED_COMMENT_GEMINI_PORT_BASE + workerIndex,
+        profileDir: `${TERAFABX_GEMINI_PROFILE_DIR}-home-verified-${workerIndex + 1}`,
+        grokContextSession: `${TERAFABX_GROK_WEB_SESSION}-home-verified-${workerIndex + 1}`,
+      }),
+      initializeResource: () => {},
+      // Gemini 브라우저는 사이클 간 재사용하므로 그룹 종료 시 내리지 않는다.
+      closeResource: async () => {},
+    });
+    if (batch.length) {
+      logEvent("terafabx_home_verified_prepare_pool_start", {
+        batchCount: batch.length,
+        authorGroupCount: authorGroups.size,
+        concurrency: prepareConcurrency,
+        scheduling: "consumer_group_fifo",
+      });
+    }
+    try {
+      await Promise.allSettled(Array.from(authorGroups.values(), (posts) => prepareGroup.enqueue(async (workerIndex, resource) => {
+        for (const post of posts) {
+          if (grokQuotaHit) return;
+          await processHomeVerifiedPrepareItem(post, resource);
+        }
+      })));
+    } finally {
+      await prepareGroup.close();
     }
 
     const remainingBacklog = backlog.filter((item) => !batch.some((b) => b.id === item.id));
@@ -3229,7 +3756,16 @@ async function maybeRunTerafabxHomeVerifiedCommentAutomation() {
       ? { pumped: 0, reason: "prefill_only" }
       : pumpTerafabxHomeVerifiedWriteQueue();
 
-    const pendingCount = loadTerafabxHomeVerifiedWriteQueue().length;
+    const reconcile = await reconcileHomeVerifiedVerificationRequired({
+      limit: 20,
+      sample: 12,
+    });
+    if (reconcile.recovered || reconcile.expired) {
+      logEvent("terafabx_home_verified_auto_verification_reconcile", reconcile);
+    }
+
+    const pendingRowsAfter = loadTerafabxHomeVerifiedWriteQueue();
+    const pendingCount = homeVerifiedCommentLib.homeVerifiedActionablePendingCount(pendingRowsAfter);
     const needPrepare = daily.remainingAfterPending > 0
       && pendingCount < TERAFABX_HOME_VERIFIED_COMMENT_READY_BUFFER;
 
@@ -3347,7 +3883,7 @@ function getTerafabxHomeVerifiedCommentStatus(state = loadTerafabxState()) {
     enabled: Boolean(state.homeVerifiedCommentEnabled),
     prefillOnly: state.homeVerifiedCommentPrefillOnly !== false,
     backlogCount: backlog.length,
-    pendingCount: pending.length,
+    pendingCount: homeVerifiedCommentLib.homeVerifiedActionablePendingCount(pending),
     postedToday: daily.postedToday,
     dailyTarget: daily.dailyTarget,
     grokQuota,
@@ -3371,6 +3907,8 @@ function getTerafabxHomeVerifiedCommentStatus(state = loadTerafabxState()) {
     minPostGapMs: TERAFABX_HOME_VERIFIED_COMMENT_MIN_POST_GAP_MS,
     backlogCount: backlog.length,
     pendingCount: pending.length,
+    actionablePendingCount: homeVerifiedCommentLib.homeVerifiedActionablePendingCount(pending),
+    verificationRequiredCount: homeVerifiedCommentLib.homeVerifiedVerificationRequiredCount(pending),
     postedToday: daily.postedToday,
     pending: pending.slice(0, 20).map((row) => ({
       id: row.id,
@@ -3428,6 +3966,35 @@ function getTerafabxHomeVerifiedCommentStatus(state = loadTerafabxState()) {
       tone: "gwajeuplupi_casual_reply_not_news_summary",
     },
   };
+}
+
+async function maybeProxyHomeVerifiedRequest(req, res, body = null) {
+  if (!HOME_VERIFIED_UPSTREAM || !isHomeVerifiedUpstreamPath(req.method, req.url)) return false;
+  try {
+    const proxied = await proxyHomeVerifiedUpstream({
+      upstream: HOME_VERIFIED_UPSTREAM,
+      method: req.method,
+      url: req.url,
+      headers: req.headers,
+      body,
+    });
+    res.writeHead(proxied.statusCode || 502, {
+      "content-type": proxied.headers["content-type"] || "application/json; charset=utf-8",
+      "x-home-verified-upstream": HOME_VERIFIED_UPSTREAM,
+    });
+    res.end(proxied.body);
+  } catch (error) {
+    logEvent("home_verified_upstream_proxy_error", {
+      error: error.message,
+      method: req.method,
+      url: req.url,
+      upstream: HOME_VERIFIED_UPSTREAM,
+      fallback: "local",
+    });
+    // 분리 워커가 꺼져 있어도 운영 서버가 상대방 원글 자동댓글을 직접 수행한다.
+    return false;
+  }
+  return true;
 }
 
 function buildHomeVerifiedDashboardData(requestUrl = "/api/discovery/home-verified-dashboard") {
@@ -3986,6 +4553,7 @@ function publishedDiscoveryTime(row, nowMs = Date.now()) {
   if (!row) return "";
   if (row.status === "posted") return row.postedAt || row.scheduledPostAt || "";
   if (row.status === "scheduled") {
+    if (isLocalScheduleDelivery(row)) return "";
     const scheduledMs = new Date(row.scheduledPostAt || 0).getTime();
     if (Number.isFinite(scheduledMs) && scheduledMs <= nowMs) {
       return row.scheduledPostAt || row.postedAt || "";
@@ -3998,6 +4566,16 @@ function isPublishedDiscoveryRow(row, nowMs = Date.now()) {
   return Boolean(publishedDiscoveryTime(row, nowMs));
 }
 
+function dashboardDiscoveryGroupFields(row) {
+  if (!row) return {};
+  const fields = {};
+  if (row.candidateGroup) fields.candidateGroup = row.candidateGroup;
+  if (row.approvalBatchId) fields.approvalBatchId = row.approvalBatchId;
+  if (row.approvedAt) fields.approvedAt = row.approvedAt;
+  if (row.groupClassifiedAt) fields.groupClassifiedAt = row.groupClassifiedAt;
+  return fields;
+}
+
 function dashboardDiscoveryRow(row, nowMs = Date.now()) {
   if (row?.status === "scheduled" && isPublishedDiscoveryRow(row, nowMs)) {
     return {
@@ -4005,15 +4583,23 @@ function dashboardDiscoveryRow(row, nowMs = Date.now()) {
       status: "posted",
       postedAt: row.scheduledPostAt || row.postedAt,
       scheduledPostAt: null,
+      scheduleDelivery: scheduleDeliveryOf(row),
+      ...dashboardDiscoveryGroupFields(row),
     };
   }
-  return row;
+  if (!row) return row;
+  return {
+    ...row,
+    scheduleDelivery: scheduleDeliveryOf(row),
+    ...dashboardDiscoveryGroupFields(row),
+  };
 }
 
 function mirrorHistoryPublishedTime(entry, nowMs = Date.now()) {
   if (!entry) return "";
   if (entry.status === "posted") return entry.completedAt || entry.postedAt || entry.scheduledAt || "";
   if (entry.status === "scheduled") {
+    if (isLocalScheduleDelivery(entry)) return "";
     const scheduledMs = new Date(entry.scheduledAt || 0).getTime();
     if (Number.isFinite(scheduledMs) && scheduledMs <= nowMs) {
       return entry.scheduledAt || entry.completedAt || "";
@@ -4025,10 +4611,14 @@ function mirrorHistoryPublishedTime(entry, nowMs = Date.now()) {
 function mirrorHistoryDashboardRow(entry, nowMs = Date.now()) {
   const canonicalUrl = String(entry?.canonicalUrl || "").trim();
   if (!canonicalUrl) return null;
+  if (entry.cancelledReason === "user_deleted_on_x") return null;
   const publishedAt = mirrorHistoryPublishedTime(entry, nowMs);
   const scheduledMs = new Date(entry.scheduledAt || 0).getTime();
   const isFutureScheduled = entry.status === "scheduled" && Number.isFinite(scheduledMs) && scheduledMs > nowMs;
-  if (!publishedAt && !isFutureScheduled) return null;
+  const isOpenLocalSchedule = entry.status === "scheduled"
+    && isLocalScheduleDelivery(entry)
+    && Number.isFinite(scheduledMs);
+  if (!publishedAt && !isFutureScheduled && !isOpenLocalSchedule) return null;
   let author = "mirror-history";
   try {
     author = new URL(canonicalUrl).pathname.split("/")[1]?.replace("@", "") || author;
@@ -4049,6 +4639,7 @@ function mirrorHistoryDashboardRow(entry, nowMs = Date.now()) {
     postedAt: publishedAt || null,
     lastError: null,
     attempts: 0,
+    scheduleDelivery: scheduleDeliveryOf(entry),
   };
 }
 
@@ -4065,6 +4656,7 @@ function mergeDiscoveryRowsWithMirrorHistory(rows, nowMs = Date.now(), historyEn
     const next = { ...existing };
     next.xPostUrl = historyRow.xPostUrl || existing.xPostUrl || null;
     next.mediaCount = Math.max(Number(existing.mediaCount || 0), Number(historyRow.mediaCount || 0));
+    next.scheduleDelivery = scheduleDeliveryOf(existing.scheduleDelivery ? existing : historyRow);
     if (historyRow.status === "posted") {
       next.status = "posted";
       next.postedAt = historyRow.postedAt;
@@ -4073,6 +4665,7 @@ function mergeDiscoveryRowsWithMirrorHistory(rows, nowMs = Date.now(), historyEn
     } else if (!isPublishedDiscoveryRow(existing, nowMs)) {
       next.status = "scheduled";
       next.scheduledPostAt = historyRow.scheduledPostAt;
+      next.scheduleDelivery = scheduleDeliveryOf(historyRow);
     }
     byUrl.set(historyRow.canonicalUrl, next);
   }
@@ -5945,7 +6538,11 @@ async function ensureTerafabxGeminiHeadlessBrowser(options = {}) {
   if (seed.seeded) logEvent("terafabx_gemini_profile_seeded", { port, profileDir, templateDir: seed.templateDir });
   else if (seed.reason && seed.reason !== "target_not_managed") logEvent("terafabx_gemini_profile_seed_skipped", { port, profileDir, reason: seed.reason });
   fs.mkdirSync(profileDir, { recursive: true });
-  const headless = options.headless !== false;
+  // Default headless=new. If Gemini starts refusing automation again, set
+  // TERAFABX_GEMINI_HEADED=true for off-screen headed Chrome (non-HeadlessChrome UA).
+  const headless = Object.prototype.hasOwnProperty.call(options, "headless")
+    ? Boolean(options.headless)
+    : !/^(1|true|yes)$/i.test(String(process.env.TERAFABX_GEMINI_HEADED || ""));
   const args = terafabxChromeLaunchArgs({ port, profileDir, headless });
   const child = spawn(chromeExecutablePath(), args, { detached: true, stdio: "ignore" });
   let childExit = null;
@@ -5961,7 +6558,8 @@ async function ensureTerafabxGeminiHeadlessBrowser(options = {}) {
     }
     throw error;
   }
-  return { launched: true, port, profileDir, pid: child.pid };
+  logEvent("terafabx_gemini_browser_launched", { port, profileDir, headless, pid: child.pid });
+  return { launched: true, port, profileDir, pid: child.pid, headless };
 }
 
 async function closeTerafabxGeminiHeadlessBrowser(options = {}) {
@@ -6634,6 +7232,68 @@ function scheduleTerafabxOwnPostReplyXIdleCleanup() {
   terafabxOwnPostReplyXIdleCleanupTimer.unref?.();
 }
 
+function isThreadsSessionCookie(cookie = {}) {
+  const domain = String(cookie.domain || "").replace(/^\./, "");
+  return /(^|\.)threads\.(com|net)$/.test(domain)
+    || /(^|\.)instagram\.com$/.test(domain)
+    || /(^|\.)facebook\.com$/.test(domain)
+    || /(^|\.)cdninstagram\.com$/.test(domain)
+    || /(^|\.)fbcdn\.net$/.test(domain);
+}
+
+async function copyThreadsCookiesToPage(page) {
+  const source = await getCookieSourcePage();
+  try {
+    const all = await source.page.send("Network.getAllCookies", {}, 10000);
+    const cookies = (all.cookies || [])
+      .filter(isThreadsSessionCookie)
+      .map((cookie) => ({
+        name: cookie.name,
+        value: cookie.value,
+        domain: cookie.domain,
+        path: cookie.path || "/",
+        secure: Boolean(cookie.secure),
+        httpOnly: Boolean(cookie.httpOnly),
+        sameSite: cookie.sameSite,
+        expires: cookie.expires,
+      }))
+      .filter((cookie) => cookie.name && cookie.value);
+    if (!cookies.length) throw new Error("복사할 Threads 로그인 쿠키를 찾지 못했습니다.");
+    await page.send("Network.setCookies", { cookies }, 10000);
+    logEvent("discovery_scan_threads_cookies_copied", { count: cookies.length, port: page.port });
+    return { count: cookies.length };
+  } finally {
+    if (source.closeTab) await source.page.close();
+    else {
+      try { source.page.ws.close(); } catch {}
+    }
+  }
+}
+
+async function ensureDiscoveryScanHeadlessBrowser() {
+  return ensureTerafabxGeminiHeadlessBrowser({
+    port: DISCOVERY_SCAN_CHROME_PORT,
+    profileDir: DISCOVERY_SCAN_PROFILE_DIR,
+    seedProfile: false,
+    headless: true,
+  });
+}
+
+async function primeDiscoveryScanHeadlessSession() {
+  await ensureDiscoveryScanHeadlessBrowser();
+  const page = await newPageForPort(DISCOVERY_SCAN_CHROME_PORT, "about:blank");
+  try {
+    return await copyThreadsCookiesToPage(page);
+  } finally {
+    await page.close().catch(() => {});
+  }
+}
+
+async function newDiscoveryScanPage(url = "about:blank") {
+  await ensureDiscoveryScanHeadlessBrowser();
+  return newPageForPort(DISCOVERY_SCAN_CHROME_PORT, url);
+}
+
 async function copyXCookiesToPage(page) {
   const source = await getCookieSourcePage();
   try {
@@ -6821,6 +7481,13 @@ function xPageReadyState(snapshot = {}, mode = "page") {
   };
 }
 
+function shouldAbortXPageReadyForRateLimit(assessment = {}, mode = "page") {
+  if (!assessment.rateLimited || assessment.ready) return false;
+  // Home/schedule pages often see incidental Viewer/fleetline 429s while the
+  // usable list is still loading. Keep polling those modes instead of aborting.
+  return mode !== "home" && mode !== "schedule";
+}
+
 async function readXPageReadySnapshot(page) {
   const snapshot = await page.evalFast(`(() => ({
     url: location.href,
@@ -6854,7 +7521,9 @@ async function waitForXPageReady(page, mode, options = {}) {
     snapshot = await readXPageReadySnapshot(page).catch(() => null);
     assessment = xPageReadyState(snapshot || {}, mode);
     if (assessment.ready) return { snapshot, assessment, reloaded };
-    if (assessment.rateLimited) throw new Error(`X ${mode} 사용량 제한 HTTP 429 code 1003`);
+    if (shouldAbortXPageReadyForRateLimit(assessment, mode)) {
+      throw new Error(`X ${mode} 사용량 제한 HTTP 429 code 1003`);
+    }
     if (assessment.loginVisible) throw new Error(`X ${mode} 로그인 화면으로 이동했습니다.`);
     if (allowReload && !reloaded && attempt >= Math.min(5, Math.floor(attempts / 3)) && (assessment.blank || assessment.errorVisible)) {
       reloaded = true;
@@ -6863,6 +7532,7 @@ async function waitForXPageReady(page, mode, options = {}) {
     }
     await sleep(intervalMs);
   }
+  if (assessment?.rateLimited) throw new Error(`X ${mode} 사용량 제한 HTTP 429 code 1003`);
   throw new Error(`X ${mode} 로딩 실패: ${JSON.stringify({
     url: snapshot?.url || null,
     title: snapshot?.title || null,
@@ -7487,7 +8157,12 @@ async function fetchFxTwitterConversation(postUrl, options = {}) {
       truncated = Boolean(nextCursor) || truncated;
       break;
     }
-    if (!nextCursor || nextCursor === cursor || seenCursors.has(nextCursor) || emptyPageStreak >= 2) break;
+    if (!nextCursor) break;
+    if (nextCursor === cursor || seenCursors.has(nextCursor) || emptyPageStreak >= 2) {
+      truncated = true;
+      cursor = nextCursor;
+      break;
+    }
     seenCursors.add(nextCursor);
     cursor = nextCursor;
   }
@@ -7505,6 +8180,46 @@ async function fetchFxTwitterConversation(postUrl, options = {}) {
     truncated,
     lastError,
     source: "fxtwitter-v2-conversation",
+  };
+}
+
+function isTerafabxOwnPostConversationComplete(conversation = {}) {
+  return conversation.partial !== true && conversation.truncated !== true;
+}
+
+function mergeTerafabxFxTwitterConversations(primary = {}, secondary = {}) {
+  const rootPost = primary.rootPost || secondary.rootPost || null;
+  const rootId = String(rootPost?.id || "");
+  const tweetsById = new Map();
+  for (const tweet of [...(primary.tweets || []), ...(secondary.tweets || [])]) {
+    const id = String(tweet?.id || "");
+    if (!id) continue;
+    tweetsById.set(id, tweet);
+  }
+  const rest = [];
+  for (const [id, tweet] of tweetsById) {
+    if (id === rootId) continue;
+    rest.push(tweet);
+  }
+  const tweets = rootId && tweetsById.has(rootId)
+    ? [tweetsById.get(rootId), ...rest]
+    : rootPost
+      ? [rootPost, ...rest]
+      : rest;
+  return {
+    ...primary,
+    rootPost,
+    tweets,
+    pageCount: Number(primary.pageCount || 0) + Number(secondary.pageCount || 0),
+    collectedReplyCount: rest.length,
+    emptyPageStreak: Math.min(
+      Number(primary.emptyPageStreak || 0),
+      Number(secondary.emptyPageStreak || 0),
+    ),
+    partial: primary.partial === true || secondary.partial === true,
+    truncated: primary.truncated === true || secondary.truncated === true,
+    lastError: primary.lastError || secondary.lastError || null,
+    source: `${primary.source || secondary.source || "fxtwitter-v2-conversation"}+recency-merge`,
   };
 }
 
@@ -8960,12 +9675,40 @@ async function collectTerafabxOwnPostConversation(postUrl, options = {}) {
   }
   if (options.apiFirst !== false && options.deepScan !== true && options.fullScan !== true) {
     try {
-      const conversation = await fetchFxTwitterConversation(normalizedPostUrl, {
-        rankingMode: "likes",
+      const fetchJson = options.fetchJson || requestExternalJson;
+      const conversationOptions = {
         excludeAuthor: true,
         maxItems: 5_000,
         maxPages: 30,
+        fetchJson,
+      };
+      let conversation = await fetchFxTwitterConversation(normalizedPostUrl, {
+        ...conversationOptions,
+        rankingMode: "likes",
       });
+      if (conversation.truncated === true || conversation.partial === true) {
+        try {
+          const recent = await fetchFxTwitterConversation(normalizedPostUrl, {
+            ...conversationOptions,
+            rankingMode: "recency",
+            maxItems: 1_000,
+            maxPages: 15,
+          });
+          conversation = mergeTerafabxFxTwitterConversations(conversation, recent);
+          logEvent("terafabx_own_post_reply_recency_merge", {
+            postUrl: normalizedPostUrl,
+            pageCount: conversation.pageCount,
+            collectedReplyCount: conversation.collectedReplyCount,
+            truncated: conversation.truncated,
+            partial: conversation.partial,
+          });
+        } catch (error) {
+          logEvent("terafabx_own_post_reply_recency_merge_error", {
+            postUrl: normalizedPostUrl,
+            error: error.message,
+          });
+        }
+      }
       if (String(conversation.rootPost.authorHandle || "").toLowerCase() !== REQUIRED_X_HANDLE) {
         throw new Error(`대상 원문 계정 검증 실패: @${conversation.rootPost.authorHandle || "unknown"}`);
       }
@@ -8996,6 +9739,8 @@ async function collectTerafabxOwnPostConversation(postUrl, options = {}) {
         tweets: conversation.tweets,
         collectionSource: conversation.source,
         pageCount: conversation.pageCount,
+        collectedReplyCount: conversation.collectedReplyCount,
+        emptyPageStreak: conversation.emptyPageStreak,
         partial: conversation.partial,
         truncated: conversation.truncated,
         collectionError: conversation.lastError,
@@ -9021,19 +9766,33 @@ function buildTerafabxOwnPostReplyCoverageRecord(conversation = {}, state = {}, 
   const remainingEligibleCount = Math.max(0, Number(conversation.candidates?.length || 0));
   const checkedAt = options.checkedAt || new Date().toISOString();
   const rawReplyCount = Math.max(0, Number(conversation.rootPost?.replyCount || 0));
+  const collectedReplyCount = Math.max(
+    0,
+    Number(conversation.collectedReplyCount || 0),
+    Number(conversation.directReplies?.length || 0),
+    Math.max(0, Number((conversation.tweets || conversation.rows || []).length) - 1),
+  );
+  const complete = isTerafabxOwnPostConversationComplete(conversation);
+  const headlessFull = conversation.fullScan === true
+    || conversation.collectionSource === "x-direct-full-scroll";
+  const fullScan = headlessFull || complete;
   return {
     rootPostUrl: rootUrl,
     rootPostText: cleanSocialText(conversation.rootPost?.text || ""),
     checkedAt,
-    fullScan: true,
-    collectionSource: conversation.collectionSource || "x-direct-full-scroll",
-    articleCount: Math.max(0, Number(conversation.rows?.length || 0)),
+    fullScan,
+    collectionSource: conversation.collectionSource || (headlessFull ? "x-direct-full-scroll" : "fxtwitter-v2-conversation"),
+    articleCount: Math.max(0, Number(conversation.rows?.length || conversation.tweets?.length || 0)),
     directReplyCount: Math.max(0, Number(conversation.directReplies?.length || 0)),
     completedCount,
     remainingEligibleCount,
     totalEligibleCount: completedCount + remainingEligibleCount,
     rawReplyCount,
-    lastConversationRawReplyCount: rawReplyCount,
+    lastConversationRawReplyCount: complete
+      ? rawReplyCount
+      : Math.max(0, Math.min(rawReplyCount || collectedReplyCount, collectedReplyCount || rawReplyCount)),
+    truncated: conversation.truncated === true,
+    partial: conversation.partial === true,
     ...(options.scheduled === true ? {
       countRefreshScheduled: true,
       countRefreshCheckedAt: checkedAt,
@@ -11145,6 +11904,7 @@ async function postTerafabxReplyUnlocked(targetUrl, comment, options = {}) {
     }
     logEvent("terafabx_reply_text_typed", { targetUrl, comment });
     if (options.validate !== false) validateTerafabxReply(typed);
+    if (options.beforeSubmit) await options.beforeSubmit();
     let clickedPost = await page.eval(`(async () => {
       async function wait(ms) { await new Promise((resolve) => setTimeout(resolve, ms)); }
       function visible(el) {
@@ -16165,6 +16925,18 @@ function assessDiscoveryCandidate(candidate, post) {
   };
 }
 
+function mergeDiscoveryEngagement(candidate = {}, post = {}) {
+  const likeCount = Math.max(
+    Number.isFinite(Number(candidate.likeCount)) ? Number(candidate.likeCount) : 0,
+    Number.isFinite(Number(post.likeCount)) ? Number(post.likeCount) : 0,
+  );
+  const viewCount = Math.max(
+    Number.isFinite(Number(candidate.viewCount)) ? Number(candidate.viewCount) : 0,
+    Number.isFinite(Number(post.viewCount)) ? Number(post.viewCount) : 0,
+  );
+  return { likeCount, viewCount, engagement: discoveryEngagementCount({ likeCount, viewCount }) };
+}
+
 function assessTerafabxDiscoveryStyle(candidate = {}, post = {}) {
   const text = cleanDiscoveryPreviewText(post.text || candidate.textPreview || "");
   const compactText = text.replace(/\s+/g, " ").trim();
@@ -16175,20 +16947,23 @@ function assessTerafabxDiscoveryStyle(candidate = {}, post = {}) {
     mediaUrls.length >= 2
     || mediaCandidates.some((item) => Number(item.width || 0) >= 240 && Number(item.height || 0) >= 240)
   );
-  const likeCount = Number.isFinite(Number(post.likeCount)) ? Number(post.likeCount) : Number(candidate.likeCount || 0);
+  const { likeCount, viewCount, engagement } = mergeDiscoveryEngagement(candidate, post);
   const isCompactHook = compactText.length >= 4 && compactText.length <= 140 && lineCount <= 5;
   const hasKorean = /[가-힣]{2,}/.test(compactText);
+  const animalCute = isCuteAnimalDiscoveryCaption(compactText);
   const curiosity = /(왜|어떻게|대체|누가|뭘까|뭐지|무슨|가능|맞지|이게|이거|이런|저런|처음 봄|알고.?보니|\?)/.test(compactText);
-  const entertainment = /(강아지|댕댕|고양이|냥이|동물|아기|남편|아내|와이프|여자친구|남자친구|엄마|아빠|친구|회사|직장|사장|손님|주말|음식|요리|축구|메시|월드컵|운동|영화|게임|사진|표정|장인)/.test(compactText);
+  const entertainment = animalCute;
   const reaction = /(ㅋㅋ|ㅎㅎ|ㄷㄷ|헐|진짜|너무|귀여|웃|미쳤|레전드|놀라|신기|소름|대박|엌|아니|제발|🥹|🤣|😂|🐶|🐱|🐈)/.test(compactText);
   const visualHook = /(이 장면|이 모습|이 표정|보고|보면|영상|사진|오른쪽|왼쪽|빈칸|들어간|나온|만드는|움직이는|잠들|깨우|쏟|도망)/.test(compactText);
   const excluded = /(대선|총선|대통령|정당|국회의원|민주당|국민의힘|난민|이슬람|혐오|전쟁|살인|자살|성폭|불륜|마약|도박|코인|주식|투자|수익률|질병|치료법|의학|다이어트약|공구|공동구매|구매링크|할인코드|협찬|광고|프로모션|DM\s*주세요)/i.test(compactText);
+  const personalCommentary = isPersonalDiscoveryCaption(compactText);
   const longInfoPost = compactText.length > 160 || lineCount > 6 || /(1\.|2\.|3\.|정리|방법|꿀팁|알아야|연구에 따르면|속보|뉴스)/.test(compactText);
+  const engagementOk = engagement >= DISCOVERY_MIN_VIEWS;
 
   let score = 0;
   if (hasStrongMedia) score += 2;
-  if (likeCount >= 3000) score += 2;
-  else if (likeCount >= DISCOVERY_MIN_LIKES) score += 1;
+  if (engagement >= 5000) score += 2;
+  else if (engagementOk) score += 1;
   if (isCompactHook) score += 2;
   if (curiosity) score += 1;
   if (entertainment) score += 1;
@@ -16197,6 +16972,9 @@ function assessTerafabxDiscoveryStyle(candidate = {}, post = {}) {
   if (!hasKorean) score -= 3;
   if (longInfoPost) score -= 3;
   if (excluded) score -= 6;
+  if (personalCommentary) score -= 6;
+  if (!animalCute) score -= 6;
+  if (!engagementOk) score -= 4;
 
   const reasons = [];
   if (!hasStrongMedia) reasons.push("weak_or_missing_media");
@@ -16204,6 +16982,9 @@ function assessTerafabxDiscoveryStyle(candidate = {}, post = {}) {
   if (!hasKorean) reasons.push("no_korean_caption");
   if (longInfoPost) reasons.push("long_or_informational");
   if (excluded) reasons.push("excluded_sensitive_or_promotional_topic");
+  if (personalCommentary) reasons.push("personal_commentary");
+  if (!animalCute) reasons.push("not_cute_animal");
+  if (!engagementOk) reasons.push("below_view_threshold");
   if (!(curiosity || entertainment || reaction || visualHook)) reasons.push("no_terafabx_style_signal");
   const pass = score >= DISCOVERY_AUTO_STYLE_MIN_SCORE
     && hasStrongMedia
@@ -16211,18 +16992,26 @@ function assessTerafabxDiscoveryStyle(candidate = {}, post = {}) {
     && hasKorean
     && !longInfoPost
     && !excluded
+    && !personalCommentary
+    && animalCute
+    && engagementOk
     && (curiosity || entertainment || reaction || visualHook);
   return {
     pass,
     score,
     reasons,
-    signals: { curiosity, entertainment, reaction, visualHook },
+    signals: { curiosity, entertainment, reaction, visualHook, animalCute },
     hasStrongMedia,
     isCompactHook,
     hasKorean,
     excluded,
+    personalCommentary,
+    animalCute,
+    engagementOk,
     longInfoPost,
     likeCount,
+    viewCount,
+    engagement,
   };
 }
 
@@ -16314,12 +17103,31 @@ function cleanDiscoveryPreviewText(value) {
   return lines.join("\n").trim();
 }
 
+function isThreadShellChromeLine(value) {
+  const text = String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  // Threads top/bottom app chrome captured when detail article extraction misses.
+  return /^(?:추천|새로운 스레드|검색|팔로잉|활동|프로필|홈|for you|following|new thread|search|activity|profile|home)$/.test(text);
+}
+
+function isThreadsShellChromeText(value) {
+  const lines = String(value || "")
+    .split(/\r?\n/)
+    .map((line) => String(line || "").replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  if (!lines.length) return false;
+  return lines.every((line) => isThreadShellChromeLine(line));
+}
+
 function isThreadUiArtifactLine(value) {
   const text = String(value || "")
     .replace(/\s+/g, " ")
     .replace(/[.!。！]+$/g, "")
     .trim()
     .toLowerCase();
+  if (isThreadShellChromeLine(text)) return true;
   return /^(?:아직 답글이 없습니다|아직 댓글이 없습니다|첫 번째 답글을 남겨보세요|첫 답글을 남겨보세요|no replies yet|be the first to reply|返信はまだありません|まだ返信はありません)$/.test(text);
 }
 
@@ -16393,12 +17201,39 @@ function selectThreadSourceText({ domText = "", embeddedCaption = "" } = {}) {
 }
 
 function selectRootPostMediaCandidates(candidates = [], maxMedia = MAX_MEDIA) {
+  const isPosterUrl = (src) => {
+    const value = String(src || "");
+    if (!value) return false;
+    let decoded = value;
+    try { decoded = decodeURIComponent(value); } catch {}
+    if (/video_first_frame(?:_thumbnail)?/i.test(decoded) || /video_first_frame(?:_thumbnail)?/i.test(value)) {
+      return true;
+    }
+    try {
+      const efg = new URL(value).searchParams.get("efg");
+      if (!efg) return false;
+      const padded = efg.replace(/-/g, "+").replace(/_/g, "/");
+      const json = typeof Buffer !== "undefined"
+        ? Buffer.from(padded, "base64").toString("utf8")
+        : (typeof atob === "function" ? atob(padded) : "");
+      return /video_first_frame/i.test(json);
+    } catch {
+      return false;
+    }
+  };
+  const slotsOverlap = (left, right) => (
+    Math.abs(Number(left.top || 0) - Number(right.top || 0)) < 8
+    && Math.abs(Number(left.left || 0) - Number(right.left || 0)) < 8
+    && Math.abs(Number(left.width || 0) - Number(right.width || 0)) < 8
+    && Math.abs(Number(left.height || 0) - Number(right.height || 0)) < 8
+  );
   const rootCandidates = candidates
     .filter((item) => item && item.rootOwned === true && item.matchesTargetPost === true)
     .filter((item) => item.src && (item.kind === "video" || /cdninstagram|fbcdn/.test(item.src)))
     .filter((item) => item.belowHandle !== false)
     .filter((item) => item.beforeRootBoundary !== false)
-    .sort((a, b) => a.top - b.top || a.left - b.left);
+    // Prefer real videos over images at the same slot so posters lose the race.
+    .sort((a, b) => a.top - b.top || a.left - b.left || (a.kind === "video" ? -1 : 1) - (b.kind === "video" ? -1 : 1));
   const firstMediaTop = rootCandidates[0]?.top;
   const mediaBand = Number.isFinite(firstMediaTop)
     ? rootCandidates.filter((item) => item.top <= firstMediaTop + 260)
@@ -16406,25 +17241,66 @@ function selectRootPostMediaCandidates(candidates = [], maxMedia = MAX_MEDIA) {
   const selectedMedia = [];
   for (const item of mediaBand) {
     if (selectedMedia.length >= maxMedia) break;
-    const duplicateSlot = selectedMedia.some((existing) =>
-      Math.abs(existing.top - item.top) < 8
-      && Math.abs(existing.left - item.left) < 8
-      && Math.abs(existing.width - item.width) < 8
-      && Math.abs(existing.height - item.height) < 8
-    );
-    if (duplicateSlot && item.kind === "image") continue;
+    const nearbyVideo = mediaBand.some((other) => (
+      other.kind === "video"
+      && other.src
+      && Math.abs(Number(other.top || 0) - Number(item.top || 0)) < 40
+    ));
+    // Never post a video first-frame poster as a still when the real video is present,
+    // and do not keep orphan posters either — they are not the media viewers expect.
+    if (item.kind === "image" && isPosterUrl(item.src)) continue;
+    const duplicateIndex = selectedMedia.findIndex((existing) => slotsOverlap(existing, item));
+    if (duplicateIndex >= 0) {
+      const existing = selectedMedia[duplicateIndex];
+      if (item.kind === "video" && existing.kind === "image") {
+        selectedMedia[duplicateIndex] = item;
+      }
+      continue;
+    }
+    if (item.kind === "image" && nearbyVideo && isPosterUrl(item.src)) continue;
     selectedMedia.push(item);
   }
   return { rootCandidates, mediaBand, selectedMedia };
 }
 
+function resolveThreadsTargetArticle(targetLink, expectedHandle, expectedPostPath) {
+  if (targetLink) {
+    const byRole = targetLink.closest('div[role="article"]');
+    if (byRole) return byRole;
+    let node = targetLink.parentElement;
+    for (let depth = 0; node && node !== document.body && depth < 24; depth += 1, node = node.parentElement) {
+      const rect = node.getBoundingClientRect();
+      if (rect.width < 240 || rect.height < 80 || rect.height > 2400) continue;
+      const text = String(node.innerText || "");
+      if (!text.includes(expectedHandle)) continue;
+      const postPaths = [];
+      for (const link of Array.from(node.querySelectorAll('a[href*="/post/"]'))) {
+        try {
+          postPaths.push(new URL(link.href, location.href).pathname.replace(/\/$/, ""));
+        } catch {}
+      }
+      const uniquePaths = Array.from(new Set(postPaths.filter(Boolean)));
+      const hasExpected = uniquePaths.some((path) => (
+        path === expectedPostPath || path.startsWith(`${expectedPostPath}/`)
+      ));
+      if (!hasExpected) continue;
+      if (uniquePaths.length > 8) continue;
+      return node;
+    }
+  }
+  return document.querySelector('div[role="article"]') || document.body;
+}
+
 async function extractThreadPost(sourceUrl, options = {}) {
-  const page = await newPage(sourceUrl, { workRole: MIRROR_WORK_TAB_ROLES.THREADS_COLLECT });
+  const page = typeof options.openPage === "function"
+    ? await options.openPage(sourceUrl)
+    : await newPage(sourceUrl, { workRole: MIRROR_WORK_TAB_ROLES.THREADS_COLLECT });
   try {
     const expectedHandle = new URL(sourceUrl).pathname.split("/")[1].replace("@", "");
     await sleep(9000);
     const translation = await page.eval(`(() => {
       const expectedPostPath = ${JSON.stringify(new URL(sourceUrl).pathname.replace(/\/$/, ""))};
+      const resolveThreadsTargetArticle = ${resolveThreadsTargetArticle.toString()};
       const targetLink = Array.from(document.querySelectorAll('a[href*="/post/"]')).find((link) => {
         try {
           const path = new URL(link.href, location.href).pathname.replace(/\\\/$/, "");
@@ -16433,7 +17309,7 @@ async function extractThreadPost(sourceUrl, options = {}) {
           return false;
         }
       });
-      const article = targetLink?.closest('div[role="article"]') || document.querySelector('div[role="article"]') || document.body;
+      const article = resolveThreadsTargetArticle(targetLink, ${JSON.stringify(new URL(sourceUrl).pathname.split("/")[1].replace("@", ""))}, expectedPostPath);
       const visible = (el) => Boolean(el) && (el.offsetWidth || el.offsetHeight || el.getClientRects().length);
       const candidates = Array.from(article.querySelectorAll('button, [role="button"], span, div'))
         .filter(visible)
@@ -16462,7 +17338,26 @@ async function extractThreadPost(sourceUrl, options = {}) {
       }
       return true;
     })()`);
-    await sleep(5000);
+    // Threads often mounts <video> before currentSrc is ready. Poll briefly so we
+    // do not fall back to video_first_frame poster JPEGs as if they were photos.
+    await page.eval(`(async () => {
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+      for (let attempt = 0; attempt < 12; attempt += 1) {
+        const videos = Array.from(document.querySelectorAll("video"));
+        for (const video of videos) {
+          try {
+            video.muted = true;
+            video.playsInline = true;
+            await video.play();
+          } catch {}
+        }
+        const ready = videos.some((video) => Boolean(video.currentSrc || video.src || video.querySelector("source")?.src));
+        if (ready) return { ok: true, attempt, count: videos.length };
+        await sleep(400);
+      }
+      return { ok: false, count: document.querySelectorAll("video").length };
+    })()`);
+    await sleep(800);
     const data = await page.eval(`(() => {
       const expectedHandle = "${expectedHandle}";
       const expectedPostPath = ${JSON.stringify(new URL(sourceUrl).pathname.replace(/\/$/, ""))};
@@ -16470,6 +17365,7 @@ async function extractThreadPost(sourceUrl, options = {}) {
       const looksLikeSocialHandle = (value) => /^@?[a-z0-9](?:[a-z0-9._]{1,28}[a-z0-9_])$/i.test((value || "").trim());
       const classifyThreadSocialLine = ${classifyThreadSocialLine.toString()};
       const linkedThreadMediaAttributionLabels = ${linkedThreadMediaAttributionLabels.toString()};
+      const resolveThreadsTargetArticle = ${resolveThreadsTargetArticle.toString()};
       const targetLink = Array.from(document.querySelectorAll('a[href*="/post/"]')).find((link) => {
         try {
           const path = new URL(link.href, location.href).pathname.replace(/\\\/$/, "");
@@ -16478,7 +17374,7 @@ async function extractThreadPost(sourceUrl, options = {}) {
           return false;
         }
       });
-      const article = targetLink?.closest('div[role="article"]') || document.querySelector('div[role="article"]') || document.body;
+      const article = resolveThreadsTargetArticle(targetLink, expectedHandle, expectedPostPath);
       const rectOk = (el) => {
         const r = el.getBoundingClientRect();
         return r.width >= 120 && r.height >= 120;
@@ -16499,28 +17395,45 @@ async function extractThreadPost(sourceUrl, options = {}) {
         const r = el.getBoundingClientRect();
         const ownerArticle = el.closest('div[role="article"]');
         const closestPostLink = el.closest('a[href*="/post/"]');
-        let matchesTargetPost = true;
-        if (closestPostLink) {
+        const containedByTarget = article !== document.body && article.contains(el);
+        let matchesTargetPost = containedByTarget || !closestPostLink;
+        if (closestPostLink && !containedByTarget) {
           try {
             const path = new URL(closestPostLink.href, location.href).pathname.replace(/\\\/$/, "");
             matchesTargetPost = path === expectedPostPath || path.startsWith(expectedPostPath + "/");
+            // Source-credit overlays link to another post while the media still belongs to the root card.
+            if (!matchesTargetPost && handleRect && r.top > handleRect.bottom && (!Number.isFinite(rootBoundaryTop) || r.top < rootBoundaryTop)) {
+              if (!ownerArticle || (targetLink && ownerArticle.contains(targetLink)) || article.contains(el)) {
+                matchesTargetPost = true;
+              }
+            }
           } catch {
             matchesTargetPost = false;
           }
         }
+        const belowHandle = !handleRect || r.top > handleRect.bottom;
+        const beforeRootBoundary = !Number.isFinite(rootBoundaryTop) || r.top < rootBoundaryTop;
+        const rootOwned = containedByTarget
+          || (
+            article === document.body
+            && belowHandle
+            && beforeRootBoundary
+            && (!ownerArticle || (targetLink && ownerArticle.contains(targetLink)))
+          );
         return {
           kind,
           top: r.top,
           left: r.left,
           width: r.width,
           height: r.height,
-          src: kind === "video" ? (el.currentSrc || el.src) : (el.currentSrc || el.src),
-          rootOwned: article === document.body
-            ? !ownerArticle && Number.isFinite(rootBoundaryTop) && r.top < rootBoundaryTop
-            : ownerArticle === article,
+          src: kind === "video"
+            ? (el.currentSrc || el.src || (el.querySelector && el.querySelector("source")?.src) || "")
+            : (el.currentSrc || el.src),
+          poster: kind === "video" ? (el.getAttribute("poster") || el.poster || "") : "",
+          rootOwned,
           matchesTargetPost,
-          belowHandle: !handleRect || r.top > handleRect.bottom,
-          beforeRootBoundary: !Number.isFinite(rootBoundaryTop) || r.top < rootBoundaryTop,
+          belowHandle,
+          beforeRootBoundary,
         };
       };
       const rawMedia = [
@@ -16680,10 +17593,50 @@ async function extractThreadPost(sourceUrl, options = {}) {
       };
     })()`);
     const videoUrls = unique(data.videos || []);
-    const imageUrls = unique(data.images || []);
-    const mediaUrls = unique((data.selectedMedia || []).map((item) => item.src)).slice(0, MAX_MEDIA);
+    const posterUrls = unique((data.selectedMedia || []).map((item) => item.poster).filter(Boolean));
+    const rawImageUrls = unique([...(data.images || []), ...posterUrls]);
+    // Drop video first-frame posters from the still-image list. If a real video URL
+    // exists they are duplicates; if it does not, posting the poster alone is wrong.
+    const imageUrls = rawImageUrls.filter((url) => !isThreadsVideoPosterUrl(url));
+    const droppedPosterCount = rawImageUrls.length - imageUrls.length;
+    const selectedSrcs = unique((data.selectedMedia || []).map((item) => item.src))
+      .filter((url) => !isThreadsVideoPosterUrl(url) || isVideoMediaUrl(url));
+    const mediaUrls = unique([...videoUrls, ...selectedSrcs.filter((url) => !videoUrls.includes(url))])
+      .slice(0, MAX_MEDIA);
+    if (droppedPosterCount > 0) {
+      logEvent("threads_video_poster_images_dropped", {
+        sourceUrl,
+        droppedPosterCount,
+        videoCount: videoUrls.length,
+        imageCount: imageUrls.length,
+        mediaCount: mediaUrls.length,
+      });
+    }
+    if (droppedPosterCount > 0 && videoUrls.length === 0) {
+      logEvent("threads_video_src_missing_after_poster_drop", {
+        sourceUrl,
+        droppedPosterCount,
+        diagnostics: data.diagnostics || null,
+      });
+    }
     const actionCounts = Array.isArray(data.actionCounts) ? data.actionCounts : [];
     const detailLikeCount = parseCompactCount(actionCounts[0]);
+    let detailViewCount = null;
+    for (const raw of actionCounts.slice(1)) {
+      const labeled = String(raw || "").match(/(\d+(?:\.\d+)?)\s*([천만kKmM]?)\s*(?:회|조회|views?)/i);
+      if (labeled) {
+        detailViewCount = parseCompactCount(`${labeled[1]}${labeled[2] || ""}`);
+        if (Number.isFinite(detailViewCount)) break;
+      }
+    }
+    if (!Number.isFinite(detailViewCount)) {
+      for (const label of [...(data.timestampLabels || []), ...(data.topicLabels || [])]) {
+        const labeled = String(label || "").match(/(\d+(?:\.\d+)?)\s*([천만kKmM]?)\s*(?:회|조회|views?)/i);
+        if (!labeled) continue;
+        detailViewCount = parseCompactCount(`${labeled[1]}${labeled[2] || ""}`);
+        if (Number.isFinite(detailViewCount)) break;
+      }
+    }
     const extraLinks = unique(data.links || []);
     let text = cleanThreadText(selectThreadSourceText({
       domText: data.text,
@@ -16714,10 +17667,12 @@ async function extractThreadPost(sourceUrl, options = {}) {
       imageMediaUrls: imageUrls.slice(0, MAX_MEDIA),
       videoMediaUrls: videoUrls.slice(0, MAX_MEDIA),
       likeCount: Number.isFinite(detailLikeCount) ? detailLikeCount : null,
+      viewCount: Number.isFinite(detailViewCount) ? detailViewCount : null,
       diagnostics: {
         ...(data.diagnostics || {}),
         translation,
         actionCounts,
+        viewCount: Number.isFinite(detailViewCount) ? detailViewCount : null,
         videoCount: videoUrls.length,
         imageCount: imageUrls.length,
           selectedMediaCount: mediaUrls.length,
@@ -16729,14 +17684,50 @@ async function extractThreadPost(sourceUrl, options = {}) {
   }
 }
 
+function discoveryAnimalSearchSeedUrls() {
+  const queries = [
+    "강아지",
+    "고양이",
+    "귀여운 강아지",
+    "멍멍이",
+    "고양이 귀여",
+    "댕댕이",
+    "냥이",
+    "귀여운 고양이",
+    "강아지 ㅋㅋ",
+    "고양이 ㅋㅋ",
+    "강아지 귀여",
+    "고양이 졸귀",
+    "댕댕이 ㅋㅋ",
+    "냥이 ㅋㅋ",
+    "puppy",
+    "kitten",
+  ];
+  return queries.map((query) => (
+    `https://www.threads.com/search?q=${encodeURIComponent(query)}&serp_type=default`
+  ));
+}
+
 async function discoverThreadsTimeline(options = {}) {
   const minLikes = Number(options.minLikes || DISCOVERY_MIN_LIKES);
   const maxScrolls = Number(options.maxScrolls || DISCOVERY_MAX_SCROLLS);
-  const page = await newPage("https://www.threads.com/");
-  try {
-    await sleep(9000);
-    const candidatesByUrl = new Map();
-    for (let scroll = 0; scroll <= maxScrolls; scroll += 1) {
+  const openPage = options.openPage || ((url) => newPage(url));
+  const seedUrls = Array.isArray(options.seedUrls) && options.seedUrls.length
+    ? options.seedUrls
+    : ["https://www.threads.com/", ...discoveryAnimalSearchSeedUrls()];
+  // Prefer enough depth per seed; maxScrolls is a total budget across seeds.
+  const scrollsPerSeed = Math.max(
+    8,
+    Number(options.scrollsPerSeed) || Math.ceil((maxScrolls + 1) / Math.max(1, seedUrls.length)),
+  );
+  const candidatesByUrl = new Map();
+  for (const seedUrl of seedUrls) {
+    if (candidatesByUrl.size >= Number(options.maxCandidates || DISCOVERY_AUTO_BATCH_LIMIT)) break;
+    const page = await openPage(seedUrl);
+    try {
+      await sleep(seedUrl.includes("/search?") ? 5000 : 9000);
+      for (let scroll = 0; scroll < scrollsPerSeed; scroll += 1) {
+        if (candidatesByUrl.size >= Number(options.maxCandidates || DISCOVERY_AUTO_BATCH_LIMIT)) break;
       const batch = await page.eval(`((minLikes) => {
         const parseCompactCount = (value) => {
           const text = String(value || "").trim().replace(/,/g, "");
@@ -16777,6 +17768,11 @@ async function discoverThreadsTimeline(options = {}) {
             const src = el.currentSrc || el.src || "";
             return rect.width >= 100 && rect.height >= 100 && /cdninstagram|fbcdn/.test(src);
           }).length;
+        const videoCountOf = (node) => Array.from(node.querySelectorAll("video"))
+          .filter((el) => {
+            const rect = el.getBoundingClientRect();
+            return rect.width >= 80 && rect.height >= 80;
+          }).length;
         const postLinks = Array.from(document.querySelectorAll('a[href*="/post/"]'))
           .map((link) => ({ link, canonicalUrl: canonical(link.href) }))
           .filter((item) => item.canonicalUrl);
@@ -16799,19 +17795,48 @@ async function discoverThreadsTimeline(options = {}) {
               .filter(Boolean)).size;
             if (postLinkCount !== 1) continue;
             const mediaCount = mediaCountOf(node);
+            const videoCount = videoCountOf(node);
             const buttons = Array.from(node.querySelectorAll('button, [role="button"]'))
               .map((button) => linesOf(button).join(""))
               .filter(Boolean);
             const likeCount = parseCompactCount(buttons[0]);
+            let viewCount = null;
+            for (const line of lines) {
+              const viewMatch = String(line || "").match(/^(\\d+(?:\\.\\d+)?)\\s*([천만kKmM]?)\\s*(?:회|조회|views?)$/i)
+                || String(line || "").match(/^(?:조회|views?)\\s*(\\d+(?:\\.\\d+)?)\\s*([천만kKmM]?)$/i);
+              if (!viewMatch) continue;
+              const parsedView = parseCompactCount((viewMatch[1] || "") + (viewMatch[2] || ""));
+              if (Number.isFinite(parsedView)) {
+                viewCount = parsedView;
+                break;
+              }
+            }
+            for (const label of Array.from(node.querySelectorAll("[aria-label]")).map((el) => el.getAttribute("aria-label") || "")) {
+              const viewMatch = String(label).match(/(\\d+(?:\\.\\d+)?)\\s*([천만kKmM]?)\\s*(?:회|조회|views?)/i);
+              if (!viewMatch) continue;
+              const parsedView = parseCompactCount((viewMatch[1] || "") + (viewMatch[2] || ""));
+              if (Number.isFinite(parsedView)) {
+                viewCount = parsedView;
+                break;
+              }
+            }
             best = {
               lines,
               mediaCount,
+              videoCount,
               likeCount,
+              viewCount,
               buttonTexts: buttons,
             };
-            if (mediaCount > 0 && likeCount !== null) break;
+            if (videoCount > 0) break;
           }
-          if (!best || best.mediaCount <= 0 || !Number.isFinite(best.likeCount) || best.likeCount < minLikes) continue;
+          if (!best || best.videoCount <= 0) continue;
+          const engagement = Math.max(
+            Number.isFinite(best.likeCount) ? best.likeCount : 0,
+            Number.isFinite(best.viewCount) ? best.viewCount : 0,
+          );
+          if (engagement < ${Number(options.minViews || DISCOVERY_MIN_VIEWS)}) continue;
+          if (!${JSON.stringify(Boolean(options.videoOnly))} && (!Number.isFinite(best.likeCount) || best.likeCount < minLikes)) continue;
           const stopIndex = best.lines.findIndex((line) => parseCompactCount(line) !== null && best.buttonTexts.includes(line));
           const textLines = best.lines
             .slice(0, stopIndex >= 0 ? stopIndex : Math.min(best.lines.length, 8))
@@ -16820,32 +17845,48 @@ async function discoverThreadsTimeline(options = {}) {
             .filter((line) => !looksLikeLocationLine(line))
             .filter((line) => classifyThreadSocialLine(line, author) === "content")
             .slice(0, 5);
+          const textPreview = textLines.join("\\n").slice(0, 240);
+          if (!/[가-힣]{2,}/.test(textPreview)) continue;
           out.push({
             canonicalUrl: item.canonicalUrl,
             author,
-            textPreview: textLines.join("\\n").slice(0, 240),
-            likeCount: best.likeCount,
+            textPreview,
+            likeCount: Number.isFinite(best.likeCount) ? best.likeCount : 0,
+            viewCount: Number.isFinite(best.viewCount) ? best.viewCount : 0,
             mediaCount: Math.min(best.mediaCount, 4),
+            videoCount: best.videoCount,
           });
         }
         return out;
       })(${minLikes})`);
       for (const item of batch) {
+        if (!isCuteAnimalDiscoveryCaption(item.textPreview)) continue;
         const current = candidatesByUrl.get(item.canonicalUrl);
-        if (!current || item.likeCount > current.likeCount) {
+        const nextEngagement = discoveryEngagementCount(item);
+        const currentEngagement = current ? discoveryEngagementCount(current) : -1;
+        if (!current || nextEngagement > currentEngagement) {
           candidatesByUrl.set(item.canonicalUrl, item);
         }
       }
+      if (candidatesByUrl.size >= Number(options.maxCandidates || DISCOVERY_AUTO_BATCH_LIMIT)) break;
       await page.eval(`window.scrollBy(0, Math.max(900, window.innerHeight * 1.5)); true`);
       await sleep(1800);
+      }
+    } finally {
+      await page.close();
     }
-    const candidates = Array.from(candidatesByUrl.values())
-      .sort((a, b) => b.likeCount - a.likeCount);
-    logEvent("discovery_scan_done", { found: candidates.length, minLikes, maxScrolls });
-    return candidates;
-  } finally {
-    await page.close();
   }
+  const candidates = Array.from(candidatesByUrl.values())
+    .sort((a, b) => Number(b.videoCount || 0) - Number(a.videoCount || 0))
+    .slice(0, Number(options.maxCandidates || DISCOVERY_AUTO_BATCH_LIMIT));
+  logEvent("discovery_scan_done", {
+    found: candidates.length,
+    minLikes,
+    maxScrolls,
+    seedCount: seedUrls.length,
+    scrollsPerSeed,
+  });
+  return candidates;
 }
 
 async function processDueDiscoveryPost(options = {}) {
@@ -16900,41 +17941,85 @@ async function runDiscoveryScan(options = {}) {
   if (discoveryScanBusy) return { ok: true, skipped: true, reason: "scan_busy" };
   discoveryScanBusy = true;
   try {
+    await primeDiscoveryScanHeadlessSession();
+    const openPage = (url) => newDiscoveryScanPage(url);
+    const saveLimit = Number(options.maxCandidates || DISCOVERY_AUTO_BATCH_LIMIT);
     const candidates = await discoverThreadsTimeline({
-      minLikes: options.minLikes || DISCOVERY_MIN_LIKES,
+      minLikes: 0,
+      minViews: options.minViews || DISCOVERY_MIN_VIEWS,
+      videoOnly: true,
+      maxCandidates: Math.max(saveLimit * 2, saveLimit),
       maxScrolls: options.maxScrolls || DISCOVERY_MAX_SCROLLS,
+      openPage,
     });
     const validated = [];
     const rejected = [];
     for (const candidate of candidates) {
       try {
-        const post = await extractThreadPost(candidate.canonicalUrl, { allowEmptyText: true });
-        if (post.mediaUrls.length <= 0) {
-          rejected.push({ canonicalUrl: candidate.canonicalUrl, reason: "no_media_after_detail_extract" });
+        if (!isCuteAnimalDiscoveryCaption(candidate.textPreview)) {
+          rejected.push({ canonicalUrl: candidate.canonicalUrl, reason: "not_cute_animal" });
+          continue;
+        }
+        const post = await extractThreadPost(candidate.canonicalUrl, { allowEmptyText: true, openPage });
+        const videoUrls = Array.isArray(post.videoMediaUrls) ? post.videoMediaUrls : [];
+        if (videoUrls.length <= 0) {
+          rejected.push({ canonicalUrl: candidate.canonicalUrl, reason: "no_video_after_detail_extract" });
           continue;
         }
         const assessment = assessDiscoveryCandidate(candidate, post);
         const style = assessTerafabxDiscoveryStyle(candidate, post);
-        const likeCount = Number.isFinite(post.likeCount) ? post.likeCount : candidate.likeCount;
-        if (!Number.isFinite(likeCount) || likeCount < (options.minLikes || DISCOVERY_MIN_LIKES)) {
-          rejected.push({ canonicalUrl: candidate.canonicalUrl, reason: "detail_like_count_below_threshold", likeCount });
-          continue;
-        }
+        const { likeCount, viewCount } = mergeDiscoveryEngagement(candidate, post);
         const textPreview = cleanDiscoveryPreviewText(post.text || candidate.textPreview || "");
         if (!textPreview) {
           rejected.push({ canonicalUrl: candidate.canonicalUrl, reason: "no_valid_text_after_detail_extract" });
           continue;
         }
+        if (!isCuteAnimalDiscoveryCaption(textPreview) || style.animalCute !== true) {
+          rejected.push({ canonicalUrl: candidate.canonicalUrl, reason: "not_cute_animal" });
+          continue;
+        }
+        if (!style.engagementOk) {
+          rejected.push({
+            canonicalUrl: candidate.canonicalUrl,
+            reason: "below_view_threshold",
+            engagement: style.engagement,
+            likeCount,
+            viewCount,
+          });
+          continue;
+        }
+        const styleSignals = style.signals || {};
+        const hasStyleSignal = Boolean(styleSignals.curiosity || styleSignals.entertainment || styleSignals.reaction || styleSignals.visualHook);
+        if (style.personalCommentary || !style.hasKorean || style.excluded || style.longInfoPost || (!style.pass && !hasStyleSignal)) {
+          rejected.push({
+            canonicalUrl: candidate.canonicalUrl,
+            reason: style.personalCommentary ? "personal_commentary" : "style_not_similar_to_posted",
+            styleScore: style.score,
+            styleReasons: style.reasons,
+          });
+          continue;
+        }
+        if (await findDuplicateDiscoveryPostText(textPreview, candidate.canonicalUrl)) {
+          rejected.push({ canonicalUrl: candidate.canonicalUrl, reason: "duplicate_posted_text" });
+          continue;
+        }
+        const posterUrl = post.imageMediaUrls?.[0] || "";
         validated.push({
           ...candidate,
-          likeCount,
+          likeCount: Number.isFinite(likeCount) ? likeCount : 0,
+          viewCount: Number.isFinite(viewCount) ? viewCount : 0,
           textPreview: textPreview.slice(0, 240),
-          mediaPreviewUrl: post.mediaUrls[0] || post.imageMediaUrls?.[0] || "",
-          mediaCount: post.mediaUrls.length,
-          viralScore: Math.max(assessment.viralScore, style.score),
+          mediaPreviewUrl: videoUrls[0],
+          mediaCount: videoUrls.length,
+          viralScore: style.score,
           criteria: JSON.stringify({
-            minLikes: true,
+            hasVideo: true,
+            videoCount: videoUrls.length,
+            mediaKind: "video",
+            mediaThumbnailUrl: posterUrl,
             hasMedia: true,
+            viewCount: Number.isFinite(viewCount) ? viewCount : 0,
+            engagement: style.engagement,
             shortHook: assessment.isShortHook,
             strongMedia: assessment.hasStrongMedia,
             controversy: assessment.hasControversy,
@@ -16943,11 +18028,22 @@ async function runDiscoveryScan(options = {}) {
               pass: style.pass,
               score: style.score,
               minScore: DISCOVERY_AUTO_STYLE_MIN_SCORE,
+              hasKorean: style.hasKorean,
+              excluded: style.excluded,
+              personalCommentary: style.personalCommentary,
+              animalCute: style.animalCute,
+              engagementOk: style.engagementOk,
+              longInfoPost: style.longInfoPost,
+              hasStrongMedia: style.hasStrongMedia,
               reasons: style.reasons,
               signals: style.signals,
+              likeCount: style.likeCount,
+              viewCount: style.viewCount,
+              engagement: style.engagement,
             },
           }),
         });
+        if (validated.length >= saveLimit) break;
       } catch (error) {
         rejected.push({ canonicalUrl: candidate.canonicalUrl, reason: error.message });
       }
@@ -16956,12 +18052,15 @@ async function runDiscoveryScan(options = {}) {
     const autoSchedule = await queueAutoDiscoveredStyleCandidates(validated, {
       source: options.manual ? "manual_scan" : "timer_scan",
     });
+    const batch = options.manual ? null : noteAutoDiscoveryBatchSaved(saved.inserted);
     logEvent("discovery_saved", {
       found: candidates.length,
       validated: validated.length,
       rejected: rejected.length,
       autoStylePassed: validated.filter((item) => parseDiscoveryCriteria(item.criteria)?.terafabxStyle?.pass === true).length,
       autoScheduleQueued: autoSchedule.queued.length,
+      autoDiscoveryBatchSaved: batch?.saved ?? null,
+      autoDiscoveryStopped: batch?.stop === true,
       ...saved,
     });
     return { ok: true, found: candidates.length, validated: validated.length, rejected, saved, autoSchedule, candidates: validated };
@@ -17220,12 +18319,27 @@ function cleanupDiscoveryMediaSnapshot(canonicalUrl, options = {}) {
   }
 }
 
-function cleanupExpiredDiscoveryMediaSnapshots(options = {}) {
+async function cleanupExpiredDiscoveryMediaSnapshots(options = {}) {
   const root = path.resolve(options.root || DISCOVERY_MEDIA_SNAPSHOT_DIR);
   const now = Number.isFinite(Number(options.now)) ? Number(options.now) : Date.now();
   const ttlMs = Math.max(0, Number(options.ttlMs ?? DISCOVERY_MEDIA_SNAPSHOT_TTL_MS));
-  const result = { checked: 0, removed: 0, errors: [] };
+  const result = { checked: 0, removed: 0, skippedActive: 0, errors: [] };
   if (!fs.existsSync(root)) return result;
+  let activeSnapshotUrls = options.activeSnapshotUrls;
+  if (options.statusCheck !== false && !activeSnapshotUrls) {
+    try {
+      const db = await getDiscoveryDb();
+      const rows = await db.prepare(`
+        SELECT canonical_url AS canonicalUrl, status
+        FROM thread_discoveries
+        WHERE status IN (${[...DISCOVERY_MEDIA_SNAPSHOT_KEEP_STATUSES].map(() => "?").join(", ")})
+      `).all([...DISCOVERY_MEDIA_SNAPSHOT_KEEP_STATUSES]);
+      activeSnapshotUrls = new Set((rows || []).map((row) => row.canonicalUrl));
+    } catch (error) {
+      result.errors.push({ dir: "*", error: error.message });
+      activeSnapshotUrls = new Set();
+    }
+  }
   for (const name of fs.readdirSync(root)) {
     const dir = path.join(root, name);
     try {
@@ -17233,12 +18347,18 @@ function cleanupExpiredDiscoveryMediaSnapshots(options = {}) {
       result.checked += 1;
       const manifestPath = path.join(dir, "manifest.json");
       let mtime = fs.statSync(dir).mtimeMs;
+      let canonicalUrl = "";
       if (fs.existsSync(manifestPath)) {
         try {
           const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+          canonicalUrl = String(manifest.canonicalUrl || "").trim();
           const savedAt = Date.parse(String(manifest.savedAt || ""));
           if (Number.isFinite(savedAt)) mtime = savedAt;
         } catch {}
+      }
+      if (activeSnapshotUrls && canonicalUrl && activeSnapshotUrls.has(canonicalUrl)) {
+        result.skippedActive += 1;
+        continue;
       }
       if (now - mtime < ttlMs) continue;
       fs.rmSync(dir, { recursive: true, force: true });
@@ -17247,7 +18367,7 @@ function cleanupExpiredDiscoveryMediaSnapshots(options = {}) {
       result.errors.push({ dir: name, error: error.message });
     }
   }
-  if (result.removed || result.errors.length) {
+  if (result.removed || result.errors.length || result.skippedActive) {
     logEvent("discovery_media_snapshot_ttl_cleanup", result);
   }
   return result;
@@ -17275,32 +18395,57 @@ async function persistDiscoveryMediaSnapshotCriteria(canonicalUrl, snapshot) {
   `).run(JSON.stringify(criteria), canonicalUrl);
 }
 
+function youtubeDlArgs(canonicalUrl, outputTemplate, options = {}) {
+  const args = [
+    "--no-playlist",
+    "--merge-output-format", "mp4",
+    "--remux-video", "mp4",
+    "--max-filesize", "500M",
+    // android/ios/web clients avoid SABR-only 403s on some Shorts/watch URLs
+    "--extractor-args", "youtube:player_client=android,ios,web",
+    "-f", "bv*[vcodec^=avc1][ext=mp4][height<=720]+ba[ext=m4a]/b[vcodec^=avc1][ext=mp4][height<=720]/18/b",
+    "-o", outputTemplate,
+    "--print", "after_move:filepath",
+    canonicalUrl,
+  ];
+  const ffmpegLocation = String(options.ffmpegLocation || "").trim();
+  if (ffmpegLocation && ffmpegLocation !== "ffmpeg") {
+    args.unshift("--ffmpeg-location", ffmpegLocation);
+  }
+  return args;
+}
+
 async function downloadYouTubeVideo(url) {
   const canonicalUrl = validateYouTubeUrl(url);
   const dir = createMediaTempDir("youtube-x-upload-");
   const outputTemplate = path.join(dir, "video.%(ext)s");
+  const childEnv = {
+    ...process.env,
+    PATH: ensureNodeExecutablePath(process.env.PATH, process.execPath),
+  };
+  const ytDlp = resolveHomebrewTool("yt-dlp", { pathEnv: childEnv.PATH });
+  const ffmpeg = resolveHomebrewTool("ffmpeg", { pathEnv: childEnv.PATH });
   try {
-    const result = await execFileOutput("yt-dlp", [
-      "--no-playlist",
-      "--merge-output-format", "mp4",
-      "--remux-video", "mp4",
-      "--max-filesize", "500M",
-      "-f", "bv*[vcodec^=avc1][ext=mp4][height<=720]+ba[ext=m4a]/b[vcodec^=avc1][ext=mp4][height<=720]/18",
-      "-o", outputTemplate,
-      "--print", "after_move:filepath",
-      canonicalUrl,
-    ], { timeout: 10 * 60 * 1000, maxBuffer: 4 * 1024 * 1024 });
+    logEvent("youtube_video_download_start", { canonicalUrl, ytDlp, ffmpeg });
+    const result = await execFileOutput(
+      ytDlp,
+      youtubeDlArgs(canonicalUrl, outputTemplate, { ffmpegLocation: ffmpeg }),
+      { timeout: 10 * 60 * 1000, maxBuffer: 4 * 1024 * 1024, env: childEnv },
+    );
+    if (result.error || (result.code && result.code !== 0)) {
+      throw new Error(`yt-dlp 실행 실패: ${youtubeDownloadFailureDetail(result) || ytDlp}`);
+    }
     const printedPath = String(result.stdout || "").trim().split(/\r?\n/).filter(Boolean).at(-1);
     const candidates = [
       printedPath,
       ...fs.readdirSync(dir).filter((name) => name.endsWith(".mp4")).map((name) => path.join(dir, name)),
     ].filter((file, index, values) => file && values.indexOf(file) === index && fs.existsSync(file));
     const file = candidates[0];
-    if (!file) throw new Error(`yt-dlp가 MP4 영상 파일을 만들지 못했습니다: ${String(result.stderr || "").slice(-500)}`);
+    if (!file) throw new Error(`yt-dlp가 MP4 영상 파일을 만들지 못했습니다: ${youtubeDownloadFailureDetail(result)}`);
     const size = fs.statSync(file).size;
     if (size <= 0) throw new Error("다운로드한 YouTube 영상 파일이 비어 있습니다.");
     if (size > 512 * 1024 * 1024) throw new Error("YouTube 영상이 X 업로드 제한 512MB를 초과합니다.");
-    logEvent("youtube_video_downloaded", { canonicalUrl, file: path.basename(file), size });
+    logEvent("youtube_video_downloaded", { canonicalUrl, file: path.basename(file), size, ytDlp });
     return { dir, files: [file], size };
   } catch (error) {
     cleanupMediaTempDir(dir);
@@ -17476,54 +18621,101 @@ async function verifyComposerText(page, expectedText, stage = "compose", eventLo
   return { ok: true, actual };
 }
 
-async function insertXComposerText(page, text, stage = "compose") {
-  const focused = await page.eval(`(() => {
+async function focusXComposerEditor(page, { clear = false } = {}) {
+  const focused = await page.eval(`((shouldClear) => {
     const visible = (el) => Boolean(el) && (el.offsetWidth || el.offsetHeight || el.getClientRects().length);
     const submitButtons = Array.from(document.querySelectorAll('[data-testid="tweetButton"], [data-testid="tweetButtonInline"]')).filter(visible);
     const activeSubmit = submitButtons[0] || null;
     const activeScope = activeSubmit?.closest('[role="dialog"]') || activeSubmit?.parentElement?.closest('[role="dialog"]') || document;
-    const boxes = Array.from(activeScope.querySelectorAll('[data-testid="tweetTextarea_0"]'));
-    const box = boxes.find(visible) || boxes[0] || null;
+    const boxes = Array.from(activeScope.querySelectorAll('[data-testid="tweetTextarea_0"], [role="textbox"][contenteditable="true"]'))
+      .map((box) => {
+        const editable = box.getAttribute("contenteditable") === "true"
+          ? box
+          : (box.querySelector('[contenteditable="true"]') || box);
+        return editable;
+      })
+      .filter((el) => el && visible(el));
+    const box = boxes[0] || null;
     if (!box) return { found: false, hasText: false };
     box.click();
     box.focus();
-    return { found: true, hasText: Boolean((box.innerText || box.textContent || "").trim()) };
-  })()`);
+    const selection = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(box);
+    if (shouldClear) {
+      selection.removeAllRanges();
+      selection.addRange(range);
+    } else {
+      range.collapse(false);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    }
+    return {
+      found: true,
+      hasText: Boolean((box.innerText || box.textContent || "").trim()),
+    };
+  })(${clear ? "true" : "false"})`);
+  return focused || { found: false, hasText: false };
+}
+
+async function typeXComposerTextByCharEvents(page, text) {
+  // Fresh X ProseMirror/Lexical editors can swallow the first trusted char.
+  // Prime with a space (trimmed by X) so the first real syllable is kept.
+  await page.send("Input.dispatchKeyEvent", { type: "char", text: " ", unmodifiedText: " " }, 3000);
+  await sleep(120);
+  for (const character of Array.from(String(text || ""))) {
+    if (character === "\n") {
+      await page.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter" }, 3000);
+      await page.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter" }, 3000);
+    } else {
+      await page.send("Input.dispatchKeyEvent", {
+        type: "char",
+        text: character,
+        unmodifiedText: character,
+      }, 3000);
+    }
+    await sleep(12);
+  }
+}
+
+async function insertXComposerText(page, text, stage = "compose") {
+  const value = String(text || "");
+  let focused = await focusXComposerEditor(page);
   if (!focused?.found) throw new Error(`X 작성창을 찾지 못했습니다(${stage}).`);
   if (focused.hasText) {
-    await page.send("Input.dispatchKeyEvent", {
-      type: "rawKeyDown", key: "a", code: "KeyA", modifiers: 4, commands: ["selectAll"],
-    });
-    await page.send("Input.dispatchKeyEvent", { type: "keyUp", key: "a", code: "KeyA", modifiers: 4 });
+    await focusXComposerEditor(page, { clear: true });
     await page.send("Input.dispatchKeyEvent", {
       type: "rawKeyDown", key: "Backspace", code: "Backspace", commands: ["deleteBackward"],
     });
     await page.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Backspace", code: "Backspace" });
-    await sleep(200);
-    await page.eval(`(() => {
-      const visible = (el) => Boolean(el) && (el.offsetWidth || el.offsetHeight || el.getClientRects().length);
-      const boxes = Array.from(document.querySelectorAll('[data-testid="tweetTextarea_0"]')).filter(visible);
-      const box = boxes.find((el) => !(el.innerText || el.textContent || "").trim()) || boxes[0] || null;
-      if (!box) return false;
-      box.click();
-      box.focus();
-      return true;
-    })()`);
+    // Editor may remount after clear; wait and place a collapsed caret again.
+    await sleep(500);
+    focused = await focusXComposerEditor(page);
+    if (!focused?.found) throw new Error(`X 작성창 재포커스에 실패했습니다(${stage}).`);
+  } else {
+    await sleep(150);
+    focused = await focusXComposerEditor(page);
+    if (!focused?.found) throw new Error(`X 작성창 재포커스에 실패했습니다(${stage}).`);
   }
-  await page.send("Input.insertText", { text });
+
+  await page.send("Input.insertText", { text: value });
   await sleep(1000);
   try {
-    return await verifyComposerText(page, text, `${stage}_cdp`);
+    return await verifyComposerText(page, value, `${stage}_cdp`);
   } catch (error) {
-    logEvent("x_compose_text_insert_fallback", { stage, reason: error.message });
+    logEvent("x_compose_text_insert_fallback", { stage, reason: error.message, method: "execCommand" });
   }
+
+  await focusXComposerEditor(page, { clear: true });
   await page.eval(`((text) => {
     const visible = (el) => Boolean(el) && (el.offsetWidth || el.offsetHeight || el.getClientRects().length);
     const submitButtons = Array.from(document.querySelectorAll('[data-testid="tweetButton"], [data-testid="tweetButtonInline"]')).filter(visible);
     const activeSubmit = submitButtons[0] || null;
     const activeScope = activeSubmit?.closest('[role="dialog"]') || activeSubmit?.parentElement?.closest('[role="dialog"]') || document;
-    const boxes = Array.from(activeScope.querySelectorAll('[data-testid="tweetTextarea_0"]'));
-    const box = boxes.find(visible) || boxes[0] || null;
+    const boxes = Array.from(activeScope.querySelectorAll('[data-testid="tweetTextarea_0"], [role="textbox"][contenteditable="true"]'))
+      .map((box) => (box.getAttribute("contenteditable") === "true" ? box : (box.querySelector('[contenteditable="true"]') || box)))
+      .filter((el) => el && visible(el));
+    const box = boxes[0] || null;
     if (!box) return false;
     box.click();
     box.focus();
@@ -17537,9 +18729,24 @@ async function insertXComposerText(page, text, stage = "compose") {
     box.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
     box.dispatchEvent(new Event("change", { bubbles: true }));
     return true;
-  })(${JSON.stringify(text)})`);
+  })(${JSON.stringify(value)})`);
   await sleep(1000);
-  return verifyComposerText(page, text, `${stage}_fallback`);
+  try {
+    return await verifyComposerText(page, value, `${stage}_fallback`);
+  } catch (error) {
+    logEvent("x_compose_text_insert_fallback", { stage, reason: error.message, method: "char_events" });
+  }
+
+  await focusXComposerEditor(page, { clear: true });
+  await page.send("Input.dispatchKeyEvent", {
+    type: "rawKeyDown", key: "Backspace", code: "Backspace", commands: ["deleteBackward"],
+  });
+  await page.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Backspace", code: "Backspace" });
+  await sleep(400);
+  await focusXComposerEditor(page);
+  await typeXComposerTextByCharEvents(page, value);
+  await sleep(800);
+  return verifyComposerText(page, value, `${stage}_chars`);
 }
 
 async function ensureComposerText(page, expectedText, stage = "compose", eventLogger = logEvent) {
@@ -17561,6 +18768,17 @@ function xScheduledTitleFingerprint(value) {
     .normalize("NFKC")
     .replace(/[^\p{L}\p{N}]+/gu, "")
     .toLowerCase();
+}
+
+function xScheduledCheckboxMatches(text, needles = [], titleNeedle = "") {
+  const normalized = normalizeXScheduledText(text);
+  if (!(needles || []).every((needle) => normalized.includes(normalizeXScheduledText(needle)))) return false;
+  const title = normalizeXScheduledText(titleNeedle);
+  if (!title) return true;
+  if (normalized.includes(title)) return true;
+  const titleFp = xScheduledTitleFingerprint(title);
+  const textFp = xScheduledTitleFingerprint(normalized);
+  return titleFp.length >= 2 && textFp.includes(titleFp);
 }
 
 function xScheduledTimeNeedles(value) {
@@ -17705,7 +18923,12 @@ async function deleteXScheduledEntry(page, scheduledAt, expected = null) {
   const needles = xScheduledTimeNeedles(scheduledAt);
   const beforeEntries = await readXScheduledEntries(page);
   const beforeEntry = findXScheduledEntry(beforeEntries, scheduledAt, expected);
-  if (!beforeEntry || (expected && assessXScheduledEntry(expected, beforeEntry).status !== "ok")) {
+  const beforeAssessment = expected && beforeEntry ? assessXScheduledEntry(expected, beforeEntry) : null;
+  const uniqueTimeSlot = (beforeEntries || []).filter((entry) => {
+    const text = normalizeXScheduledText(entry.text || entry.rawText || "");
+    return needles.length > 0 && needles.every((needle) => text.includes(needle));
+  }).length === 1;
+  if (!beforeEntry || (expected && beforeAssessment?.status !== "ok" && !(expected.matchUniqueTimeSlot && uniqueTimeSlot))) {
     throw new Error(`X 예약 목록에서 취소할 항목을 찾지 못했습니다: ${needles.join(" / ")}`);
   }
   const selected = await page.eval(`((needles) => {
@@ -17719,9 +18942,13 @@ async function deleteXScheduledEntry(page, scheduledAt, expected = null) {
   })(${JSON.stringify(needles)})`);
   if (!selected?.ok) throw new Error("X 예약 목록의 수정 버튼을 찾지 못했습니다.");
   await sleep(700);
-  const expectedTitleNeedle = normalizeXScheduledText(expected?.text || expected?.textPreview || "").slice(0, 80);
-  const checked = await page.eval(`((needles, expectedTitleNeedle) => {
+  const expectedTitleNeedle = beforeAssessment?.status === "ok"
+    ? normalizeXScheduledText(expected?.text || expected?.textPreview || "").slice(0, 80)
+    : "";
+  const expectedTitleFingerprint = xScheduledTitleFingerprint(expectedTitleNeedle);
+  const checked = await page.eval(`((needles, expectedTitleNeedle, expectedTitleFingerprint) => {
     const normalize = (value) => String(value || "").replace(/\\s+/g, " ").trim();
+    const fingerprint = (value) => normalize(value).normalize("NFKC").replace(/[^\\p{L}\\p{N}]+/gu, "").toLowerCase();
     const normalizedNeedles = needles.map(normalize);
     const normalizedTitleNeedle = normalize(expectedTitleNeedle);
     const boxes = Array.from(document.querySelectorAll('input[type="checkbox"], [role="checkbox"]'));
@@ -17731,15 +18958,17 @@ async function deleteXScheduledEntry(page, scheduledAt, expected = null) {
       const innerLabel = el.closest('label');
       const rowLabel = innerLabel?.parentElement?.closest('label') || innerLabel;
       const text = normalize(el.getAttribute('aria-label') || describedText || rowLabel?.innerText || el.parentElement?.innerText || "");
-      return normalizedNeedles.every((needle) => text.includes(needle))
-        && (!normalizedTitleNeedle || text.includes(normalizedTitleNeedle));
+      if (!normalizedNeedles.every((needle) => text.includes(needle))) return false;
+      if (!normalizedTitleNeedle) return true;
+      if (text.includes(normalizedTitleNeedle)) return true;
+      return expectedTitleFingerprint.length >= 2 && fingerprint(text).includes(expectedTitleFingerprint);
     });
     if (!target) return false;
     const innerLabel = target.closest('label');
     const rowLabel = innerLabel?.parentElement?.closest('label') || innerLabel;
     (rowLabel || target).click();
     return true;
-  })(${JSON.stringify(needles)}, ${JSON.stringify(expectedTitleNeedle)})`);
+  })(${JSON.stringify(needles)}, ${JSON.stringify(expectedTitleNeedle)}, ${JSON.stringify(expectedTitleFingerprint)})`);
   if (!checked) throw new Error(`X 예약 취소 체크박스를 찾지 못했습니다: ${needles.join(" / ")}`);
   await sleep(500);
   const deleteClicked = await page.eval(`(() => {
@@ -17915,20 +19144,16 @@ async function postToX(threadPost, mediaFiles, options = {}) {
     let xScheduleSubmissionStarted = false;
     try {
       await verifyXAccount(page);
+      await closeXDialogs(page);
       await page.navigate("https://x.com/compose/post", 5000);
+      await closeXDialogs(page);
       await waitForComposer(page);
       if (String(threadPost.text || "").trim()) {
         await insertXComposerText(page, threadPost.text, "after_text_insert");
       }
 
       if (mediaFiles.length) {
-        const root = await page.send("DOM.getDocument", { depth: -1, pierce: true });
-        const node = await page.send("DOM.querySelector", {
-          nodeId: root.root.nodeId,
-          selector: 'input[type="file"]',
-        });
-        if (!node.nodeId) throw new Error("X 미디어 업로드 input을 찾지 못했습니다.");
-        await page.send("DOM.setFileInputFiles", { nodeId: node.nodeId, files: mediaFiles });
+        await setXComposerFileInputFiles(page, mediaFiles);
         await waitForUploadToSettle(page, mediaFiles.length, mediaFiles);
       }
 
@@ -18072,13 +19297,7 @@ async function createXDraft(threadPost, mediaFiles) {
       await insertXComposerText(page, threadPost.text, "draft_after_text_insert");
 
       if (mediaFiles.length) {
-        const root = await page.send("DOM.getDocument", { depth: -1, pierce: true });
-        const node = await page.send("DOM.querySelector", {
-          nodeId: root.root.nodeId,
-          selector: 'input[type="file"]',
-        });
-        if (!node.nodeId) throw new Error("X 미디어 업로드 input을 찾지 못했습니다.");
-        await page.send("DOM.setFileInputFiles", { nodeId: node.nodeId, files: mediaFiles });
+        await setXComposerFileInputFiles(page, mediaFiles);
         await waitForUploadToSettle(page, mediaFiles.length, mediaFiles);
       }
 
@@ -18164,15 +19383,49 @@ function normalizeAutoScheduleCandidate(date) {
     candidate.setMinutes(candidate.getMinutes() + 1);
   }
   candidate.setSeconds(0, 0);
-  const minuteStep = 5;
-  const remainder = candidate.getMinutes() % minuteStep;
+  const remainder = candidate.getMinutes() % AUTO_SCHEDULE_MINUTE_STEP;
   if (remainder) {
-    candidate.setMinutes(candidate.getMinutes() + (minuteStep - remainder));
+    candidate.setMinutes(candidate.getMinutes() + (AUTO_SCHEDULE_MINUTE_STEP - remainder));
   }
   if (isAutoScheduleQuietTime(candidate)) {
     return autoScheduleQuietEndForKstDay(candidate);
   }
   return candidate;
+}
+
+function autoScheduleRandomMinutes() {
+  const minutes = [];
+  for (let minute = AUTO_SCHEDULE_MINUTE_STEP; minute <= 55; minute += AUTO_SCHEDULE_MINUTE_STEP) {
+    minutes.push(minute);
+  }
+  return minutes;
+}
+
+function pickAutoScheduleMinute(randomFn = Math.random) {
+  const minutes = autoScheduleRandomMinutes();
+  const raw = Number(typeof randomFn === "function" ? randomFn() : randomFn);
+  const unit = Number.isFinite(raw) ? Math.min(0.999999, Math.max(0, raw)) : 0;
+  return minutes[Math.min(minutes.length - 1, Math.floor(unit * minutes.length))];
+}
+
+function applyAutoScheduleRandomMinute(earliest, options = {}) {
+  const minTime = new Date(earliest).getTime();
+  if (!Number.isFinite(minTime)) return new Date(NaN);
+  const candidate = new Date(minTime);
+  candidate.setSeconds(0, 0);
+  const requested = Number(options.minute);
+  const minute = Number.isFinite(requested)
+    ? requested
+    : pickAutoScheduleMinute(options.random);
+  const stepped = Math.round(minute / AUTO_SCHEDULE_MINUTE_STEP) * AUTO_SCHEDULE_MINUTE_STEP;
+  const clamped = Math.min(55, Math.max(AUTO_SCHEDULE_MINUTE_STEP, stepped));
+  candidate.setMinutes(clamped, 0, 0);
+  if (candidate.getTime() < minTime) candidate.setHours(candidate.getHours() + 1);
+  return candidate;
+}
+
+function autoScheduleOffsetFromLatest(latestMs, nowMs = Date.now()) {
+  return Math.max(Number(latestMs) || 0, Number(nowMs) || 0) + AUTO_SCHEDULE_INTERVAL_MS;
 }
 
 async function nextAutoScheduleTime() {
@@ -18198,9 +19451,13 @@ async function nextAutoScheduleTime() {
     logEvent("auto_schedule_time_db_error", { error: error.message });
   }
   const latest = times.length ? Math.max(...times) : 0;
-  let candidate = normalizeAutoScheduleCandidate(new Date(Math.max(latest, now) + 30 * 60 * 1000));
+  let candidate = normalizeAutoScheduleCandidate(
+    applyAutoScheduleRandomMinute(new Date(autoScheduleOffsetFromLatest(latest, now))),
+  );
   while (isAutoScheduleQuietTime(candidate)) {
-    candidate = normalizeAutoScheduleCandidate(autoScheduleQuietEndForKstDay(candidate));
+    candidate = normalizeAutoScheduleCandidate(
+      applyAutoScheduleRandomMinute(autoScheduleQuietEndForKstDay(candidate)),
+    );
   }
   return candidate;
 }
@@ -18292,16 +19549,47 @@ function saveMirrorHistory(history) {
   fs.writeFileSync(MIRROR_HISTORY_PATH, JSON.stringify(history.slice(-500), null, 2));
 }
 
+function normalizeDiscoveryDuplicateText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/\s+/g, "")
+    .replace(/[^\p{L}\p{N}]/gu, "")
+    .slice(0, 80);
+}
+
+async function findDuplicateDiscoveryPostText(text, canonicalUrl = "") {
+  const key = normalizeDiscoveryDuplicateText(text);
+  if (key.length < 12) return false;
+  if (findCompletedMirror(canonicalUrl)) return true;
+  try {
+    const db = await getDiscoveryDb();
+    const rows = await db.prepare(`
+      SELECT canonical_url AS canonicalUrl, text_preview AS textPreview, status
+      FROM thread_discoveries
+      WHERE status IN ('posted', 'scheduled', 'x_draft', 'approved', 'queued_schedule', 'scheduling')
+    `).all();
+    return (rows || []).some((row) => (
+      row.canonicalUrl !== canonicalUrl
+      && normalizeDiscoveryDuplicateText(row.textPreview) === key
+    ));
+  } catch {
+    return false;
+  }
+}
+
 function findCompletedMirror(canonicalUrl) {
   return loadMirrorHistory()
     .slice()
     .reverse()
-    .find((entry) => entry.canonicalUrl === canonicalUrl && ["posted", "scheduled"].includes(entry.status));
+    .find((entry) => entry.canonicalUrl === canonicalUrl
+      && ["posted", "scheduled"].includes(entry.status)
+      && entry.cancelledReason !== "user_deleted_on_x");
 }
 
 function recordCompletedMirror(entry) {
   const history = loadMirrorHistory();
   const withoutSameUrl = history.filter((item) => item.canonicalUrl !== entry.canonicalUrl);
+  const delivery = entry.scheduleDelivery ? normalizeScheduleDelivery(entry.scheduleDelivery) : "";
   withoutSameUrl.push({
     canonicalUrl: entry.canonicalUrl,
     status: entry.status,
@@ -18309,6 +19597,7 @@ function recordCompletedMirror(entry) {
     postUrl: entry.postUrl || null,
     mediaCount: entry.mediaCount,
     completedAt: new Date().toISOString(),
+    ...(delivery ? { scheduleDelivery: delivery } : {}),
   });
   saveMirrorHistory(withoutSameUrl);
 }
@@ -18393,6 +19682,21 @@ async function getDiscoveryDb() {
         if (!columnNames.has("media_preview_url")) {
           await db.exec(`ALTER TABLE thread_discoveries ADD COLUMN media_preview_url TEXT NOT NULL DEFAULT ''`);
         }
+        if (!columnNames.has("schedule_delivery")) {
+          await db.exec(`ALTER TABLE thread_discoveries ADD COLUMN schedule_delivery TEXT NOT NULL DEFAULT 'x_native'`);
+        }
+        if (!columnNames.has("candidate_group")) {
+          await db.exec(`ALTER TABLE thread_discoveries ADD COLUMN candidate_group TEXT`);
+        }
+        if (!columnNames.has("approval_batch_id")) {
+          await db.exec(`ALTER TABLE thread_discoveries ADD COLUMN approval_batch_id TEXT`);
+        }
+        if (!columnNames.has("approved_at")) {
+          await db.exec(`ALTER TABLE thread_discoveries ADD COLUMN approved_at TEXT`);
+        }
+        if (!columnNames.has("group_classified_at")) {
+          await db.exec(`ALTER TABLE thread_discoveries ADD COLUMN group_classified_at TEXT`);
+        }
         await repairStuckDiscoveryRows(db);
         return db;
       } catch (error) {
@@ -18429,6 +19733,7 @@ async function saveDiscoveryCandidates(candidates) {
   let updated = 0;
   let skippedCompleted = 0;
   let skippedExcluded = 0;
+  const reviewUrls = [];
   for (const candidate of candidates) {
     const excludedKeyword = excludedDiscoveryKeywordForText(
       `${candidate.author || ""} ${candidate.textPreview || ""} ${candidate.criteria || ""}`
@@ -18474,6 +19779,7 @@ async function saveDiscoveryCandidates(candidates) {
         candidate.canonicalUrl,
       );
       updated += 1;
+      reviewUrls.push(candidate.canonicalUrl);
       continue;
     }
     await db.prepare(`
@@ -18491,19 +19797,37 @@ async function saveDiscoveryCandidates(candidates) {
       candidate.criteria || "",
     );
     inserted += 1;
+    reviewUrls.push(candidate.canonicalUrl);
   }
-  return { inserted, updated, skippedCompleted, skippedExcluded };
+  for (const canonicalUrl of reviewUrls) {
+    setImmediate(() => {
+      queueDiscoveryGroupClassify(canonicalUrl);
+      const rowText = String(candidates.find((item) => item.canonicalUrl === canonicalUrl)?.textPreview || "").trim();
+      if (rowText) queueDiscoveryTitleRefine(canonicalUrl, rowText.slice(0, 240));
+    });
+  }
+  return { inserted, updated, skippedCompleted, skippedExcluded, reviewUrls };
 }
 
 function isDiscoveryPlaceholderText(value) {
   const text = String(value || "").trim();
-  return !text || text === "수집 중" || text === "(본문 없음)";
+  return !text || /^수집\s*중$/.test(text) || text === "(본문 없음)";
 }
 
 function isDiscoveryFailureLabel(value) {
   const text = String(value || "").trim();
-  return /^(Threads 수집 시간 초과|미디어 없음|예약 실패|예약실패|Threads 수집 실패|수집 중|\(본문 없음\))$/.test(text)
+  return /^(Threads 수집 시간 초과|미디어 없음|예약 실패|예약실패|Threads 수집 실패|수집\s*중|\(본문 없음\))$/.test(text)
     || isThreadsInvalidPageText(text);
+}
+
+function firstUsableDiscoveryText(...values) {
+  for (const value of values) {
+    const text = String(value || "").trim();
+    if (!text) continue;
+    if (isDiscoveryPlaceholderText(text) || isDiscoveryFailureLabel(text)) continue;
+    return text;
+  }
+  return "";
 }
 
 function discoveryFailurePreviewText(error, kind = "detail") {
@@ -18632,6 +19956,17 @@ function buildYouTubeXText(title, canonicalUrl, maxLength = 280) {
   return `${truncateXText(cleanTitle, titleLimit)}${separator}${url}`;
 }
 
+async function resolveYouTubeXTitle(url, options = {}, row = null) {
+  const criteria = parseDiscoveryCriteria(row?.criteria);
+  let title = firstUsableDiscoveryText(options.textOverride, options.text, criteria.title, row?.textPreview);
+  if (!title) {
+    const live = await extractYouTubePost(url);
+    title = firstUsableDiscoveryText(live.title, live.text);
+  }
+  if (!title) throw new Error("YouTube 제목이 아직 수집되지 않아 게시/예약을 중단했습니다.");
+  return sanitizeYouTubeXTitle(title);
+}
+
 function sanitizeYouTubeXTitle(value, maxLength = 280) {
   const cleaned = String(value || "")
     .replace(/https?:\/\/\S+/giu, " ")
@@ -18704,7 +20039,17 @@ async function addYouTubeToDiscoveryReview(url, options = {}) {
     }),
   }]);
   logEvent("youtube_added_to_discovery", { canonicalUrl, author: post.author, ...saved });
-  return { canonicalUrl, mediaCount: 1, saved, message: "YouTube 영상을 대시보드에 추가함" };
+  return {
+    canonicalUrl,
+    mediaCount: 1,
+    saved,
+    message: "YouTube 영상을 대시보드에 추가함",
+    threadPostSnapshot: {
+      text: post.text,
+      title: post.title,
+      url: canonicalUrl,
+    },
+  };
 }
 
 async function addSourceToDiscoveryReview(url, options = {}) {
@@ -18748,10 +20093,13 @@ async function addThreadToDiscoveryReview(url, options = {}) {
   const post = await extractThreadPost(canonicalUrl, { allowEmptyText: true });
   const author = new URL(canonicalUrl).pathname.split("/")[1].replace("@", "");
   const incomingText = String(options.text || "").trim();
+  const extractedText = String(post.text || "").trim();
   const textPreview = (
-    incomingText && !isDiscoveryFailureLabel(incomingText)
+    incomingText && !isDiscoveryFailureLabel(incomingText) && !isThreadsInvalidPageText(incomingText)
       ? incomingText
-      : String(post.text || "").trim()
+      : extractedText && !isThreadsInvalidPageText(extractedText)
+        ? extractedText
+        : ""
   ) || "(본문 없음)";
   const allowTextOnly = options.allowTextOnly === true && !isDiscoveryPlaceholderText(textPreview);
   if (post.mediaUrls.length <= 0 && !allowTextOnly) {
@@ -18839,6 +20187,12 @@ async function addThreadToDiscoveryReview(url, options = {}) {
     mediaSnapshotReady: Boolean(mediaSnapshotMeta?.ready),
     ...saved,
   });
+  if ((saved.inserted || 0) + (saved.updated || 0) > 0) {
+    setImmediate(() => {
+      queueDiscoveryTitleRefine(canonicalUrl, textPreview.slice(0, 240));
+      queueDiscoveryGroupClassify(canonicalUrl);
+    });
+  }
   const thumbnailSource = post.imageMediaUrls?.[0]
     || post.mediaUrls.find((mediaUrl) => !isVideoMediaUrl(mediaUrl))
     || "";
@@ -19060,7 +20414,11 @@ async function maybeRunScheduledInssiderReplies() {
 async function enqueueMissingScheduledInssiderReplyItems() {
   const state = loadScheduledReplyState();
   const existing = new Set((state.items || []).map((item) => item.canonicalUrl));
-  const scheduledHistory = loadMirrorHistory().filter((entry) => entry.status === "scheduled" && isInssiderPostUrl(entry.canonicalUrl));
+  const scheduledHistory = loadMirrorHistory().filter((entry) => (
+    entry.status === "scheduled"
+    && isInssiderPostUrl(entry.canonicalUrl)
+    && !isLocalScheduleDelivery(entry)
+  ));
   if (!scheduledHistory.length) return;
   const rows = await listDiscoveryRows(500);
   for (const history of scheduledHistory) {
@@ -19090,7 +20448,10 @@ async function listDiscoveryRows(limit = 20) {
       media_preview_url AS mediaPreviewUrl, like_count AS likeCount, media_count AS mediaCount, viral_score AS viralScore,
       criteria, status,
       scheduled_post_at AS scheduledPostAt, discovered_at AS discoveredAt,
-      posted_at AS postedAt, last_error AS lastError, attempts
+      posted_at AS postedAt, last_error AS lastError, attempts,
+      COALESCE(schedule_delivery, 'x_native') AS scheduleDelivery,
+      candidate_group AS candidateGroup, approval_batch_id AS approvalBatchId,
+      approved_at AS approvedAt, group_classified_at AS groupClassifiedAt
     FROM thread_discoveries
     WHERE status != 'skipped'
     ORDER BY discovered_at DESC
@@ -19105,23 +20466,450 @@ async function getDiscoveryRow(canonicalUrl) {
       media_preview_url AS mediaPreviewUrl, like_count AS likeCount, media_count AS mediaCount, viral_score AS viralScore,
       criteria, status,
       scheduled_post_at AS scheduledPostAt, discovered_at AS discoveredAt,
-      posted_at AS postedAt, last_error AS lastError, attempts
+      posted_at AS postedAt, last_error AS lastError, attempts,
+      COALESCE(schedule_delivery, 'x_native') AS scheduleDelivery,
+      candidate_group AS candidateGroup, approval_batch_id AS approvalBatchId,
+      approved_at AS approvedAt, group_classified_at AS groupClassifiedAt
     FROM thread_discoveries
     WHERE canonical_url = ? AND status != 'skipped'
   `).get(canonicalUrl);
+}
+
+function canApproveDiscoveryRow(row) {
+  return row?.status === "review" && (row.candidateGroup === "A" || row.candidateGroup === "B");
+}
+
+function canUnapproveDiscoveryRow(row) {
+  return row?.status === DISCOVERY_APPROVED_STATUS;
+}
+
+async function markDiscoveryApproved(canonicalUrl, { batchId, approvedAt } = {}) {
+  const db = await getDiscoveryDb();
+  const result = await db.prepare(`
+    UPDATE thread_discoveries
+    SET status = ?, approval_batch_id = ?, approved_at = ?
+    WHERE canonical_url = ? AND status = 'review'
+  `).run(
+    DISCOVERY_APPROVED_STATUS,
+    batchId || null,
+    approvedAt || new Date().toISOString(),
+    canonicalUrl,
+  );
+  return { changes: result.changes };
+}
+
+async function markDiscoveryUnapproved(canonicalUrl) {
+  const db = await getDiscoveryDb();
+  const result = await db.prepare(`
+    UPDATE thread_discoveries
+    SET status = 'review', approval_batch_id = NULL, approved_at = NULL
+    WHERE canonical_url = ? AND status = ?
+  `).run(canonicalUrl, DISCOVERY_APPROVED_STATUS);
+  return { changes: result.changes };
+}
+
+async function markDiscoveryCandidateGroup(canonicalUrl, { group, criteriaPatch, force = false } = {}) {
+  const db = await getDiscoveryDb();
+  const row = await db.prepare(`
+    SELECT criteria, candidate_group AS candidateGroup FROM thread_discoveries WHERE canonical_url = ?
+  `).get(canonicalUrl);
+  if (!row) return { changes: 0 };
+  const criteria = parseDiscoveryCriteria(row.criteria);
+  const existing = criteria.candidateGroup;
+  if (existing?.classifier === "manual" && !force) {
+    return { changes: 0, skipped: true, reason: "manual_classifier" };
+  }
+  if (existing && typeof existing === "object") {
+    const history = Array.isArray(criteria.candidateGroupHistory) ? criteria.candidateGroupHistory : [];
+    history.unshift(existing);
+    criteria.candidateGroupHistory = history.slice(0, 3);
+  }
+  const classifiedAt = new Date().toISOString();
+  const nextCandidateGroup = {
+    ...(criteriaPatch?.candidateGroup && typeof criteriaPatch.candidateGroup === "object" ? criteriaPatch.candidateGroup : {}),
+    group,
+    classifiedAt,
+  };
+  criteria.candidateGroup = nextCandidateGroup;
+  const result = await db.prepare(`
+    UPDATE thread_discoveries
+    SET candidate_group = ?, group_classified_at = ?, criteria = ?
+    WHERE canonical_url = ?
+  `).run(group, classifiedAt, JSON.stringify(criteria), canonicalUrl);
+  return { changes: result.changes };
+}
+
+const DISCOVERY_GROUP_DISTRIBUTION_STATUSES = [
+  "review",
+  DISCOVERY_APPROVED_STATUS,
+  "draft",
+  "queued_schedule",
+  "scheduling",
+  "failed",
+  "failed_post",
+  "failed_draft",
+  "failed_schedule",
+  "discovered",
+];
+
+async function getDiscoveryGroupDistribution() {
+  const db = await getDiscoveryDb();
+  const rows = await db.prepare(`
+    SELECT candidate_group AS candidateGroup, status
+    FROM thread_discoveries
+    WHERE status IN (${DISCOVERY_GROUP_DISTRIBUTION_STATUSES.map(() => "?").join(", ")})
+  `).all(DISCOVERY_GROUP_DISTRIBUTION_STATUSES);
+  const distribution = { A: 0, B: 0, C: 0, unclassified: 0 };
+  for (const row of rows || []) {
+    const group = String(row.candidateGroup || "").trim();
+    if (group === "A" || group === "B" || group === "C") distribution[group] += 1;
+    else distribution.unclassified += 1;
+  }
+  return distribution;
+}
+
+function effectiveGroupApprovalDailyCap(settings = {}) {
+  const normalized = normalizeGroupApprovalSettings(settings);
+  if (normalized.rolloutStage === "manual_batch") return Math.min(normalized.dailyPostCap, 4);
+  return normalized.dailyPostCap;
+}
+
+function groupApprovalAllowsApprove(settings = {}) {
+  const normalized = normalizeGroupApprovalSettings(settings);
+  return normalized.enabled === true && normalized.rolloutStage !== "shadow";
+}
+
+function groupApprovalAllowsStanding(settings = {}) {
+  const normalized = normalizeGroupApprovalSettings(settings);
+  return normalized.enabled === true
+    && normalized.rolloutStage === "steady"
+    && normalized.standingApprovedGroups.includes("A");
+}
+
+function kstDayBounds(nowMs = Date.now()) {
+  const key = formatKstDateKey(nowMs);
+  const startMs = new Date(`${key}T00:00:00+09:00`).getTime();
+  return {
+    key,
+    startIso: new Date(startMs).toISOString(),
+    endIso: new Date(startMs + 24 * 60 * 60 * 1000).toISOString(),
+  };
+}
+
+function isGroupApprovalContentConstraint(error) {
+  const message = String(error?.message || error || "");
+  return /본문과 미디어를 모두 찾지 못|미디어 후보.*확정하지 못|원문 미디어.*확인하지 못|첨부.*없|지원하지 않는|잘못된 URL|invalid URL|제외 키워드|삭제·비공개|잘못된 링크 상태|미디어를 찾지 못해|미디어 재추출 결과가 .*0개로 감소/i.test(message);
+}
+
+function isDiscoveryMediaExtractFailure(error) {
+  const message = String(error?.message || error || "");
+  return /미디어 재추출 결과가 .*0개로 감소|미디어를 찾지 못해|신뢰할 수 있는 본문·미디어를 찾지 못해|미디어 후보.*확정하지 못|원문 미디어.*확인하지 못/i.test(message);
+}
+
+function selectApprovedRowsForDrain(rows = [], { remaining = 0, maxPerTick = 3 } = {}) {
+  const limit = Math.max(0, Math.min(Number(maxPerTick) || 0, Number(remaining) || 0));
+  return rows.slice(0, limit);
+}
+
+let discoveryGroupDrainBusy = false;
+
+function discoveryTimestampMs(value) {
+  const text = String(value || "").trim();
+  if (!text) return NaN;
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(text)) return new Date(`${text.replace(" ", "T")}Z`).getTime();
+  return new Date(text).getTime();
+}
+
+async function countGroupApprovalUsageForKstDay(nowMs = Date.now()) {
+  const bounds = kstDayBounds(nowMs);
+  const startMs = new Date(bounds.startIso).getTime();
+  const endMs = new Date(bounds.endIso).getTime();
+  const db = await getDiscoveryDb();
+  const rows = await db.prepare(`
+    SELECT status, posted_at AS postedAt, scheduled_post_at AS scheduledPostAt,
+      approval_batch_id AS approvalBatchId
+    FROM thread_discoveries
+    WHERE approval_batch_id IS NOT NULL AND approval_batch_id != ''
+      AND status IN ('posted', 'scheduled', 'queued_schedule', 'scheduling')
+  `).all();
+  let used = 0;
+  for (const row of rows || []) {
+    if (row.status === "queued_schedule" || row.status === "scheduling") {
+      used += 1;
+      continue;
+    }
+    const stampMs = discoveryTimestampMs(row.status === "posted" ? row.postedAt : row.scheduledPostAt);
+    if (Number.isFinite(stampMs) && stampMs >= startMs && stampMs < endMs) used += 1;
+  }
+  return { ...bounds, used };
+}
+
+async function maybeStandingApproveDiscoveryRow(canonicalUrl, group) {
+  const settings = getGroupApprovalSettings();
+  if (!groupApprovalAllowsStanding(settings) || group !== "A") return { applied: false, reason: "standing_disabled" };
+  const row = await getDiscoveryRow(canonicalUrl);
+  if (!canApproveDiscoveryRow(row)) return { applied: false, reason: "not_approvable" };
+  if (findCompletedMirror(canonicalUrl)) return { applied: false, reason: "already_completed" };
+  const batchId = `standing-${formatKstDateKey(Date.now())}`;
+  const result = await markDiscoveryApproved(canonicalUrl, { batchId });
+  if (!result.changes) return { applied: false, reason: "not_updated" };
+  logEvent("discovery_group_approved", { canonicalUrl, group, batchId, standing: true });
+  return { applied: true, batchId };
+}
+
+async function approveDiscoveryGroup({ group, canonicalUrls } = {}) {
+  const settings = getGroupApprovalSettings();
+  if (!groupApprovalAllowsApprove(settings)) {
+    return {
+      ok: false,
+      status: 409,
+      error: "group_approval_not_accepting",
+      rolloutStage: settings.rolloutStage,
+      enabled: settings.enabled,
+    };
+  }
+  if (group !== "A" && group !== "B") {
+    return { ok: false, status: 400, error: "group_not_approvable" };
+  }
+  const urls = normalizeDiscoveryScheduleCancelBatchUrls(canonicalUrls);
+  const batchId = `batch-${Date.now().toString(36)}-${crypto.randomBytes(3).toString("hex")}`;
+  const approvedAt = new Date().toISOString();
+  const approved = [];
+  const rejected = [];
+  for (const canonicalUrl of urls) {
+    const row = await getDiscoveryRow(canonicalUrl);
+    if (!row) {
+      rejected.push({ canonicalUrl, reason: "missing" });
+      continue;
+    }
+    if (row.candidateGroup !== group) {
+      rejected.push({ canonicalUrl, reason: "group_mismatch", group: row.candidateGroup || null });
+      continue;
+    }
+    if (!canApproveDiscoveryRow(row)) {
+      rejected.push({ canonicalUrl, reason: `status_${row.status}` });
+      continue;
+    }
+    if (findCompletedMirror(canonicalUrl) || await findDuplicateDiscoveryPostText(row.textPreview, canonicalUrl)) {
+      rejected.push({ canonicalUrl, reason: "already_completed" });
+      continue;
+    }
+    const result = await markDiscoveryApproved(canonicalUrl, { batchId, approvedAt });
+    if (result.changes) approved.push(canonicalUrl);
+    else rejected.push({ canonicalUrl, reason: "not_updated" });
+  }
+  logEvent("discovery_group_approved", { batchId, group, approved: approved.length, rejected: rejected.length });
+  return { ok: true, status: 200, batchId, approved, rejected, group };
+}
+
+async function unapproveDiscoveryRows(canonicalUrls = []) {
+  const urls = normalizeDiscoveryScheduleCancelBatchUrls(canonicalUrls);
+  const unapproved = [];
+  const rejected = [];
+  for (const canonicalUrl of urls) {
+    const row = await getDiscoveryRow(canonicalUrl);
+    if (!canUnapproveDiscoveryRow(row)) {
+      rejected.push({ canonicalUrl, reason: row ? `status_${row.status}` : "missing" });
+      continue;
+    }
+    const result = await markDiscoveryUnapproved(canonicalUrl);
+    if (result.changes) unapproved.push(canonicalUrl);
+    else rejected.push({ canonicalUrl, reason: "not_updated" });
+  }
+  logEvent("discovery_group_unapproved", { unapproved: unapproved.length, rejected: rejected.length });
+  return { unapproved, rejected };
+}
+
+async function setDiscoveryGroupManual(canonicalUrl, group) {
+  const nextGroup = String(group || "").trim();
+  if (!["A", "B", "C"].includes(nextGroup)) throw new Error("그룹은 A, B, C 중 하나여야 합니다.");
+  const url = normalizeDiscoveryUrl(canonicalUrl);
+  const row = await getDiscoveryRow(url);
+  if (!row) throw new Error("대시보드 항목을 찾지 못했습니다.");
+  if (!["review", "approved", "discovered"].includes(row.status)) {
+    throw new Error(`현재 상태에서는 그룹을 바꿀 수 없습니다: ${row.status}`);
+  }
+  if (row.status === "approved") await markDiscoveryUnapproved(url);
+  await markDiscoveryCandidateGroup(url, {
+    group: nextGroup,
+    force: true,
+    criteriaPatch: {
+      candidateGroup: {
+        group: nextGroup,
+        classifier: "manual",
+        reasons: ["manual"],
+        topic: null,
+        score: null,
+        version: GROUP_CLASSIFIER_VERSION,
+      },
+    },
+  });
+  logEvent("discovery_group_classified", { canonicalUrl: url, group: nextGroup, classifier: "manual" });
+  return { canonicalUrl: url, group: nextGroup };
+}
+
+async function listDiscoveryApprovalBatches(limit = 10) {
+  const db = await getDiscoveryDb();
+  const rows = await db.prepare(`
+    SELECT approval_batch_id AS batchId,
+      MIN(approved_at) AS approvedAt,
+      candidate_group AS candidateGroup,
+      status,
+      COUNT(*) AS count
+    FROM thread_discoveries
+    WHERE approval_batch_id IS NOT NULL AND approval_batch_id != ''
+    GROUP BY approval_batch_id, candidate_group, status
+    ORDER BY approvedAt DESC
+    LIMIT ?
+  `).all(Math.max(1, Number(limit || 10)) * 8);
+  const batches = new Map();
+  for (const row of rows || []) {
+    if (!batches.has(row.batchId)) {
+      batches.set(row.batchId, {
+        batchId: row.batchId,
+        approvedAt: row.approvedAt,
+        group: row.candidateGroup,
+        counts: {},
+        total: 0,
+      });
+    }
+    const batch = batches.get(row.batchId);
+    batch.counts[row.status] = Number(row.count || 0);
+    batch.total += Number(row.count || 0);
+  }
+  return [...batches.values()].slice(0, Math.max(1, Number(limit || 10)));
+}
+
+async function recoverApprovedDiscoveryQueue() {
+  const db = await getDiscoveryDb();
+  const result = await db.prepare(`
+    UPDATE thread_discoveries
+    SET status = ?
+    WHERE status = 'queued_schedule' AND approval_batch_id IS NOT NULL AND approval_batch_id != ''
+  `).run(DISCOVERY_APPROVED_STATUS);
+  if (result.changes) {
+    logEvent("discovery_group_drain", { recoveredQueued: result.changes });
+  }
+  return { recovered: result.changes || 0 };
+}
+
+async function revertGroupApprovalScheduleFailure(canonicalUrl, error) {
+  const db = await getDiscoveryDb();
+  const row = await getDiscoveryRow(canonicalUrl);
+  const attempts = Number(row?.attempts || 0) + 1;
+  const contentConstraint = isGroupApprovalContentConstraint(error);
+  if (contentConstraint || attempts >= 3) {
+    await markDiscoveryScheduleFailed(canonicalUrl, error);
+    logEvent("discovery_group_post_failed", {
+      canonicalUrl,
+      attempts,
+      contentConstraint,
+      error: error.message || String(error),
+    });
+    return { status: "failed_schedule", attempts };
+  }
+  await db.prepare(`
+    UPDATE thread_discoveries
+    SET status = ?, last_error = ?, attempts = attempts + 1
+    WHERE canonical_url = ? AND status IN ('queued_schedule', 'scheduling', 'approved')
+  `).run(DISCOVERY_APPROVED_STATUS, error.message || String(error), canonicalUrl);
+  logEvent("discovery_group_post_failed", {
+    canonicalUrl,
+    attempts,
+    retry: true,
+    error: error.message || String(error),
+  });
+  return { status: DISCOVERY_APPROVED_STATUS, attempts };
+}
+
+async function drainApprovedDiscoveryRows(options = {}) {
+  if (discoveryGroupDrainBusy) return { ok: true, skipped: true, reason: "busy" };
+  discoveryGroupDrainBusy = true;
+  try {
+    const settings = getGroupApprovalSettings();
+    if (!groupApprovalAllowsApprove(settings)) {
+      return { ok: true, skipped: true, reason: "disabled", rolloutStage: settings.rolloutStage };
+    }
+    const usage = await countGroupApprovalUsageForKstDay();
+    const cap = effectiveGroupApprovalDailyCap(settings);
+    const remaining = Math.max(0, cap - usage.used);
+    if (remaining <= 0) {
+      const result = { ok: true, queued: [], deferred: "daily_cap", used: usage.used, cap };
+      logEvent("discovery_group_drain", result);
+      return result;
+    }
+    const nextSlot = await nextAutoScheduleTime();
+    if (!isAutoStyleScheduleWithinHorizon(nextSlot)) {
+      const result = {
+        ok: true,
+        queued: [],
+        deferred: "future_horizon",
+        nextSlotAt: nextSlot.toISOString(),
+      };
+      logEvent("discovery_group_drain", result);
+      return result;
+    }
+    const db = await getDiscoveryDb();
+    const rows = await db.prepare(`
+      SELECT canonical_url AS canonicalUrl, text_preview AS textPreview,
+        candidate_group AS candidateGroup, approval_batch_id AS approvalBatchId,
+        attempts
+      FROM thread_discoveries
+      WHERE status = ?
+      ORDER BY approved_at ASC,
+        CASE candidate_group WHEN 'A' THEN 0 ELSE 1 END,
+        like_count DESC
+      LIMIT 20
+    `).all(DISCOVERY_APPROVED_STATUS);
+    const selected = selectApprovedRowsForDrain(rows || [], { remaining, maxPerTick: options.maxPerTick || 3 });
+    const queued = [];
+    const skipped = [];
+    for (const row of selected) {
+      if (Number(row.attempts || 0) >= 3) {
+        skipped.push({ canonicalUrl: row.canonicalUrl, reason: "retry_limit" });
+        continue;
+      }
+      if (findCompletedMirror(row.canonicalUrl) || await findDuplicateDiscoveryPostText(row.textPreview, row.canonicalUrl)) {
+        skipped.push({ canonicalUrl: row.canonicalUrl, reason: "already_completed" });
+        continue;
+      }
+      const source = `group_approval:${row.approvalBatchId || "none"}`;
+      await markDiscoveryScheduleQueueState(row.canonicalUrl, "queued_schedule");
+      queued.push({ canonicalUrl: row.canonicalUrl, source, group: row.candidateGroup });
+      enqueueDiscoveryAutoScheduleJob(row.canonicalUrl, source, async () => {
+        try {
+          return await processDiscoveryAutoScheduleJob(row.canonicalUrl, source, row.textPreview);
+        } catch (error) {
+          if (shouldMarkDiscoveryScheduleFailed(error)) {
+            await revertGroupApprovalScheduleFailure(row.canonicalUrl, error).catch(() => {});
+          }
+          throw error;
+        }
+      }).catch(() => {});
+    }
+    const result = { ok: true, queued, skipped, used: usage.used, cap, remaining, nextSlotAt: nextSlot.toISOString() };
+    logEvent("discovery_group_drain", result);
+    return result;
+  } finally {
+    discoveryGroupDrainBusy = false;
+  }
 }
 
 async function markDiscoveryPosted(canonicalUrl, mediaCount) {
   const db = await getDiscoveryDb();
   await db.prepare(`
     UPDATE thread_discoveries
-    SET status = 'posted', posted_at = CURRENT_TIMESTAMP, last_error = NULL, media_count = MAX(media_count, ?)
+    SET status = 'posted', posted_at = CURRENT_TIMESTAMP, last_error = NULL,
+        media_count = MAX(media_count, ?), scheduled_post_at = NULL
     WHERE canonical_url = ?
   `).run(mediaCount || 0, canonicalUrl);
   cleanupDiscoveryMediaSnapshot(canonicalUrl, { reason: "posted" });
 }
 
 async function markDiscoveryPostFailed(canonicalUrl, error) {
+  if (isDiscoveryMediaExtractFailure(error)) {
+    return discardDiscoveryRowForMediaExtractFailure(canonicalUrl, error);
+  }
   const db = await getDiscoveryDb();
   const message = error.message || String(error);
   await db.prepare(`
@@ -19148,6 +20936,9 @@ async function markDiscoveryDrafted(canonicalUrl, mediaCount) {
 }
 
 async function markDiscoveryDraftFailed(canonicalUrl, error) {
+  if (isDiscoveryMediaExtractFailure(error)) {
+    return discardDiscoveryRowForMediaExtractFailure(canonicalUrl, error);
+  }
   const db = await getDiscoveryDb();
   const message = error.message || String(error);
   await db.prepare(`
@@ -19164,16 +20955,19 @@ async function markDiscoveryDraftFailed(canonicalUrl, error) {
   `).run(message, discoveryFailurePreviewText(error, "draft"), canonicalUrl);
 }
 
-async function markDiscoveryScheduled(canonicalUrl, mediaCount, scheduledAt) {
+async function markDiscoveryScheduled(canonicalUrl, mediaCount, scheduledAt, options = {}) {
+  const delivery = normalizeScheduleDelivery(options.scheduleDelivery || SCHEDULE_DELIVERY_X_NATIVE);
   const db = await getDiscoveryDb();
   await db.prepare(`
     UPDATE thread_discoveries
     SET status = 'scheduled', scheduled_post_at = ?, posted_at = CURRENT_TIMESTAMP,
-        last_error = NULL, media_count = MAX(media_count, ?)
+        last_error = NULL, media_count = MAX(media_count, ?), schedule_delivery = ?
     WHERE canonical_url = ?
-  `).run(scheduledAt || null, mediaCount || 0, canonicalUrl);
-  // Schedule success is the durable completion for auto-schedule retries.
-  cleanupDiscoveryMediaSnapshot(canonicalUrl, { reason: "scheduled" });
+  `).run(scheduledAt || null, mediaCount || 0, delivery, canonicalUrl);
+  // X native already uploaded media. Local delivery keeps the snapshot for due-time posting.
+  if (delivery !== SCHEDULE_DELIVERY_LOCAL_POST) {
+    cleanupDiscoveryMediaSnapshot(canonicalUrl, { reason: "scheduled" });
+  }
 }
 
 async function markDiscoveryScheduleQueueState(canonicalUrl, status) {
@@ -19189,12 +20983,32 @@ async function markDiscoveryScheduleQueueState(canonicalUrl, status) {
   `).run(status, canonicalUrl);
 }
 
-async function cancelDiscoveryScheduledPost(canonicalUrl) {
+function normalizeDiscoveryScheduleCancelBatchUrls(value = []) {
+  const seen = new Set();
+  const urls = [];
+  const items = Array.isArray(value) ? value : value ? [value] : [];
+  for (const item of items) {
+    if (!String(item || "").trim()) continue;
+    let url = "";
+    try {
+      url = normalizeDiscoveryUrl(item);
+    } catch {
+      continue;
+    }
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    urls.push(url);
+  }
+  return urls;
+}
+
+async function loadCancellableScheduledDiscoveryRow(canonicalUrl) {
   const url = normalizeDiscoveryUrl(canonicalUrl);
   const db = await getDiscoveryDb();
   const row = await db.prepare(`
     SELECT canonical_url AS canonicalUrl, status, scheduled_post_at AS scheduledPostAt,
-      media_count AS mediaCount, text_preview AS textPreview
+      media_count AS mediaCount, text_preview AS textPreview,
+      COALESCE(schedule_delivery, 'x_native') AS scheduleDelivery
     FROM thread_discoveries
     WHERE canonical_url = ?
   `).get(url);
@@ -19205,52 +21019,331 @@ async function cancelDiscoveryScheduledPost(canonicalUrl) {
   if (!Number.isFinite(scheduledAt.getTime()) || scheduledAt.getTime() <= Date.now()) {
     throw new Error("미래 예약글만 취소할 수 있습니다.");
   }
+  return { ...row, scheduledAt };
+}
+
+function discoveryScheduleCancelMatchOptions(row) {
+  return {
+    textPreview: isDiscoveryPlaceholderText(row.textPreview) || isDiscoveryFailureLabel(row.textPreview)
+      ? "수집 중"
+      : row.textPreview,
+    mediaCount: Number(row.mediaCount || 0),
+    matchUniqueTimeSlot: true,
+  };
+}
+
+async function completeDiscoveryScheduleCancellation(row, verification = {}) {
+  const url = row.canonicalUrl;
+  const scheduledAt = row.scheduledAt;
+  const db = await getDiscoveryDb();
+  await db.prepare(`
+    UPDATE thread_discoveries
+    SET status = 'review', scheduled_post_at = NULL, posted_at = NULL, last_error = NULL,
+        schedule_delivery = 'x_native'
+    WHERE canonical_url = ? AND status = 'cancelling_schedule'
+  `).run(url);
+  removeCompletedMirror(url);
+  removeScheduleSlot(scheduledAt, url);
+  removeScheduledReplyItem(url);
+  logEvent("discovery_schedule_cancelled", {
+    canonicalUrl: url,
+    scheduledAt: scheduledAt.toISOString(),
+    ...verification,
+  });
+  return {
+    canonicalUrl: url,
+    scheduledAt: scheduledAt.toISOString(),
+    status: "review",
+    ...verification,
+  };
+}
+
+async function failDiscoveryScheduleCancellation(url, error) {
+  const db = await getDiscoveryDb();
+  await db.prepare(`
+    UPDATE thread_discoveries
+    SET status = 'scheduled', last_error = ?
+    WHERE canonical_url = ? AND status = 'cancelling_schedule'
+  `).run(`예약 취소 실패: ${error.message}`, url);
+}
+
+async function cancelLoadedScheduledDiscoveryRowOnPage(page, row) {
+  const url = row.canonicalUrl;
+  const db = await getDiscoveryDb();
   await db.prepare(`
     UPDATE thread_discoveries
     SET status = 'cancelling_schedule', last_error = NULL
     WHERE canonical_url = ? AND status = 'scheduled'
   `).run(url);
   try {
+    const verification = await deleteXScheduledEntry(page, row.scheduledAt, discoveryScheduleCancelMatchOptions(row));
+    return await completeDiscoveryScheduleCancellation(row, verification);
+  } catch (error) {
+    await failDiscoveryScheduleCancellation(url, error);
+    throw error;
+  }
+}
+
+async function cancelLocalScheduledDiscoveryRow(row) {
+  const db = await getDiscoveryDb();
+  await db.prepare(`
+    UPDATE thread_discoveries
+    SET status = 'cancelling_schedule', last_error = NULL
+    WHERE canonical_url = ? AND status = 'scheduled'
+  `).run(row.canonicalUrl);
+  try {
+    return await completeDiscoveryScheduleCancellation(row, {
+      deletedOnX: false,
+      scheduleDelivery: SCHEDULE_DELIVERY_LOCAL_POST,
+    });
+  } catch (error) {
+    await failDiscoveryScheduleCancellation(row.canonicalUrl, error);
+    throw error;
+  }
+}
+
+async function markDiscoveryScheduleDeliveryLocal(row) {
+  const url = row.canonicalUrl;
+  const scheduledAt = row.scheduledAt instanceof Date
+    ? row.scheduledAt
+    : new Date(row.scheduledPostAt || row.scheduledAt || 0);
+  if (!Number.isFinite(scheduledAt.getTime())) {
+    throw new Error("로컬 예약으로 바꿀 시각이 없습니다.");
+  }
+  const db = await getDiscoveryDb();
+  await db.prepare(`
+    UPDATE thread_discoveries
+    SET schedule_delivery = ?, last_error = NULL
+    WHERE canonical_url = ? AND status = 'scheduled'
+  `).run(SCHEDULE_DELIVERY_LOCAL_POST, url);
+  const existing = findCompletedMirror(url);
+  recordCompletedMirror({
+    canonicalUrl: url,
+    status: "scheduled",
+    scheduledAt: scheduledAt.toISOString(),
+    postUrl: existing?.postUrl || null,
+    mediaCount: Number(row.mediaCount || existing?.mediaCount || 0),
+    scheduleDelivery: SCHEDULE_DELIVERY_LOCAL_POST,
+  });
+  recordScheduleSlot(scheduledAt, {
+    canonicalUrl: url,
+    state: "verified",
+    source: "converted_from_x_native",
+    scheduleDelivery: SCHEDULE_DELIVERY_LOCAL_POST,
+  });
+}
+
+async function convertLoadedXNativeScheduledRowToLocal(page, row) {
+  if (!shouldConvertScheduledRowToLocal(row)) {
+    return {
+      canonicalUrl: row.canonicalUrl,
+      skipped: true,
+      reason: isLocalScheduleDelivery(row) ? "already_local" : "not_convertible",
+    };
+  }
+  const verification = await deleteXScheduledEntry(page, row.scheduledAt, discoveryScheduleCancelMatchOptions(row));
+  await markDiscoveryScheduleDeliveryLocal(row);
+  logEvent("discovery_schedule_converted_to_local", {
+    canonicalUrl: row.canonicalUrl,
+    scheduledAt: row.scheduledAt.toISOString(),
+    ...verification,
+  });
+  return {
+    canonicalUrl: row.canonicalUrl,
+    scheduledAt: row.scheduledAt.toISOString(),
+    scheduleDelivery: SCHEDULE_DELIVERY_LOCAL_POST,
+    skipped: false,
+    ...verification,
+  };
+}
+
+async function listConvertibleXNativeScheduledRows(nowMs = Date.now()) {
+  const db = await getDiscoveryDb();
+  const rows = await db.prepare(`
+    SELECT canonical_url AS canonicalUrl, status, scheduled_post_at AS scheduledPostAt,
+      media_count AS mediaCount, text_preview AS textPreview,
+      COALESCE(schedule_delivery, 'x_native') AS scheduleDelivery
+    FROM thread_discoveries
+    WHERE status = 'scheduled'
+      AND scheduled_post_at IS NOT NULL
+      AND scheduled_post_at > ?
+      AND COALESCE(schedule_delivery, 'x_native') != 'local_post'
+    ORDER BY scheduled_post_at ASC
+    LIMIT 50
+  `).all(new Date(nowMs).toISOString());
+  return (rows || [])
+    .map((row) => ({ ...row, scheduledAt: new Date(row.scheduledPostAt) }))
+    .filter((row) => shouldConvertScheduledRowToLocal(row, nowMs));
+}
+
+async function convertScheduledDiscoveryRowsToLocal(urls = []) {
+  const uniqueUrls = normalizeDiscoveryScheduleCancelBatchUrls(urls);
+  const failed = [];
+  const skipped = [];
+  let rows = [];
+  if (uniqueUrls.length) {
+    if (uniqueUrls.length > 50) throw new Error("한 번에 로컬 예약으로 바꿀 수 있는 항목은 50개입니다.");
+    for (const url of uniqueUrls) {
+      try {
+        rows.push(await loadCancellableScheduledDiscoveryRow(url));
+      } catch (error) {
+        failed.push({ canonicalUrl: url, error: error.message });
+      }
+    }
+  } else {
+    rows = await listConvertibleXNativeScheduledRows();
+  }
+  const xRows = [];
+  for (const row of rows) {
+    if (isLocalScheduleDelivery(row)) {
+      skipped.push({ canonicalUrl: row.canonicalUrl, reason: "already_local" });
+    } else {
+      xRows.push(row);
+    }
+  }
+  const converted = [];
+  if (xRows.length) {
+    await withMirrorChromeLock("dashboard_schedule_convert_local", async () => {
+      const page = await newPage(`https://x.com/${REQUIRED_X_HANDLE}`);
+      try {
+        await verifyXAccount(page);
+        for (const row of xRows) {
+          try {
+            const result = await convertLoadedXNativeScheduledRowToLocal(page, row);
+            if (result.skipped) skipped.push(result);
+            else converted.push(result);
+          } catch (error) {
+            failed.push({
+              canonicalUrl: row.canonicalUrl,
+              scheduledAt: row.scheduledPostAt || (row.scheduledAt instanceof Date ? row.scheduledAt.toISOString() : null),
+              error: error.message,
+            });
+            logEvent("discovery_schedule_convert_local_item_error", {
+              canonicalUrl: row.canonicalUrl,
+              error: error.message,
+            });
+          }
+        }
+      } finally {
+        await page.close();
+        logEvent("x_tab_closed", { source: "dashboard_schedule_convert_local" });
+      }
+    });
+  }
+  logEvent("discovery_schedule_convert_local_done", {
+    requestedCount: uniqueUrls.length || xRows.length,
+    convertedCount: converted.length,
+    skippedCount: skipped.length,
+    failedCount: failed.length,
+  });
+  return {
+    converted,
+    skipped,
+    failed,
+    convertedCount: converted.length,
+    skippedCount: skipped.length,
+    failedCount: failed.length,
+  };
+}
+
+async function cancelDiscoveryScheduledPost(canonicalUrl) {
+  const row = await loadCancellableScheduledDiscoveryRow(canonicalUrl);
+  if (isLocalScheduleDelivery(row)) {
+    return cancelLocalScheduledDiscoveryRow(row);
+  }
+  const db = await getDiscoveryDb();
+  await db.prepare(`
+    UPDATE thread_discoveries
+    SET status = 'cancelling_schedule', last_error = NULL
+    WHERE canonical_url = ? AND status = 'scheduled'
+  `).run(row.canonicalUrl);
+  try {
     const verification = await withMirrorChromeLock("dashboard_schedule_cancel", async () => {
       const page = await newPage(`https://x.com/${REQUIRED_X_HANDLE}`);
       try {
         await verifyXAccount(page);
-        return await deleteXScheduledEntry(page, scheduledAt, {
-          textPreview: isDiscoveryPlaceholderText(row.textPreview) ? "" : row.textPreview,
-          mediaCount: Number(row.mediaCount || 0),
-        });
+        return await deleteXScheduledEntry(page, row.scheduledAt, discoveryScheduleCancelMatchOptions(row));
       } finally {
         await page.close();
         logEvent("x_tab_closed", { source: "dashboard_schedule_cancel" });
       }
     });
-    await db.prepare(`
-      UPDATE thread_discoveries
-      SET status = 'review', scheduled_post_at = NULL, posted_at = NULL, last_error = NULL
-      WHERE canonical_url = ? AND status = 'cancelling_schedule'
-    `).run(url);
-    removeCompletedMirror(url);
-    removeScheduleSlot(scheduledAt, url);
-    removeScheduledReplyItem(url);
-    logEvent("discovery_schedule_cancelled", {
-      canonicalUrl: url,
-      scheduledAt: scheduledAt.toISOString(),
-      ...verification,
-    });
-    return {
-      canonicalUrl: url,
-      scheduledAt: scheduledAt.toISOString(),
-      status: "review",
-      ...verification,
-    };
+    return await completeDiscoveryScheduleCancellation(row, verification);
   } catch (error) {
-    await db.prepare(`
-      UPDATE thread_discoveries
-      SET status = 'scheduled', last_error = ?
-      WHERE canonical_url = ? AND status = 'cancelling_schedule'
-    `).run(`예약 취소 실패: ${error.message}`, url);
+    await failDiscoveryScheduleCancellation(row.canonicalUrl, error);
     throw error;
   }
+}
+
+async function cancelDiscoveryScheduledPostsBatch(urls = []) {
+  const uniqueUrls = normalizeDiscoveryScheduleCancelBatchUrls(urls);
+  if (!uniqueUrls.length) throw new Error("취소할 예약 URL이 없습니다.");
+  if (uniqueUrls.length > 50) throw new Error("한 번에 예약 취소할 수 있는 항목은 50개입니다.");
+  const failed = [];
+  const rows = [];
+  for (const url of uniqueUrls) {
+    try {
+      rows.push(await loadCancellableScheduledDiscoveryRow(url));
+    } catch (error) {
+      failed.push({ canonicalUrl: url, error: error.message });
+    }
+  }
+  if (!rows.length) {
+    return {
+      cancelled: [],
+      failed,
+      cancelledCount: 0,
+      failedCount: failed.length,
+    };
+  }
+  const cancelled = [];
+  const localRows = rows.filter((row) => isLocalScheduleDelivery(row));
+  const xRows = rows.filter((row) => !isLocalScheduleDelivery(row));
+  for (const row of localRows) {
+    try {
+      cancelled.push(await cancelLocalScheduledDiscoveryRow(row));
+    } catch (error) {
+      failed.push({ canonicalUrl: row.canonicalUrl, error: error.message });
+      logEvent("discovery_schedule_cancel_batch_item_error", {
+        canonicalUrl: row.canonicalUrl,
+        error: error.message,
+        scheduleDelivery: SCHEDULE_DELIVERY_LOCAL_POST,
+      });
+    }
+  }
+  if (xRows.length) {
+    await withMirrorChromeLock("dashboard_schedule_cancel_batch", async () => {
+      const page = await newPage(`https://x.com/${REQUIRED_X_HANDLE}`);
+      try {
+        await verifyXAccount(page);
+        for (const row of xRows) {
+          try {
+            cancelled.push(await cancelLoadedScheduledDiscoveryRowOnPage(page, row));
+          } catch (error) {
+            failed.push({ canonicalUrl: row.canonicalUrl, error: error.message });
+            logEvent("discovery_schedule_cancel_batch_item_error", {
+              canonicalUrl: row.canonicalUrl,
+              error: error.message,
+            });
+          }
+        }
+      } finally {
+        await page.close();
+        logEvent("x_tab_closed", { source: "dashboard_schedule_cancel_batch" });
+      }
+    });
+  }
+  logEvent("discovery_schedule_cancel_batch_done", {
+    requestedCount: uniqueUrls.length,
+    cancelledCount: cancelled.length,
+    failedCount: failed.length,
+  });
+  return {
+    cancelled,
+    failed,
+    cancelledCount: cancelled.length,
+    failedCount: failed.length,
+  };
 }
 
 async function confirmDiscoveryScheduledPostDeletedOnX(canonicalUrl) {
@@ -19262,20 +21355,17 @@ async function confirmDiscoveryScheduledPostDeletedOnX(canonicalUrl) {
     FROM thread_discoveries
     WHERE canonical_url = ?
   `).get(url);
-  const alreadyConfirmed = row?.status === "skipped" && row?.lastError === "user_deleted_on_x";
-  if (!row || (!alreadyConfirmed && !["scheduled", "cancelling_schedule"].includes(row.status))) {
+  if (!row || !["scheduled", "cancelling_schedule", "skipped"].includes(row.status)) {
     throw new Error("X 삭제를 확정할 예약 항목을 찾지 못했습니다.");
   }
   const cancelledAt = new Date().toISOString();
-  if (!alreadyConfirmed) {
-    await db.prepare(`
-      UPDATE thread_discoveries
-      SET status = 'skipped', scheduled_post_at = NULL, posted_at = NULL,
-          last_error = 'user_deleted_on_x', discovered_at = CURRENT_TIMESTAMP
-      WHERE canonical_url = ? AND status IN ('scheduled', 'cancelling_schedule')
-    `).run(url);
-    recordUserDeletedScheduledMirror(url, cancelledAt);
-  }
+  await db.prepare(`
+    UPDATE thread_discoveries
+    SET status = 'review', scheduled_post_at = NULL, posted_at = NULL,
+        last_error = NULL, discovered_at = CURRENT_TIMESTAMP, schedule_delivery = 'x_native'
+    WHERE canonical_url = ? AND status IN ('scheduled', 'cancelling_schedule', 'skipped')
+  `).run(url);
+  removeCompletedMirror(url);
   removeScheduleSlotsForCanonicalUrl(url);
   removeScheduledReplyItem(url);
   logEvent("discovery_schedule_user_deleted_on_x", {
@@ -19286,13 +21376,38 @@ async function confirmDiscoveryScheduledPostDeletedOnX(canonicalUrl) {
   return {
     canonicalUrl: url,
     previousScheduledAt: row.scheduledPostAt || null,
-    status: "skipped",
+    status: "review",
     cancelledAt,
     cancelledReason: "user_deleted_on_x",
   };
 }
 
+async function discardDiscoveryRowForMediaExtractFailure(canonicalUrl, error) {
+  const url = normalizeDiscoveryUrl(canonicalUrl);
+  const reason = `discarded_media_extract_failed:${String(error?.message || error || "").slice(0, 180)}`;
+  const db = await getDiscoveryDb();
+  const result = await db.prepare(`
+    UPDATE thread_discoveries
+    SET status = 'skipped',
+        last_error = ?,
+        scheduled_post_at = NULL,
+        discovered_at = CURRENT_TIMESTAMP
+    WHERE canonical_url = ? AND status != 'skipped'
+  `).run(reason, url);
+  removeScheduleSlotsForCanonicalUrl(url);
+  cleanupDiscoveryMediaSnapshot(url, { reason: "media_extract_failed" });
+  logEvent("discovery_row_discarded_media_extract_failed", {
+    canonicalUrl: url,
+    discarded: result.changes || 0,
+    error: String(error?.message || error || "").slice(0, 240),
+  });
+  return { canonicalUrl: url, discarded: result.changes || 0, reason };
+}
+
 async function markDiscoveryScheduleFailed(canonicalUrl, error) {
+  if (isDiscoveryMediaExtractFailure(error)) {
+    return discardDiscoveryRowForMediaExtractFailure(canonicalUrl, error);
+  }
   const db = await getDiscoveryDb();
   const message = error.message || String(error);
   const failurePreview = discoveryFailurePreviewText(error, "schedule");
@@ -19327,7 +21442,8 @@ async function discardDiscoveryRow(canonicalUrl) {
   const nowMs = Date.now();
   const row = await db.prepare(`
     SELECT canonical_url AS canonicalUrl, status,
-      scheduled_post_at AS scheduledPostAt, posted_at AS postedAt
+      scheduled_post_at AS scheduledPostAt, posted_at AS postedAt,
+      COALESCE(schedule_delivery, 'x_native') AS scheduleDelivery
     FROM thread_discoveries
     WHERE canonical_url = ?
   `).get(url);
@@ -19346,6 +21462,7 @@ async function discardDiscoveryRow(canonicalUrl) {
 
   const discardableReviewStatuses = new Set([
     "review",
+    DISCOVERY_APPROVED_STATUS,
     "draft",
     "failed",
     "failed_post",
@@ -19414,6 +21531,469 @@ async function updateDiscoveryTitle(canonicalUrl, text) {
   }
   logEvent("discovery_title_updated", { canonicalUrl, length: title.length });
   return { canonicalUrl, text: title };
+}
+
+const discoveryTitleRefineJobs = new Map();
+const DISCOVERY_TITLE_REFINE_STATUSES = ["review", "discovered"];
+
+async function markDiscoveryTitleRefine(db, canonicalUrl, titleRefine) {
+  const row = await db.prepare(`SELECT criteria FROM thread_discoveries WHERE canonical_url = ?`).get(canonicalUrl);
+  if (!row) return;
+  let criteria = {};
+  try { criteria = JSON.parse(row.criteria || "{}") || {}; } catch {}
+  criteria.titleRefine = titleRefine;
+  await db.prepare(`UPDATE thread_discoveries SET criteria = ? WHERE canonical_url = ?`).run(JSON.stringify(criteria), canonicalUrl);
+}
+
+function runFfmpegFrameExtract(ffmpegBin, videoPath, outPath, seekSeconds) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      ffmpegBin,
+      ["-y", "-ss", String(Math.max(0, Number(seekSeconds) || 0)), "-i", videoPath, "-frames:v", "1", "-q:v", "3", outPath],
+      { timeout: 30_000, maxBuffer: 2 * 1024 * 1024 },
+      (error, _stdout, stderr) => {
+        if (error) {
+          error.message = [error.message, stderr].filter(Boolean).join("\n");
+          reject(error);
+          return;
+        }
+        resolve(outPath);
+      },
+    );
+  });
+}
+
+async function extractDiscoveryTitleRefineFrames(mediaFiles, framesDir, options = {}) {
+  fs.mkdirSync(framesDir, { recursive: true });
+  const frames = [];
+  const ffmpegBin = options.ffmpegBin || resolveHomebrewTool("ffmpeg", { pathEnv: process.env.PATH });
+  const videos = (mediaFiles || []).filter((file) => /\.(mp4|mov|webm)$/i.test(file) && fs.existsSync(file));
+  const images = (mediaFiles || []).filter((file) => /\.(jpe?g|png|webp|gif)$/i.test(file) && fs.existsSync(file));
+  for (const image of images.slice(0, 3)) {
+    const dest = path.join(framesDir, `image-${frames.length + 1}${path.extname(image) || ".jpg"}`);
+    fs.copyFileSync(image, dest);
+    frames.push(dest);
+    if (frames.length >= 3) return frames;
+  }
+  for (const video of videos.slice(0, 1)) {
+    let duration = 8;
+    try {
+      duration = await new Promise((resolve) => {
+        execFile(
+          resolveHomebrewTool("ffprobe", { pathEnv: process.env.PATH }) || "ffprobe",
+          ["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", video],
+          { timeout: 15_000 },
+          (error, stdout) => {
+            const value = Number(String(stdout || "").trim());
+            resolve(error || !Number.isFinite(value) || value <= 0 ? 8 : value);
+          },
+        );
+      });
+    } catch {
+      duration = 8;
+    }
+    const seeks = [
+      Math.min(1, Math.max(0.2, duration * 0.08)),
+      Math.max(0.5, duration * 0.4),
+      Math.max(1, duration * 0.72),
+    ];
+    for (const seek of seeks) {
+      if (frames.length >= 3) break;
+      const outPath = path.join(framesDir, `frame-${frames.length + 1}.jpg`);
+      try {
+        await runFfmpegFrameExtract(ffmpegBin || "ffmpeg", video, outPath, seek);
+        if (fs.existsSync(outPath) && fs.statSync(outPath).size > 1000) frames.push(outPath);
+      } catch (error) {
+        logEvent("discovery_title_refine_frame_error", { video: path.basename(video), seek, error: error.message });
+      }
+    }
+  }
+  return frames;
+}
+
+async function prepareDiscoveryTitleRefineMedia(canonicalUrl, row, criteria = {}, runDir) {
+  let snapshot = loadDiscoveryMediaSnapshot(canonicalUrl);
+  if (!snapshot?.files?.length) {
+    const mediaUrls = unique([
+      row.mediaPreviewUrl,
+      criteria.mediaThumbnailUrl,
+      ...(Array.isArray(criteria.mediaUrls) ? criteria.mediaUrls : []),
+    ].filter(Boolean)).slice(0, MAX_MEDIA);
+    if (mediaUrls.length) {
+      try {
+        snapshot = await saveDiscoveryMediaSnapshot(canonicalUrl, {
+          text: row.textPreview,
+          mediaUrls,
+          videoMediaUrls: mediaUrls.filter((url) => isVideoMediaUrl(url)),
+          imageMediaUrls: mediaUrls.filter((url) => !isVideoMediaUrl(url)),
+        });
+      } catch (error) {
+        logEvent("discovery_title_refine_media_save_error", { canonicalUrl, error: error.message });
+      }
+    }
+  }
+  const mediaFiles = snapshot?.files?.length ? snapshot.files : [];
+  if (!mediaFiles.length) return { frames: [], mediaFileCount: 0 };
+  const framesDir = path.join(runDir, "frames");
+  const frames = await extractDiscoveryTitleRefineFrames(mediaFiles, framesDir);
+  return { frames, mediaFileCount: mediaFiles.length, snapshotDir: snapshot?.dir || null };
+}
+
+/**
+ * 대시보드에 저장된 글 제목(text_preview)을 Gemini Web 헤드리스로 1회 다듬는다.
+ * fail-closed: 검증을 통과한 재작성만 적용하고, 사용자가 이미 제목을 고쳤거나
+ * 행 상태가 review를 벗어났으면 건드리지 않는다.
+ * 외국어·감정만 있는 캡션은 영상 프레임을 같이 보고 장면을 쓴다.
+ */
+async function refineDiscoveryTitleOnce(canonicalUrl, originalTitle, options = {}) {
+  const original = String(originalTitle || "").trim();
+  const db = await getDiscoveryDb();
+  const row = await db.prepare(`
+    SELECT status, text_preview AS textPreview, media_preview_url AS mediaPreviewUrl, criteria
+    FROM thread_discoveries WHERE canonical_url = ?
+  `).get(canonicalUrl);
+  if (!row) return { applied: false, reason: "row_missing" };
+  if (isPersonalDiscoveryCaption(original) || isPersonalDiscoveryCaption(row.textPreview)) {
+    return { applied: false, reason: "personal_commentary" };
+  }
+  let criteria = {};
+  try { criteria = JSON.parse(row.criteria || "{}") || {}; } catch {}
+  const priorRefine = criteria.titleRefine && typeof criteria.titleRefine === "object" ? criteria.titleRefine : null;
+  const voiceCurrent = priorRefine?.voice === DISCOVERY_TITLE_VOICE && priorRefine?.applied === true;
+  if (voiceCurrent && !options.force) return { applied: false, reason: "already_refined" };
+  if (!DISCOVERY_TITLE_REFINE_STATUSES.includes(row.status)) return { applied: false, reason: `status_${row.status}` };
+  const currentTitle = String(row.textPreview || "").trim();
+  const sourceTitle = String(priorRefine?.from || original || currentTitle).trim();
+  const userEdited = priorRefine?.applied === true
+    && priorRefine.to
+    && currentTitle !== priorRefine.to
+    && currentTitle !== priorRefine.from
+    && currentTitle !== original;
+  if (userEdited) return { applied: false, reason: "title_changed_by_user" };
+  if (!options.force && !priorRefine && currentTitle !== original) return { applied: false, reason: "title_changed_by_user" };
+
+  // Prefer the shared logged-in Gemini review browser. The old title-refine-1
+  // clone often sits logged-out, which disables image upload.
+  const chromePort = Number(options.chromePort || TERAFABX_GEMINI_CHROME_PORT);
+  const profileDir = options.profileDir || TERAFABX_GEMINI_PROFILE_DIR;
+  const runId = `discovery-title-refine-${new Date().toISOString().replace(/[:.]/g, "-")}-${crypto.randomBytes(3).toString("hex")}`;
+  const runDir = path.join(TERAFABX_GEMINI_REVIEW_DIR, runId);
+  fs.mkdirSync(runDir, { recursive: true });
+  const mediaPrep = await prepareDiscoveryTitleRefineMedia(canonicalUrl, row, criteria, runDir);
+  const framePaths = mediaPrep.frames || [];
+  const hasMediaFrames = framePaths.length > 0;
+  if (isVagueDiscoveryCaption(sourceTitle) && !hasMediaFrames) {
+    const marker = {
+      at: new Date().toISOString(),
+      from: sourceTitle.slice(0, 240),
+      voice: DISCOVERY_TITLE_VOICE,
+      applied: false,
+      reason: "needs_media_context",
+    };
+    await markDiscoveryTitleRefine(db, canonicalUrl, marker);
+    logEvent("discovery_title_refine_skipped", { canonicalUrl, reason: "needs_media_context", length: sourceTitle.length });
+    return { applied: false, reason: "needs_media_context" };
+  }
+  const promptPath = path.join(runDir, "prompt.md");
+  const outPath = path.join(runDir, "out.txt");
+  fs.writeFileSync(promptPath, buildDiscoveryTitleRefinePrompt(sourceTitle, {
+    retry: options.retry === true,
+    hasMediaFrames,
+  }));
+  logEvent("discovery_title_refine_start", {
+    canonicalUrl,
+    length: sourceTitle.length,
+    port: chromePort,
+    runDir,
+    retry: options.retry === true,
+    frameCount: framePaths.length,
+    vagueCaption: isVagueDiscoveryCaption(sourceTitle),
+  });
+  const scriptPath = resolveTerafabxGeminiScriptPath();
+  if (!fs.existsSync(scriptPath)) throw new Error(`Gemini Web 스크립트가 없습니다: ${scriptPath}`);
+  await ensureTerafabxGeminiHeadlessBrowser({ port: chromePort, profileDir });
+  const geminiArgs = ["--prompt", promptPath, "--out", outPath, "--cdp", `http://127.0.0.1:${chromePort}`, "--min-length", "6"];
+  for (const framePath of framePaths) {
+    geminiArgs.push("--image", framePath);
+  }
+  const result = await runTerafabxGeminiScript(
+    scriptPath,
+    geminiArgs,
+    {
+      cwd: terafabxGeminiScriptCwd(scriptPath),
+      timeoutMs: DISCOVERY_TITLE_REFINE_TIMEOUT_MS,
+      chromePort,
+      profileDir,
+      priority: "normal",
+      label: `discovery-title-refine:${canonicalUrl.slice(-24)}`,
+    },
+  );
+  if (result.code !== 0) throw new Error(result.stderr || result.stdout || "Gemini 제목 다듬기 실행 실패");
+  if (!fs.existsSync(outPath)) throw new Error("Gemini 제목 다듬기 출력 파일이 없습니다.");
+  const refined = sanitizeRefinedDiscoveryTitle(parseRefinedDiscoveryTitle(fs.readFileSync(outPath, "utf8")));
+  const verdict = validateRefinedDiscoveryTitle(refined, sourceTitle, { hasMediaFrames });
+  const marker = {
+    at: new Date().toISOString(),
+    from: sourceTitle.slice(0, 240),
+    voice: DISCOVERY_TITLE_VOICE,
+    frameCount: framePaths.length,
+  };
+  if (!verdict.ok && verdict.reason === "unchanged" && options.retry !== true) {
+    return refineDiscoveryTitleOnce(canonicalUrl, sourceTitle, { ...options, retry: true, force: true });
+  }
+  if (!verdict.ok) {
+    await markDiscoveryTitleRefine(db, canonicalUrl, { ...marker, applied: false, reason: verdict.reason });
+    logEvent("discovery_title_refine_skipped", { canonicalUrl, reason: verdict.reason, refinedPreview: String(refined || "").slice(0, 120) });
+    return { applied: false, reason: verdict.reason, refined };
+  }
+  const updated = await db.prepare(`
+    UPDATE thread_discoveries
+    SET text_preview = ?, last_error = NULL
+    WHERE canonical_url = ? AND text_preview = ? AND status IN (${DISCOVERY_TITLE_REFINE_STATUSES.map(() => "?").join(", ")})
+  `).run(refined, canonicalUrl, currentTitle, ...DISCOVERY_TITLE_REFINE_STATUSES);
+  if (!updated.changes) {
+    await markDiscoveryTitleRefine(db, canonicalUrl, { ...marker, applied: false, reason: "row_changed_during_refine" });
+    logEvent("discovery_title_refine_skipped", { canonicalUrl, reason: "row_changed_during_refine" });
+    return { applied: false, reason: "row_changed_during_refine", refined };
+  }
+  await markDiscoveryTitleRefine(db, canonicalUrl, { ...marker, applied: true, to: refined });
+  logEvent("discovery_title_refined", {
+    canonicalUrl,
+    fromLength: sourceTitle.length,
+    toLength: refined.length,
+    fromPreview: original.slice(0, 120),
+    toPreview: refined.slice(0, 120),
+    frameCount: framePaths.length,
+  });
+  return { applied: true, refined, frameCount: framePaths.length };
+}
+
+async function backfillDiscoveryTitleVoiceRewrites({ limit = 24 } = {}) {
+  const db = await getDiscoveryDb();
+  const rows = await db.prepare(`
+    SELECT canonical_url AS canonicalUrl, text_preview AS textPreview, criteria
+    FROM thread_discoveries
+    WHERE status = 'review'
+    ORDER BY discovered_at DESC
+    LIMIT ?
+  `).all(Math.max(1, Number(limit || 24)));
+  let queued = 0;
+  for (const row of rows || []) {
+    let criteria = {};
+    try { criteria = JSON.parse(row.criteria || "{}") || {}; } catch {}
+    if (criteria.titleRefine?.voice === DISCOVERY_TITLE_VOICE && criteria.titleRefine?.applied === true) continue;
+    const source = String(criteria.titleRefine?.from || row.textPreview || "").trim();
+    if (!source || isPersonalDiscoveryCaption(source) || isDiscoveryFailureLabel(source) || isDiscoveryPlaceholderText(source)) continue;
+    if (queueDiscoveryTitleRefine(row.canonicalUrl, source, { force: true })) queued += 1;
+  }
+  logEvent("discovery_title_voice_backfill_queued", { queued, scanned: (rows || []).length, voice: DISCOVERY_TITLE_VOICE });
+  return { queued, scanned: (rows || []).length };
+}
+
+function queueDiscoveryTitleRefine(canonicalUrl, originalTitle, options = {}) {
+  const title = String(originalTitle || "").trim();
+  if (!title || title === "(본문 없음)") return null;
+  if (isPersonalDiscoveryCaption(title)) return null;
+  if (isDiscoveryFailureLabel(title) || isDiscoveryPlaceholderText(title)) return null;
+  if (discoveryTitleRefineJobs.has(canonicalUrl)) return discoveryTitleRefineJobs.get(canonicalUrl);
+  const job = (async () => {
+    try {
+      return await refineDiscoveryTitleOnce(canonicalUrl, title, options);
+    } catch (error) {
+      logEvent("discovery_title_refine_error", { canonicalUrl, error: error.message });
+      return { applied: false, reason: "error", error: error.message };
+    } finally {
+      discoveryTitleRefineJobs.delete(canonicalUrl);
+    }
+  })();
+  discoveryTitleRefineJobs.set(canonicalUrl, job);
+  return job;
+}
+
+const discoveryGroupClassifyJobs = new Map();
+let discoveryGroupClassifyChain = Promise.resolve();
+
+async function classifyDiscoveryCandidateGroup(canonicalUrl, options = {}) {
+  const row = await getDiscoveryRow(canonicalUrl);
+  if (!row) return { ok: false, reason: "row_missing" };
+  const criteria = parseDiscoveryCriteria(row.criteria);
+  if (criteria.candidateGroup?.classifier === "manual" && !options.force) {
+    return { ok: false, reason: "manual_classifier" };
+  }
+  if (!["review", "discovered"].includes(row.status)) {
+    return { ok: false, reason: `status_${row.status}` };
+  }
+
+  const rulesResult = classifyDiscoveryGroupByRules({
+    likeCount: row.likeCount,
+    mediaCount: row.mediaCount,
+    criteria: row.criteria,
+    textPreview: row.textPreview,
+  });
+
+  let finalGroup = rulesResult.group;
+  let classifier = "rules";
+  let topic = null;
+  const reasons = [...(rulesResult.reasons || [])];
+  const settings = getGroupApprovalSettings();
+  const shouldTryGemini = settings.geminiAssistEnabled
+    && options.skipGemini !== true
+    && rulesResult.borderline === true;
+
+  if (shouldTryGemini) {
+    try {
+      const chromePort = Number(options.chromePort || DISCOVERY_GROUP_CLASSIFY_GEMINI_PORT);
+      const profileDir = options.profileDir || `${TERAFABX_GEMINI_PROFILE_DIR}-group-classify-1`;
+      const runId = `discovery-group-classify-${new Date().toISOString().replace(/[:.]/g, "-")}-${crypto.randomBytes(3).toString("hex")}`;
+      const runDir = path.join(TERAFABX_GEMINI_REVIEW_DIR, runId);
+      fs.mkdirSync(runDir, { recursive: true });
+      const promptPath = path.join(runDir, "prompt.md");
+      const outPath = path.join(runDir, "out.txt");
+      fs.writeFileSync(promptPath, buildGroupClassifierPrompt(row, rulesResult));
+      const scriptPath = resolveTerafabxGeminiScriptPath();
+      if (!fs.existsSync(scriptPath)) throw new Error(`Gemini Web 스크립트가 없습니다: ${scriptPath}`);
+      await ensureTerafabxGeminiHeadlessBrowser({ port: chromePort, profileDir });
+      const result = await runTerafabxGeminiScript(
+        scriptPath,
+        ["--prompt", promptPath, "--out", outPath, "--cdp", `http://127.0.0.1:${chromePort}`, "--min-length", "6"],
+        {
+          cwd: terafabxGeminiScriptCwd(scriptPath),
+          timeoutMs: DISCOVERY_GROUP_CLASSIFY_TIMEOUT_MS,
+          chromePort,
+          profileDir,
+          priority: "low",
+          label: `discovery-group-classify:${canonicalUrl.slice(-24)}`,
+        },
+      );
+      if (result.code !== 0) throw new Error(result.stderr || result.stdout || "Gemini 그룹 분류 실행 실패");
+      if (!fs.existsSync(outPath)) throw new Error("Gemini 그룹 분류 출력 파일이 없습니다.");
+      const parsed = parseGroupClassification(fs.readFileSync(outPath, "utf8"));
+      const validated = validateGroupClassification(parsed, rulesResult);
+      if (validated.ok) {
+        finalGroup = validated.group;
+        topic = validated.topic;
+        classifier = "rules+gemini";
+      }
+    } catch {
+      reasons.push("gemini_unavailable");
+    }
+  }
+
+  const candidateGroup = {
+    group: finalGroup,
+    score: rulesResult.score,
+    reasons,
+    topic,
+    classifier,
+    version: GROUP_CLASSIFIER_VERSION,
+    classifiedAt: new Date().toISOString(),
+  };
+  await markDiscoveryCandidateGroup(canonicalUrl, {
+    group: finalGroup,
+    criteriaPatch: { candidateGroup },
+    force: options.force === true,
+  });
+  logEvent("discovery_group_classified", {
+    canonicalUrl,
+    group: finalGroup,
+    classifier,
+    score: rulesResult.score,
+    reasons,
+    topic,
+  });
+  const standing = await maybeStandingApproveDiscoveryRow(canonicalUrl, finalGroup);
+  return { ok: true, group: finalGroup, classifier, score: rulesResult.score, reasons, topic, standing };
+}
+
+function queueDiscoveryGroupClassify(canonicalUrl, options = {}) {
+  const url = String(canonicalUrl || "").trim();
+  if (!url) return null;
+  if (discoveryGroupClassifyJobs.has(url)) return discoveryGroupClassifyJobs.get(url);
+  const job = discoveryGroupClassifyChain.then(async () => {
+    try {
+      return await classifyDiscoveryCandidateGroup(url, options);
+    } catch (error) {
+      logEvent("discovery_group_classify_error", { canonicalUrl: url, error: error.message });
+      return { ok: false, reason: "error", error: error.message };
+    } finally {
+      discoveryGroupClassifyJobs.delete(url);
+    }
+  });
+  discoveryGroupClassifyChain = job.catch(() => {});
+  discoveryGroupClassifyJobs.set(url, job);
+  return job;
+}
+
+async function pruneDiscoveryReviewOutsideVideoStyle() {
+  const db = await getDiscoveryDb();
+  const rows = await db.prepare(`
+    SELECT canonical_url AS canonicalUrl, text_preview AS textPreview,
+      media_preview_url AS mediaPreviewUrl, criteria, media_count AS mediaCount,
+      like_count AS likeCount
+    FROM thread_discoveries
+    WHERE status = 'review'
+  `).all();
+  let kept = 0;
+  let hidden = 0;
+  for (const row of rows || []) {
+    const criteria = parseDiscoveryCriteria(row.criteria);
+    const engagement = discoveryEngagementCount({
+      likeCount: row.likeCount,
+      viewCount: criteria.viewCount ?? criteria.terafabxStyle?.viewCount,
+    });
+    let group = classifyDiscoveryGroupByRules({
+      likeCount: row.likeCount,
+      mediaCount: row.mediaCount,
+      criteria,
+      textPreview: row.textPreview,
+      previewUrl: row.mediaPreviewUrl,
+    });
+    if (!isCuteAnimalDiscoveryCaption(row.textPreview)) {
+      group = { group: "C", score: group.score, reasons: ["not_cute_animal"], borderline: false };
+    } else if (engagement < DISCOVERY_MIN_VIEWS) {
+      group = { group: "C", score: group.score, reasons: ["below_view_threshold"], borderline: false };
+    }
+    if (group.group === "C") {
+      await db.prepare(`
+        UPDATE thread_discoveries
+        SET status = 'skipped', last_error = ?, candidate_group = 'C'
+        WHERE canonical_url = ? AND status = 'review'
+      `).run(`filtered_${group.reasons[0] || "not_video_style"}`, row.canonicalUrl);
+      hidden += 1;
+      continue;
+    }
+    await markDiscoveryCandidateGroup(row.canonicalUrl, {
+      group: group.group,
+      criteriaPatch: {
+        candidateGroup: {
+          group: group.group,
+          score: group.score,
+          reasons: group.reasons,
+          topic: null,
+          classifier: "rules",
+          version: GROUP_CLASSIFIER_VERSION,
+        },
+      },
+    });
+    kept += 1;
+  }
+  logEvent("discovery_review_style_pruned", { kept, hidden });
+  return { kept, hidden };
+}
+
+async function backfillDiscoveryCandidateGroups({ batchSize = 50 } = {}) {
+  const db = await getDiscoveryDb();
+  const rows = await db.prepare(`
+    SELECT canonical_url AS canonicalUrl
+    FROM thread_discoveries
+    WHERE status IN ('review', 'discovered') AND candidate_group IS NULL
+    ORDER BY discovered_at ASC
+    LIMIT ?
+  `).all(Math.max(1, Number(batchSize || 50)));
+  for (const row of rows || []) {
+    await classifyDiscoveryCandidateGroup(row.canonicalUrl, { skipGemini: true });
+  }
+  return { processed: (rows || []).length };
 }
 
 async function refreshDiscoveryPreviews(limit = 20) {
@@ -19555,13 +22135,10 @@ async function renderDiscoveryDashboard(requestUrl = "/discovery") {
   const dashboardRows = enrichDiscoveryRowsWithReplyCompletion(
     allRows.map((row) => dashboardDiscoveryRow(row, nowMs)),
   );
-  const discoveredStatuses = new Set(["review", "draft", "queued_schedule", "scheduling", "failed", "failed_post", "failed_draft", "failed_schedule"]);
+  const discoveredStatuses = new Set(["review", DISCOVERY_APPROVED_STATUS, "draft", "queued_schedule", "scheduling", "failed", "failed_post", "failed_draft", "failed_schedule"]);
   const viewRows = {
     discovered: dashboardRows.filter((row) => discoveredStatuses.has(row.status)),
-    scheduled: dashboardRows.filter((row) => {
-      const time = new Date(row.scheduledPostAt || 0).getTime();
-      return row.status === "scheduled" && Number.isFinite(time) && time > nowMs;
-    }),
+    scheduled: dashboardRows.filter((row) => row.status === "scheduled"),
     posted: dashboardRows.filter((row) => row.status === "posted"),
   };
   const rows = (viewRows[activeView] || viewRows.discovered).sort((a, b) => {
@@ -21086,10 +23663,14 @@ async function loadDiscoveryDashboardDetails(activeView, allRows, nowMs, depende
 async function getDiscoveryDashboardData(requestUrl = "/api/discovery/dashboard") {
   const parsedUrl = new URL(requestUrl, "http://localhost");
   const activeView = parsedUrl.searchParams.get("view") || "discovered";
+  const groupFilter = String(parsedUrl.searchParams.get("group") || "").trim();
   const autoDiscoveryEnabled = isAutoDiscoveryEnabled();
   const autoStyleScheduleEnabled = isAutoStyleScheduleEnabled();
   const nowMs = Date.now();
-  const allRows = mergeDiscoveryRowsWithMirrorHistory(await listDiscoveryRows(300), nowMs);
+  const allRows = mergeStoryDashboardRows(
+    mergeDiscoveryRowsWithMirrorHistory(await listDiscoveryRows(300), nowMs),
+    storyLocalQueue.read().items, __dirname,
+  );
   const requestedTimelineDate = String(parsedUrl.searchParams.get("date") || "").trim();
   const timelineDate = requestedTimelineDate === "all" || /^\d{4}-\d{2}-\d{2}$/.test(requestedTimelineDate)
     ? requestedTimelineDate
@@ -21102,16 +23683,16 @@ async function getDiscoveryDashboardData(requestUrl = "/api/discovery/dashboard"
   const dashboardRows = enrichDiscoveryRowsWithReplyCompletion(
     allRows.map((row) => dashboardDiscoveryRow(row, nowMs)),
   );
-  const discoveredStatuses = new Set(["review", "draft", "queued_schedule", "scheduling", "failed", "failed_post", "failed_draft", "failed_schedule"]);
+  const discoveredStatuses = new Set(["review", DISCOVERY_APPROVED_STATUS, "draft", "queued_schedule", "scheduling", "failed", "failed_post", "failed_draft", "failed_schedule"]);
   const viewRows = {
     discovered: dashboardRows.filter((row) => discoveredStatuses.has(row.status)),
-    scheduled: dashboardRows.filter((row) => {
-      const time = new Date(row.scheduledPostAt || 0).getTime();
-      return row.status === "scheduled" && Number.isFinite(time) && time > nowMs;
-    }),
+    scheduled: dashboardRows.filter((row) => row.status === "scheduled"),
     posted: dashboardRows.filter((row) => row.status === "posted"),
   };
-  const rows = (viewRows[activeView] || viewRows.discovered).sort((a, b) => {
+  const visibleRows = activeView === "discovered" && ["A", "B", "C"].includes(groupFilter)
+    ? viewRows.discovered.filter((row) => row.candidateGroup === groupFilter)
+    : (viewRows[activeView] || viewRows.discovered);
+  const rows = visibleRows.sort((a, b) => {
     if (activeView === "scheduled") {
       return new Date(a.scheduledPostAt || 0).getTime() - new Date(b.scheduledPostAt || 0).getTime();
     }
@@ -21136,6 +23717,7 @@ async function getDiscoveryDashboardData(requestUrl = "/api/discovery/dashboard"
   return {
     ok: true,
     view: activeView,
+    group: groupFilter || "",
     ...details,
     summary: {
       discoveredCount: viewRows.discovered.length,
@@ -21152,6 +23734,17 @@ async function getDiscoveryDashboardData(requestUrl = "/api/discovery/dashboard"
       failedCount,
       autoDiscoveryEnabled,
       autoStyleScheduleEnabled,
+      scheduleDeliveryMode: getScheduleDeliveryMode(),
+      groupApproval: getGroupApprovalSettings(),
+      groupCounts: {
+        A: viewRows.discovered.filter((row) => row.candidateGroup === "A").length,
+        B: viewRows.discovered.filter((row) => row.candidateGroup === "B").length,
+        C: viewRows.discovered.filter((row) => row.candidateGroup === "C").length,
+        unclassified: viewRows.discovered.filter((row) => !["A", "B", "C"].includes(row.candidateGroup)).length,
+        approved: viewRows.discovered.filter((row) => row.status === DISCOVERY_APPROVED_STATUS).length,
+      },
+      localScheduledCount: viewRows.scheduled.filter((row) => isLocalScheduleDelivery(row)).length,
+      xNativeScheduledCount: viewRows.scheduled.filter((row) => !isLocalScheduleDelivery(row)).length,
       autoStyleScheduleMaxPerScan: DISCOVERY_AUTO_STYLE_SCHEDULE_MAX_PER_SCAN,
       autoStyleMinScore: DISCOVERY_AUTO_STYLE_MIN_SCORE,
       autoStyleMaxFutureHours: DISCOVERY_AUTO_STYLE_MAX_FUTURE_HOURS,
@@ -21169,6 +23762,7 @@ async function getDiscoveryDashboardData(requestUrl = "/api/discovery/dashboard"
         ...row,
         criteria,
         canPost: ["review", "draft", "failed", "failed_post", "failed_draft", "failed_schedule"].includes(row.status),
+        scheduleDelivery: scheduleDeliveryOf(row),
       };
     }),
   };
@@ -21467,49 +24061,145 @@ async function setXSchedule(page, scheduledAt, expectedText = "") {
   logEvent("schedule_set", { scheduledAt: scheduledAt.toISOString() });
 }
 
+function readXComposerState() {
+  const visible = (el) => Boolean(el) && (el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+  const dialogs = Array.from(document.querySelectorAll('[role="dialog"]')).filter(visible);
+  const scope = [...dialogs].reverse().find((dialog) => dialog.querySelector(
+    '[data-testid="tweetTextarea_0"], [data-testid="tweetButton"], [data-testid="tweetButtonInline"]'
+  )) || dialogs[0] || document;
+  const primaryAttachmentNodes = Array.from(scope.querySelectorAll(
+    '[data-testid="attachments"] img, [data-testid="attachments"] video, [data-testid="media"] img, [data-testid="media"] video'
+  )).filter(visible);
+  const fallbackAttachmentNodes = Array.from(scope.querySelectorAll("img, video")).filter((node) => {
+    if (primaryAttachmentNodes.includes(node)) return false;
+    if (node.closest("article, [data-testid=\"tweet\"]") && !node.closest('[data-testid="attachments"], [data-testid="media"]')) {
+      return false;
+    }
+    const r = node.getBoundingClientRect();
+    const src = node.currentSrc || node.src || "";
+    return r.width >= 80 && r.height >= 80
+      && /^(?:blob:)|twimg[.]com[/]media|cdninstagram|fbcdn/i.test(src)
+      && !/profile_images|emoji/i.test(src);
+  });
+  const attachmentNodes = Array.from(new Set([...primaryAttachmentNodes, ...fallbackAttachmentNodes]));
+  const scopeText = String(scope.innerText || "");
+  const uploadProgress = Array.from(scope.querySelectorAll('[role="progressbar"], [aria-busy="true"]')).filter((node) => {
+    const text = `${node.innerText || ""} ${node.getAttribute("aria-label") || ""}`;
+    if (/트렌드|timeline|feed|새 게시물/i.test(text)) return false;
+    if (/미디어 준비|처리 중|preparing|processing|upload/i.test(text)) return true;
+    return Boolean(node.closest('[data-testid="attachments"], [data-testid="media"]'));
+  });
+  const uploadBusy = uploadProgress.length > 0;
+  const processing = /미디어 준비 중|:\s*처리 중|(?:^|\n)처리 중/i.test(scopeText)
+    || uploadProgress.some((node) => /미디어 준비|처리 중|processing/i.test(`${node.innerText || ""} ${node.getAttribute("aria-label") || ""}`));
+  const errorText = Array.from(scope.querySelectorAll('[role="alert"]'))
+    .map((el) => el.innerText)
+    .filter((text) => text && !/게시물을 전송했습니다|posted|sent/i.test(text))
+    .filter(Boolean)
+    .join("\n");
+  const readyText = /준비 완료|uploaded|업로드 완료/i.test(scopeText);
+  const postButtons = Array.from(scope.querySelectorAll('[data-testid="tweetButton"], [data-testid="tweetButtonInline"]')).filter(visible);
+  const activePostButton = postButtons.some((btn) => btn.getAttribute("aria-disabled") !== "true" && !btn.disabled);
+  return {
+    busy: uploadBusy,
+    uploadBusy,
+    processing,
+    errorText,
+    readyText,
+    activePostButton,
+    attachmentCount: attachmentNodes.length,
+    attachmentKinds: attachmentNodes.map((node) => node.tagName.toLowerCase()),
+    removeControls: Array.from(scope.querySelectorAll("button, [role=\"button\"]")).map((node) => ({
+      label: node.getAttribute("aria-label") || "",
+      testid: node.getAttribute("data-testid") || "",
+      text: (node.innerText || "").trim(),
+    })).filter((item) => /remove|삭제|제거|media/i.test(`${item.label} ${item.testid} ${item.text}`)).slice(0, 12),
+    scopeText: scopeText.slice(0, 400),
+  };
+}
+
+function selectXComposerFileInput() {
+  const visible = (el) => Boolean(el) && (el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+  const dialogs = Array.from(document.querySelectorAll('[role="dialog"]')).filter(visible);
+  const scope = [...dialogs].reverse().find((dialog) => dialog.querySelector(
+    '[data-testid="tweetTextarea_0"], [data-testid="fileInput"], [data-testid="tweetButton"]'
+  )) || dialogs[0] || document;
+  return scope.querySelector('input[type="file"][data-testid="fileInput"]') || scope.querySelector('input[type="file"]');
+}
+
+function xUploadSettleDecision(state = {}, options = {}) {
+  const expected = Math.max(0, Number(options.expectedMediaCount || 0));
+  const hasVideo = Boolean(options.hasVideo);
+  const stableReadyTicks = Math.max(0, Number(options.stableReadyTicks || 0));
+  const attachmentOk = Number(state.attachmentCount || 0) >= expected;
+  const postReady = state.activePostButton === true;
+  const mediaReady = state.readyText === true || (state.processing !== true && state.uploadBusy !== true && state.busy !== true);
+  if (!attachmentOk || !postReady) {
+    return { action: "wait", nextStableTicks: 0, reason: "not_ready" };
+  }
+  if (hasVideo && !mediaReady) {
+    return { action: "wait", nextStableTicks: 0, reason: "video_processing" };
+  }
+  const needed = hasVideo ? (state.readyText === true ? 2 : 5) : 3;
+  const next = stableReadyTicks + 1;
+  if (next >= needed) return { action: "ready", nextStableTicks: next, reason: "stable" };
+  return { action: "wait", nextStableTicks: next, reason: "stabilizing" };
+}
+
+function xComposerUploadRetryDecision({
+  tick = 0,
+  retried = false,
+  processing = false,
+  readyText = false,
+  activePostButton = false,
+  retryAtTick = 40,
+} = {}) {
+  if (retried) return "wait";
+  if (Number(tick) < Number(retryAtTick)) return "wait";
+  if (readyText && activePostButton) return "wait";
+  if (processing || !activePostButton || !readyText) return "reattach";
+  return "wait";
+}
+
 async function getComposerState(page) {
+  return page.eval(`(${readXComposerState.toString()})()`);
+}
+
+async function setXComposerFileInputFiles(page, mediaFiles) {
+  const files = Array.isArray(mediaFiles) ? mediaFiles.filter(Boolean) : [];
+  if (!files.length) throw new Error("X 미디어 파일이 없습니다.");
+  const marker = `x-composer-file-${Date.now()}`;
+  const marked = await page.eval(`(() => {
+    const input = (${selectXComposerFileInput.toString()})();
+    if (!input) return false;
+    input.setAttribute("data-x-composer-file", ${JSON.stringify(marker)});
+    return true;
+  })()`);
+  if (!marked) throw new Error("X 미디어 업로드 input을 찾지 못했습니다.");
+  const root = await page.send("DOM.getDocument", { depth: -1, pierce: true });
+  const node = await page.send("DOM.querySelector", {
+    nodeId: root.root.nodeId,
+    selector: `input[data-x-composer-file="${marker}"]`,
+  });
+  if (!node?.nodeId) throw new Error("X 미디어 업로드 input node를 찾지 못했습니다.");
+  await page.send("DOM.setFileInputFiles", { nodeId: node.nodeId, files });
+}
+
+async function clickXComposerRemoveMedia(page) {
   return page.eval(`(() => {
     const visible = (el) => Boolean(el) && (el.offsetWidth || el.offsetHeight || el.getClientRects().length);
-    const activeSubmit = Array.from(document.querySelectorAll('[data-testid="tweetButton"], [data-testid="tweetButtonInline"]')).find(visible);
-    const scope = activeSubmit?.closest('[role="dialog"]') || document;
-    const primaryAttachmentNodes = Array.from(scope.querySelectorAll(
-      '[data-testid="attachments"] img, [data-testid="attachments"] video, [data-testid="media"] img, [data-testid="media"] video'
-    ));
-    const fallbackAttachmentNodes = Array.from(scope.querySelectorAll('img, video')).filter((node) => {
-      const r = node.getBoundingClientRect();
-      const src = node.currentSrc || node.src || "";
-      return r.width >= 80 && r.height >= 80
-        && /^(?:blob:)|twimg[.]com[/]media|cdninstagram|fbcdn/i.test(src)
-        && !/profile_images|emoji/i.test(src);
+    const dialogs = Array.from(document.querySelectorAll('[role="dialog"]')).filter(visible);
+    const scope = [...dialogs].reverse().find((dialog) => dialog.querySelector(
+      '[data-testid="tweetTextarea_0"], [data-testid="tweetButton"], [data-testid="tweetButtonInline"]'
+    )) || dialogs[0] || document;
+    const target = Array.from(scope.querySelectorAll('button, [role="button"]')).filter(visible).find((button) => {
+      const label = [button.getAttribute("aria-label"), button.getAttribute("data-testid"), button.innerText]
+        .filter(Boolean).join(" ");
+      return /remove media|remove attachment|media-remove|미디어 (?:제거|삭제)|첨부.*삭제/i.test(label);
     });
-    const attachmentNodes = Array.from(new Set([...primaryAttachmentNodes, ...fallbackAttachmentNodes]));
-    const busyNodes = Array.from(scope.querySelectorAll('[role="progressbar"], [aria-busy="true"]'));
-    const busy = busyNodes.some((node) => {
-      const text = node.innerText || node.getAttribute("aria-label") || "";
-      return !/트렌드|timeline|feed/i.test(text);
-    });
-    const errorText = Array.from(scope.querySelectorAll('[role="alert"]'))
-      .map((el) => el.innerText)
-      .filter((text) => text && !/게시물을 전송했습니다|posted|sent/i.test(text))
-      .filter(Boolean)
-      .join("\\n");
-    const readyText = /준비 완료|ready|uploaded|업로드 완료/i.test(scope.innerText || "");
-    const activePostButton = Array.from(scope.querySelectorAll('[data-testid="tweetButton"], [data-testid="tweetButtonInline"]'))
-      .filter(visible)
-      .some((btn) => btn.getAttribute("aria-disabled") !== "true" && !btn.disabled);
-    return {
-      busy,
-      errorText,
-      readyText,
-      activePostButton,
-      attachmentCount: attachmentNodes.length,
-      attachmentKinds: attachmentNodes.map((node) => node.tagName.toLowerCase()),
-      removeControls: Array.from(scope.querySelectorAll('button, [role="button"]')).map((node) => ({
-        label: node.getAttribute('aria-label') || "",
-        testid: node.getAttribute('data-testid') || "",
-        text: (node.innerText || "").trim(),
-      })).filter((item) => /remove|삭제|제거|media/i.test(item.label + " " + item.testid + " " + item.text)).slice(0, 12),
-    };
+    if (!target) return false;
+    target.click();
+    return true;
   })()`);
 }
 
@@ -21517,8 +24207,10 @@ async function waitForUploadToSettle(page, expectedMediaCount, mediaFiles = []) 
   let stableReadyTicks = 0;
   let sawExpectedAttachment = false;
   let lastState = null;
+  let retried = false;
   const hasVideo = mediaFiles.some((file) => /\.mp4$/i.test(file));
-  for (let i = 0; i < 120; i++) {
+  const timeoutTicks = hasVideo ? 150 : 120;
+  for (let i = 0; i < timeoutTicks; i++) {
     const state = await getComposerState(page);
     lastState = state;
     if (i % 5 === 0) logEvent("upload_wait_state", state);
@@ -21527,16 +24219,23 @@ async function waitForUploadToSettle(page, expectedMediaCount, mediaFiles = []) 
     if (sawExpectedAttachment && state.attachmentCount < expectedMediaCount) {
       throw new Error(`X가 업로드된 미디어를 제거했습니다: ${JSON.stringify(state)}`);
     }
-    if (state.attachmentCount >= expectedMediaCount && state.readyText && state.activePostButton) {
-      stableReadyTicks += 1;
-      if (stableReadyTicks >= 2) return;
-    } else if (!hasVideo && state.attachmentCount >= expectedMediaCount && state.activePostButton) {
-      stableReadyTicks += 1;
-      if (stableReadyTicks >= 3) return;
-    } else if (state.attachmentCount >= expectedMediaCount && !state.busy && state.activePostButton) {
-      stableReadyTicks += 1;
-      if (stableReadyTicks >= 5) return;
-    } else {
+    const decision = xUploadSettleDecision(state, { expectedMediaCount, hasVideo, stableReadyTicks });
+    stableReadyTicks = decision.nextStableTicks;
+    if (decision.action === "ready") return;
+    if (xComposerUploadRetryDecision({
+      tick: i,
+      retried,
+      processing: state.processing,
+      readyText: state.readyText,
+      activePostButton: state.activePostButton,
+    }) === "reattach") {
+      logEvent("upload_wait_reattach", { tick: i, state });
+      const removed = await clickXComposerRemoveMedia(page);
+      await sleep(1000);
+      if (removed) await sleep(700);
+      await setXComposerFileInputFiles(page, mediaFiles);
+      retried = true;
+      sawExpectedAttachment = false;
       stableReadyTicks = 0;
     }
     await sleep(1000);
@@ -21608,9 +24307,11 @@ function threadPostSnapshotForMirror(canonicalUrl, snapshot) {
 
 async function mirrorThread(url, options = {}) {
   const canonicalUrl = validateThreadsUrl(url);
-  const requestedScheduledAt = parseRequestedScheduleTime(options.scheduledAt);
+  const requestedScheduledAt = options.fulfillLocalSchedule
+    ? null
+    : parseRequestedScheduleTime(options.scheduledAt);
   const completed = findCompletedMirror(canonicalUrl);
-  if (completed) {
+  if (completed && !canFulfillLocalScheduledMirror(completed, options)) {
     throw new DuplicateMirrorError("이미 X에 게시 또는 예약된 Threads URL입니다.", {
       canonicalUrl,
       previousStatus: completed.status,
@@ -21679,12 +24380,19 @@ async function mirrorThread(url, options = {}) {
   if (!usedLocalSnapshot && (threadPost.diagnostics?.mediaCandidateCount || 0) > 0 && threadPost.mediaUrls.length === 0) {
     throw new Error("Threads 원글에서 미디어 후보를 발견했지만 첨부 대상으로 확정하지 못해 게시를 중단했습니다.");
   }
-  if (!String(threadPost.text || "").trim()
-    && !(usedLocalSnapshot ? localSnapshot.files.length : threadPost.mediaUrls.length)) {
-    throw new Error("Threads 원글에서 본문과 미디어를 모두 찾지 못해 게시를 중단했습니다.");
-  }
   if (options.textOverride && String(options.textOverride).trim() && !isDiscoveryFailureLabel(options.textOverride)) {
     threadPost.text = cleanThreadTextOverride(options.textOverride);
+  } else {
+    threadPost.text = cleanThreadTextOverride(threadPost.text);
+  }
+  if (isDiscoveryFailureLabel(threadPost.text) || isThreadsInvalidPageText(threadPost.text)) {
+    threadPost.text = "";
+  }
+  const mirrorMediaCount = usedLocalSnapshot
+    ? localSnapshot.files.length
+    : threadPost.mediaUrls.length;
+  if (!String(threadPost.text || "").trim() && !mirrorMediaCount) {
+    throw new Error("Threads 원글에서 본문과 미디어를 모두 찾지 못해 게시를 중단했습니다.");
   }
   if (options.schedule) {
     logEvent("schedule_media_strategy", {
@@ -21741,12 +24449,15 @@ async function mirrorThread(url, options = {}) {
       schedule: Boolean(options.schedule),
       scheduledAt: requestedScheduledAt,
     });
+    const recordedDelivery = scheduleDeliveryForMirrorRecord(options);
     recordCompletedMirror({
       canonicalUrl,
       status: postResult.scheduledAt ? "scheduled" : "posted",
-      scheduledAt: postResult.scheduledAt?.toISOString(),
+      scheduledAt: postResult.scheduledAt?.toISOString()
+        || localScheduleHistoryTime(options),
       postUrl: postResult.postUrl || null,
       mediaCount: media.files.length,
+      ...(recordedDelivery ? { scheduleDelivery: recordedDelivery } : {}),
     });
     // markDiscoveryScheduled/Posted also clean, but immediate posts may only hit recordCompletedMirror.
     if (postResult.scheduledAt || postResult.postUrl || !options.schedule) {
@@ -21836,7 +24547,7 @@ async function postDiscoveryRowToX(canonicalUrl, options = {}) {
   if (isYouTubeUrl(canonicalUrl)) {
     const url = validateYouTubeUrl(canonicalUrl);
     const completed = findCompletedMirror(url);
-    if (completed) {
+    if (completed && !canFulfillLocalScheduledMirror(completed, options)) {
       throw new DuplicateMirrorError("이미 X에 게시 또는 예약된 YouTube URL입니다.", {
         canonicalUrl: url,
         previousStatus: completed.status,
@@ -21846,28 +24557,32 @@ async function postDiscoveryRowToX(canonicalUrl, options = {}) {
     }
     const row = await getDiscoveryRow(url);
     if (!row) throw new Error("저장된 YouTube 대시보드 항목을 찾지 못했습니다.");
-    const criteria = parseDiscoveryCriteria(row.criteria);
     const post = {
       url,
-      text: sanitizeYouTubeXTitle(options.textOverride || criteria.title || row.textPreview),
+      text: await resolveYouTubeXTitle(url, options, row),
       mediaUrls: [],
       imageMediaUrls: [],
       videoMediaUrls: [url],
       diagnostics: { source: "youtube_downloaded_video" },
     };
-    const scheduledAt = parseRequestedScheduleTime(options.scheduledAt);
+    const scheduledAt = options.fulfillLocalSchedule
+      ? null
+      : parseRequestedScheduleTime(options.scheduledAt);
     const media = await downloadYouTubeVideo(url);
     try {
       const postResult = await postToX(post, media.files, {
         schedule: Boolean(options.schedule),
         scheduledAt,
       });
+      const recordedDelivery = scheduleDeliveryForMirrorRecord(options);
       recordCompletedMirror({
         canonicalUrl: url,
         status: postResult.scheduledAt ? "scheduled" : "posted",
-        scheduledAt: postResult.scheduledAt?.toISOString(),
+        scheduledAt: postResult.scheduledAt?.toISOString()
+          || localScheduleHistoryTime(options),
         postUrl: postResult.postUrl || null,
         mediaCount: media.files.length,
+        ...(recordedDelivery ? { scheduleDelivery: recordedDelivery } : {}),
       });
       logEvent("youtube_x_post_success", { canonicalUrl: url, scheduledAt: postResult.scheduledAt?.toISOString(), mediaCount: media.files.length });
       return {
@@ -21883,7 +24598,7 @@ async function postDiscoveryRowToX(canonicalUrl, options = {}) {
     }
   }
   const completed = findCompletedMirror(canonicalUrl);
-  if (completed) {
+  if (completed && !canFulfillLocalScheduledMirror(completed, options)) {
     throw new DuplicateMirrorError("이미 X에 게시 또는 예약된 인싸이더 URL입니다.", {
       canonicalUrl,
       previousStatus: completed.status,
@@ -21897,7 +24612,9 @@ async function postDiscoveryRowToX(canonicalUrl, options = {}) {
   try { criteria = JSON.parse(row.criteria || "{}"); } catch {}
   if (criteria.source !== "inssider") throw new Error("인싸이더 저장 항목 정보가 올바르지 않습니다.");
   if (!row.mediaPreviewUrl) throw new Error("인싸이더 캡처 이미지가 없습니다.");
-  const requestedScheduledAt = parseRequestedScheduleTime(options.scheduledAt);
+  const requestedScheduledAt = options.fulfillLocalSchedule
+    ? null
+    : parseRequestedScheduleTime(options.scheduledAt);
   const post = {
     url: canonicalUrl,
     text: String(options.textOverride || row.textPreview || "").trim().slice(0, 280),
@@ -21937,12 +24654,15 @@ async function postDiscoveryRowToX(canonicalUrl, options = {}) {
         if (index < replyChunks.length - 1) await sleep(300);
       }
     }
+    const recordedDelivery = scheduleDeliveryForMirrorRecord(options);
     recordCompletedMirror({
       canonicalUrl,
       status: postResult.scheduledAt ? "scheduled" : "posted",
-      scheduledAt: postResult.scheduledAt?.toISOString(),
+      scheduledAt: postResult.scheduledAt?.toISOString()
+        || localScheduleHistoryTime(options),
       postUrl: postResult.postUrl || null,
       mediaCount: media.files.length,
+      ...(recordedDelivery ? { scheduleDelivery: recordedDelivery } : {}),
     });
     if (postResult.scheduledAt && replyChunks.length) {
       upsertScheduledReplyItem({
@@ -21980,10 +24700,9 @@ async function createXDraftFromDiscoveryRow(canonicalUrl, options = {}) {
     const url = validateYouTubeUrl(canonicalUrl);
     const row = await getDiscoveryRow(url);
     if (!row) throw new Error("저장된 YouTube 대시보드 항목을 찾지 못했습니다.");
-    const criteria = parseDiscoveryCriteria(row.criteria);
     const post = {
       url,
-      text: sanitizeYouTubeXTitle(options.textOverride || criteria.title || row.textPreview),
+      text: await resolveYouTubeXTitle(url, options, row),
       mediaUrls: [],
       imageMediaUrls: [],
       videoMediaUrls: [url],
@@ -22025,34 +24744,88 @@ async function createXDraftFromDiscoveryRow(canonicalUrl, options = {}) {
   }
 }
 
-async function runDiscoveryAutoSchedule(canonicalUrl, options = {}) {
-  await acquireMirrorBusy({
-    wait: Boolean(options.waitForBusy),
+async function commitLocalDiscoverySchedule(canonicalUrl, scheduledAt, options = {}) {
+  const at = scheduledAt instanceof Date ? scheduledAt : parseRequestedScheduleTime(scheduledAt);
+  if (!at) throw new Error("예약 시간이 없습니다.");
+  const row = await getDiscoveryRow(canonicalUrl);
+  const mediaCount = Number(options.mediaCount || row?.mediaCount || 0);
+  const source = options.source || "local_schedule";
+  recordScheduleSlot(at, {
     canonicalUrl,
-    source: options.source || null,
+    state: "verified",
+    source,
+    scheduleDelivery: SCHEDULE_DELIVERY_LOCAL_POST,
   });
+  recordCompletedMirror({
+    canonicalUrl,
+    status: "scheduled",
+    scheduledAt: at.toISOString(),
+    postUrl: null,
+    mediaCount,
+    scheduleDelivery: SCHEDULE_DELIVERY_LOCAL_POST,
+  });
+  await markDiscoveryScheduled(canonicalUrl, mediaCount, at.toISOString(), {
+    scheduleDelivery: SCHEDULE_DELIVERY_LOCAL_POST,
+  });
+  logEvent("discovery_local_schedule_committed", {
+    canonicalUrl,
+    scheduledAt: at.toISOString(),
+    source,
+    mediaCount,
+  });
+  return {
+    canonicalUrl,
+    mediaCount,
+    scheduledAt: at.toISOString(),
+    scheduleDelivery: SCHEDULE_DELIVERY_LOCAL_POST,
+    message: `로컬 예약됨 · ${at.toLocaleString("ko-KR")} · 시각에 대시보드가 직접 게시합니다`,
+  };
+}
+
+async function runDiscoveryAutoSchedule(canonicalUrl, options = {}) {
   let scheduledAt = null;
   let submissionCompleted = false;
+  let acquiredBusy = false;
   try {
     if (options.text && String(options.text).trim() && !isDiscoveryFailureLabel(options.text)) {
       await updateDiscoveryTitle(canonicalUrl, options.text);
     }
     scheduledAt = await reserveNextAutoScheduleTime(canonicalUrl);
+    const scheduleDelivery = assignScheduleDelivery(canonicalUrl);
     logEvent("discovery_auto_schedule_request", {
       canonicalUrl,
       scheduledAt: scheduledAt.toISOString(),
       source: options.source || null,
+      scheduleDelivery,
     });
+    if (scheduleDelivery === SCHEDULE_DELIVERY_LOCAL_POST) {
+      const row = await getDiscoveryRow(canonicalUrl);
+      const result = await commitLocalDiscoverySchedule(canonicalUrl, scheduledAt, {
+        source: options.source || "auto_schedule",
+        mediaCount: Number(row?.mediaCount || 0),
+      });
+      submissionCompleted = true;
+      return result;
+    }
+    await acquireMirrorBusy({
+      wait: Boolean(options.waitForBusy),
+      canonicalUrl,
+      source: options.source || null,
+    });
+    acquiredBusy = true;
     const result = await postDiscoveryRowToX(canonicalUrl, {
       textOverride: options.text,
       schedule: true,
       scheduledAt,
+      scheduleDelivery: SCHEDULE_DELIVERY_X_NATIVE,
       source: options.source || null,
       threadPostSnapshot: options.threadPostSnapshot || null,
     });
     submissionCompleted = true;
-    await markDiscoveryScheduled(canonicalUrl, result.mediaCount, result.scheduledAt);
-    return result;
+    await markDiscoveryScheduled(canonicalUrl, result.mediaCount, result.scheduledAt, {
+      scheduleDelivery: SCHEDULE_DELIVERY_X_NATIVE,
+    });
+    return { ...result, scheduleDelivery: SCHEDULE_DELIVERY_X_NATIVE };
   } catch (error) {
     if (scheduledAt && shouldReleaseReservedScheduleSlot(error, { submissionCompleted })) {
       removeScheduleSlot(scheduledAt, canonicalUrl);
@@ -22064,7 +24837,135 @@ async function runDiscoveryAutoSchedule(canonicalUrl, options = {}) {
     }
     throw error;
   } finally {
+    if (acquiredBusy) busy = false;
+  }
+}
+
+function localScheduleDispatchRetryReady(canonicalUrl, nowMs = Date.now()) {
+  const prev = localScheduleDispatchBackoff.get(canonicalUrl);
+  if (!prev) return true;
+  const backoffMs = Math.min(10 * 60 * 1000, 30 * 1000 * (2 ** Math.min(Number(prev.count || 1), 5)));
+  return nowMs - Number(prev.at || 0) >= backoffMs;
+}
+
+async function dueLocalScheduledDiscoveryRows(nowMs = Date.now()) {
+  const db = await getDiscoveryDb();
+  const rows = await db.prepare(`
+    SELECT canonical_url AS canonicalUrl, author, text_preview AS textPreview,
+      media_preview_url AS mediaPreviewUrl, like_count AS likeCount, media_count AS mediaCount,
+      viral_score AS viralScore, criteria, status,
+      scheduled_post_at AS scheduledPostAt, discovered_at AS discoveredAt,
+      posted_at AS postedAt, last_error AS lastError, attempts,
+      COALESCE(schedule_delivery, 'x_native') AS scheduleDelivery,
+      candidate_group AS candidateGroup, approval_batch_id AS approvalBatchId,
+      approved_at AS approvedAt, group_classified_at AS groupClassifiedAt
+    FROM thread_discoveries
+    WHERE status = 'scheduled'
+      AND scheduled_post_at IS NOT NULL
+      AND COALESCE(schedule_delivery, 'x_native') = 'local_post'
+    ORDER BY scheduled_post_at ASC
+    LIMIT 20
+  `).all();
+  return (rows || []).filter((row) => (
+    isDueLocalScheduledRow(row, nowMs) && localScheduleDispatchRetryReady(row.canonicalUrl, nowMs)
+  ));
+}
+
+async function markLocalScheduleDispatchFailed(canonicalUrl, error) {
+  const db = await getDiscoveryDb();
+  await db.prepare(`
+    UPDATE thread_discoveries
+    SET last_error = ?, attempts = attempts + 1
+    WHERE canonical_url = ? AND status = 'scheduled'
+      AND COALESCE(schedule_delivery, 'x_native') = 'local_post'
+  `).run(`로컬 예약 게시 실패: ${error.message || error}`, canonicalUrl);
+}
+
+async function fulfillLocalScheduledDiscoveryPost(row) {
+  const canonicalUrl = row.canonicalUrl;
+  await acquireMirrorBusy({
+    wait: true,
+    canonicalUrl,
+    source: "local_schedule_dispatch",
+  });
+  try {
+    const text = firstUsableDiscoveryText(row.textPreview);
+    const scheduledPostAt = row.scheduledPostAt || null;
+    const delayMs = scheduledPostAt ? Date.now() - new Date(scheduledPostAt).getTime() : null;
+    logEvent("local_schedule_dispatch_start", {
+      canonicalUrl,
+      scheduledPostAt,
+      delayMs,
+    });
+    const result = await postDiscoveryRowToX(canonicalUrl, {
+      textOverride: text,
+      schedule: false,
+      fulfillLocalSchedule: true,
+      scheduledAt: scheduledPostAt,
+      source: "local_schedule_dispatch",
+    });
+    await markDiscoveryPosted(canonicalUrl, result.mediaCount);
+    localScheduleDispatchBackoff.delete(canonicalUrl);
+    logEvent("local_schedule_dispatch_success", {
+      canonicalUrl,
+      scheduledPostAt,
+      delayMs,
+      postUrl: result.postUrl || null,
+      mediaCount: result.mediaCount,
+    });
+    return result;
+  } finally {
     busy = false;
+  }
+}
+
+async function maybeDispatchLocalScheduledPosts() {
+  if (localScheduleDispatchBusy) return { ok: true, skipped: true, reason: "busy" };
+  localScheduleDispatchBusy = true;
+  try {
+    const due = await dueLocalScheduledDiscoveryRows();
+    if (!due.length) return { ok: true, processed: [], skipped: [] };
+    const processed = [];
+    const skipped = [];
+    for (const row of due) {
+      if (busy) {
+        skipped.push({ canonicalUrl: row.canonicalUrl, reason: "mirror_busy" });
+        break;
+      }
+      try {
+        const result = await fulfillLocalScheduledDiscoveryPost(row);
+        processed.push({
+          canonicalUrl: row.canonicalUrl,
+          postUrl: result.postUrl || null,
+          mediaCount: result.mediaCount,
+        });
+      } catch (error) {
+        const prev = localScheduleDispatchBackoff.get(row.canonicalUrl) || { count: 0 };
+        localScheduleDispatchBackoff.set(row.canonicalUrl, {
+          at: Date.now(),
+          count: Number(prev.count || 0) + 1,
+        });
+        skipped.push({ canonicalUrl: row.canonicalUrl, error: error.message });
+        await markLocalScheduleDispatchFailed(row.canonicalUrl, error).catch(() => {});
+        logEvent("local_schedule_dispatch_error", {
+          canonicalUrl: row.canonicalUrl,
+          scheduledPostAt: row.scheduledPostAt || null,
+          error: error.message,
+        });
+      }
+    }
+    logEvent("local_schedule_dispatch_tick", {
+      processedCount: processed.length,
+      skippedCount: skipped.length,
+      processed,
+      skipped,
+    });
+    return { ok: true, processed, skipped };
+  } catch (error) {
+    logEvent("local_schedule_dispatch_tick_error", { error: error.message });
+    return { ok: false, error: error.message };
+  } finally {
+    localScheduleDispatchBusy = false;
   }
 }
 
@@ -22085,6 +24986,7 @@ function isThreadsMediaRegression(expectedMediaCount, extractedMediaCount) {
 function isThreadsInvalidPageText(value) {
   const text = String(value || "").replace(/\s+/g, " ").trim();
   if (!text) return false;
+  if (isThreadsShellChromeText(value)) return true;
   const missingPage = /이 페이지는 길을 잃었습니다/i.test(text)
     || /링크가 작동하지 않거나 페이지가 존재하지 않습니다/i.test(text)
     || /page (?:isn't|is not) available/i.test(text)
@@ -22112,13 +25014,19 @@ function threadsInvalidPageError(value) {
 
 function isThreadsUnusableExtraction(diagnostics = {}, mediaUrls = [], embeddedCaption = "", text = "") {
   if (Array.isArray(mediaUrls) && mediaUrls.length > 0) return false;
+  // No article + no handle + no media: never trust embeddedCaption alone.
+  // Shell chrome / unrelated JSON can look like a caption and previously
+  // short-circuited this check (sean970106/Dc3IxHRjwWr → "추천/새로운 스레드/검색").
+  if (diagnostics?.targetArticleFound === false && diagnostics?.handleFound === false) {
+    return true;
+  }
   const caption = String(embeddedCaption || "").trim();
   if (caption && !isThreadsInvalidPageText(caption)) return false;
   const cleaned = String(text || "").trim();
   if (cleaned && !isThreadsInvalidPageText(cleaned) && diagnostics?.targetArticleFound === true && diagnostics?.handleFound === true) {
     return false;
   }
-  return diagnostics?.targetArticleFound === false && diagnostics?.handleFound === false;
+  return diagnostics?.targetArticleFound === false || diagnostics?.handleFound === false;
 }
 
 function isDiscoveryAutoScheduleSource(source) {
@@ -22390,6 +25298,22 @@ async function processDiscoveryAutoScheduleJob(canonicalUrl, source, text) {
     });
     return { skipped: true, detail };
   }
+  const schedulePreview = String(
+    detail.threadPostSnapshot?.text
+      || (await getDiscoveryRow(canonicalUrl))?.textPreview
+      || ""
+  ).trim();
+  if (
+    Number(detail.mediaCount || 0) <= 0
+    && (
+      !schedulePreview
+      || isDiscoveryPlaceholderText(schedulePreview)
+      || isDiscoveryFailureLabel(schedulePreview)
+      || isThreadsInvalidPageText(schedulePreview)
+    )
+  ) {
+    throw new Error("Threads 원글에서 신뢰할 수 있는 본문·미디어를 찾지 못해 자동예약을 중단했습니다.");
+  }
   if (!detail.fromLocalSnapshot && isThreadsMediaRegression(previous?.mediaCount, detail.mediaCount)) {
     logEvent("threads_media_regression_blocked", {
       canonicalUrl,
@@ -22403,8 +25327,25 @@ async function processDiscoveryAutoScheduleJob(canonicalUrl, source, text) {
     );
   }
   await markDiscoveryScheduleQueueState(canonicalUrl, "scheduling");
+  const refreshed = await getDiscoveryRow(canonicalUrl);
+  const criteria = parseDiscoveryCriteria(refreshed?.criteria || detail?.saved?.criteria);
+  let scheduleText = firstUsableDiscoveryText(
+    safeText,
+    detail.threadPostSnapshot?.title,
+    detail.threadPostSnapshot?.text,
+    criteria.title,
+    refreshed?.textPreview,
+    previous?.textPreview,
+  );
+  if (isYouTubeUrl(canonicalUrl) && !scheduleText) {
+    const live = await extractYouTubePost(canonicalUrl);
+    scheduleText = firstUsableDiscoveryText(live.title, live.text);
+  }
+  if (isYouTubeUrl(canonicalUrl) && !scheduleText) {
+    throw new Error("YouTube 제목이 아직 수집되지 않아 예약을 중단했습니다.");
+  }
   const result = await runDiscoveryAutoSchedule(canonicalUrl, {
-    text: safeText || detail.threadPostSnapshot?.text || previous?.textPreview || "",
+    text: scheduleText,
     source,
     threadPostSnapshot: detail.threadPostSnapshot || null,
     waitForBusy: true,
@@ -22734,10 +25675,51 @@ async function terafabxGeminiChallengeUrl(chromePort) {
   return (Array.isArray(tabs) ? tabs : []).find((tab) => /google\.com\/sorry\//i.test(String(tab.url || "")))?.url || null;
 }
 
+function isTerafabxGeminiScriptTimeout(result) {
+  return Boolean(result && result.code !== 0 && /Node script timed out after \d+ms/.test(String(result.stderr || "")));
+}
+
+/**
+ * 맛이 간 Gemini 헤드리스 인스턴스 자가 복구: agent-browser 세션 정리 →
+ * 해당 포트 Chrome 종료 → 재기동. 슬롯 안에서 호출되므로 동시 실행과 충돌하지 않는다.
+ */
+async function terafabxRecycleGeminiInstance(chromePort, profileDir) {
+  const port = Number(chromePort);
+  try {
+    const { agentBrowserInvocation } = require(resolveTerafabxGeminiScriptPath());
+    const invocation = agentBrowserInvocation(`http://127.0.0.1:${port}`, ["close"]);
+    await execFileOutput(invocation.bin, invocation.args, { timeout: 15_000 });
+  } catch {}
+  const pids = await chromePidsForPort(port);
+  for (const pid of pids) {
+    try { process.kill(pid, "SIGTERM"); } catch {}
+  }
+  const deadline = Date.now() + 8_000;
+  while (Date.now() < deadline) {
+    if (!(await chromePidsForPort(port)).length) break;
+    await sleep(300);
+  }
+  for (const pid of await chromePidsForPort(port)) {
+    try { process.kill(pid, "SIGKILL"); } catch {}
+  }
+  await ensureTerafabxGeminiHeadlessBrowser({ port, profileDir });
+  return { port, profileDir, killedPids: pids };
+}
+
 async function runTerafabxGeminiScript(scriptPath, args, options = {}) {
   const label = options.label || path.basename(scriptPath);
   return withTerafabxGeminiWebSlot(label, async () => {
     let result = await runNodeScript(scriptPath, args, options);
+    if (options.chromePort && isTerafabxGeminiScriptTimeout(result)) {
+      logEvent("terafabx_gemini_instance_recycle", { label, chromePort: options.chromePort, profileDir: options.profileDir || null, reason: "script_timeout" });
+      try {
+        await terafabxRecycleGeminiInstance(options.chromePort, options.profileDir);
+        result = await runNodeScript(scriptPath, args, options);
+        logEvent("terafabx_gemini_instance_recycle_retry_done", { label, chromePort: options.chromePort, code: result.code });
+      } catch (error) {
+        logEvent("terafabx_gemini_instance_recycle_error", { label, chromePort: options.chromePort, error: error.message });
+      }
+    }
     const challengeUrl = options.chromePort ? await terafabxGeminiChallengeUrl(options.chromePort) : null;
     if (!challengeUrl) return result;
     logEvent("terafabx_gemini_google_challenge", { label, chromePort: options.chromePort, challengeUrl: challengeUrl.slice(0, 300) });
@@ -22813,7 +25795,54 @@ function spawnOutputNoStdin(file, args = [], options = {}) {
   });
 }
 
+const storyPublisher = createStoryPublisher({
+  newPage, verifyXAccount, withMirrorChromeLock, waitForComposer,
+  setXComposerFileInputFiles, waitForUploadToSettle, logEvent,
+});
+const storyLocalQueue = createStoryQueue({
+  root: __dirname, ...storyPublisher, recordHistory: recordCompletedMirror, log: logEvent,
+});
+
 const server = http.createServer(async (req, res) => {
+  if (req.method === "GET" && req.url.startsWith("/api/story-schedules/media?")) {
+    try {
+      const query = new URL(req.url, "http://localhost").searchParams;
+      const item = storyLocalQueue.read().items.find(row => row.id === query.get("id"));
+      if (!item) { json(res, 404, { ok: false, error: "사연 이미지를 찾지 못했습니다." }); return; }
+      const filename = storyMediaPath(__dirname, item, Number(query.get("index") || 0), query.has("reply") ? Number(query.get("reply")) : null);
+      if (query.get("thumbnail") === "1") {
+        const buffer = await require("sharp")(filename).resize({ width: 160, height: 220, fit: "inside", withoutEnlargement: true }).webp({ quality: 80 }).toBuffer();
+        res.writeHead(200, { "content-type": "image/webp", "content-length": buffer.length, "cache-control": "private, max-age=3600" });
+        res.end(buffer);
+      } else serveFile(res, filename);
+    } catch (error) {
+      json(res, 404, { ok: false, error: "사연 이미지를 불러오지 못했습니다." });
+    }
+    return;
+  }
+  if (req.url === "/api/story-schedules" || req.url === "/api/story-schedules/run") {
+    if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(req.socket.remoteAddress)) {
+      json(res, 403, { ok: false, error: "Story operations require a local request" }); return;
+    }
+    try {
+      if (req.method === "GET" && req.url === "/api/story-schedules") {
+        json(res, 200, { ok: true, ...storyLocalQueue.read() }); return;
+      }
+      if (req.method === "POST" && req.url === "/api/story-schedules") {
+        const payload = JSON.parse(await readRequestBody(req));
+        const result = await storyLocalQueue.enqueue(payload.items);
+        json(res, 200, { ok: true, ...result }); return;
+      }
+      if (req.method === "POST" && req.url === "/api/story-schedules/run") {
+        json(res, 200, { ok: true, result: await storyLocalQueue.tick() }); return;
+      }
+      json(res, 405, { ok: false, error: "Unsupported method" });
+    } catch (error) {
+      logEvent("story_local_api_error", { error: error.message });
+      json(res, 400, { ok: false, error: error.message });
+    }
+    return;
+  }
   if (req.method === "GET" && tryServeDashboardAsset(req, res)) {
     return;
   }
@@ -22997,10 +26026,11 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "POST" && req.url === "/api/terafabx/home-verified-comment") {
     try {
       const body = await readRequestBody(req);
+      if (await maybeProxyHomeVerifiedRequest(req, res, body)) return;
       const payload = JSON.parse(body || "{}");
       const action = String(payload.action || "status");
-      if (!["status", "enable", "disable", "prefill_only", "live", "ingest", "discover", "prepare", "pump", "discard", "post_one", "purge_policy_fail", "purge_dead_targets"].includes(action)) {
-        throw new Error("action은 status, enable, disable, prefill_only, live, ingest, discover, prepare, pump, discard, post_one, purge_policy_fail, purge_dead_targets만 가능합니다.");
+      if (!["status", "enable", "disable", "prefill_only", "live", "ingest", "discover", "prepare", "pump", "discard", "post_one", "purge_policy_fail", "purge_dead_targets", "reconcile_verification"].includes(action)) {
+        throw new Error("action은 status, enable, disable, prefill_only, live, ingest, discover, prepare, pump, discard, post_one, purge_policy_fail, purge_dead_targets, reconcile_verification만 가능합니다.");
       }
       let result = null;
       if (action === "status") {
@@ -23064,6 +26094,12 @@ const server = http.createServer(async (req, res) => {
         result = purgeHomeVerifiedPolicyFailPending({ sample: payload.sample });
       } else if (action === "purge_dead_targets") {
         result = purgeHomeVerifiedDeadTargetPending({ sample: payload.sample, maxAttempts: payload.maxAttempts });
+      } else if (action === "reconcile_verification") {
+        result = await reconcileHomeVerifiedVerificationRequired({
+          sample: payload.sample,
+          limit: payload.limit,
+          ttlMs: payload.ttlMs,
+        });
       }
       json(res, 200, { ok: true, action, result, status: getTerafabxHomeVerifiedCommentStatus() });
     } catch (error) {
@@ -23327,6 +26363,48 @@ const server = http.createServer(async (req, res) => {
     }
     return;
   }
+  if (req.method === "GET" && (req.url === "/articles" || req.url.startsWith("/articles?"))) {
+    try {
+      html(res, 200, renderSavedArticlesPage(req.url));
+    } catch (error) {
+      logEvent("saved_articles_page_error", { error: error.message });
+      html(res, 500, `<pre>${escapeHtml(error.message)}</pre>`);
+    }
+    return;
+  }
+  if (req.method === "GET" && req.url.startsWith("/articles/media")) {
+    try {
+      const parsedUrl = new URL(req.url, "http://localhost");
+      const filePath = resolveSavedArticleMedia(
+        parsedUrl.searchParams.get("id") || "",
+        parsedUrl.searchParams.get("file") || "",
+      );
+      if (!filePath) {
+        json(res, 404, { ok: false, error: "미디어 파일을 찾지 못했습니다." });
+        return;
+      }
+      const ext = path.extname(filePath).toLowerCase();
+      const types = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+        ".mp4": "video/mp4",
+      };
+      const body = fs.readFileSync(filePath);
+      res.writeHead(200, {
+        "content-type": types[ext] || "application/octet-stream",
+        "content-length": body.length,
+        "cache-control": "public, max-age=86400",
+      });
+      res.end(body);
+    } catch (error) {
+      logEvent("saved_articles_media_error", { error: error.message });
+      if (!res.headersSent) json(res, 500, { ok: false, error: error.message });
+    }
+    return;
+  }
   if (req.method === "GET" && req.url.startsWith("/discovery")) {
     try {
       if (fs.existsSync(DASHBOARD_INDEX_PATH)) {
@@ -23387,7 +26465,9 @@ const server = http.createServer(async (req, res) => {
       const result = await runDiscoveryScan({
         manual: true,
         minLikes: payload.minLikes || DISCOVERY_MIN_LIKES,
+        minViews: payload.minViews || DISCOVERY_MIN_VIEWS,
         maxScrolls: payload.maxScrolls || DISCOVERY_MAX_SCROLLS,
+        maxCandidates: payload.maxCandidates || DISCOVERY_AUTO_BATCH_LIMIT,
       });
       json(res, 200, {
         ok: true,
@@ -23396,7 +26476,7 @@ const server = http.createServer(async (req, res) => {
         saved: result.saved,
         autoSchedule: result.autoSchedule,
         rejected: result.rejected || [],
-        candidates: (result.candidates || []).slice(0, 20),
+        candidates: (result.candidates || []).slice(0, DISCOVERY_AUTO_BATCH_LIMIT),
       });
     } catch (error) {
       logEvent("discovery_run_error", { error: error.message });
@@ -23523,6 +26603,112 @@ const server = http.createServer(async (req, res) => {
     }
     return;
   }
+  if (req.method === "POST" && req.url === "/api/discovery/reclassify") {
+    try {
+      const body = await readRequestBody(req);
+      const payload = JSON.parse(body || "{}");
+      const canonicalUrls = normalizeDiscoveryScheduleCancelBatchUrls(payload.canonicalUrls);
+      for (const canonicalUrl of canonicalUrls) {
+        queueDiscoveryGroupClassify(canonicalUrl, { force: false });
+      }
+      json(res, 202, { ok: true, queued: canonicalUrls.length });
+    } catch (error) {
+      logEvent("discovery_reclassify_error", { error: error.message });
+      json(res, 500, { ok: false, error: error.message });
+    }
+    return;
+  }
+  if (req.method === "POST" && req.url === "/api/discovery/approve-group") {
+    try {
+      const body = await readRequestBody(req);
+      const payload = JSON.parse(body || "{}");
+      const result = await approveDiscoveryGroup({
+        group: String(payload.group || "").trim(),
+        canonicalUrls: payload.canonicalUrls,
+      });
+      if (result.ok && result.approved.length) {
+        drainApprovedDiscoveryRows().catch((error) => {
+          logEvent("discovery_group_drain_error", { error: error.message });
+        });
+      }
+      json(res, result.status || 200, result);
+    } catch (error) {
+      logEvent("discovery_group_approve_error", { error: error.message });
+      json(res, 500, { ok: false, error: error.message });
+    }
+    return;
+  }
+  if (req.method === "POST" && req.url === "/api/discovery/unapprove") {
+    try {
+      const body = await readRequestBody(req);
+      const payload = JSON.parse(body || "{}");
+      const result = await unapproveDiscoveryRows(payload.canonicalUrls);
+      json(res, 200, { ok: true, ...result });
+    } catch (error) {
+      logEvent("discovery_group_unapprove_error", { error: error.message });
+      json(res, 500, { ok: false, error: error.message });
+    }
+    return;
+  }
+  if (req.method === "POST" && req.url === "/api/discovery/set-group") {
+    try {
+      const body = await readRequestBody(req);
+      const payload = JSON.parse(body || "{}");
+      const result = await setDiscoveryGroupManual(payload.url, payload.group);
+      json(res, 200, { ok: true, ...result });
+    } catch (error) {
+      logEvent("discovery_group_set_error", { error: error.message });
+      json(res, 400, { ok: false, error: error.message });
+    }
+    return;
+  }
+  if (req.method === "POST" && req.url === "/api/discovery/group-approval") {
+    try {
+      const body = await readRequestBody(req);
+      const payload = JSON.parse(body || "{}");
+      const groupApproval = setGroupApprovalSettings(payload);
+      json(res, 200, { ok: true, groupApproval });
+    } catch (error) {
+      logEvent("discovery_group_approval_settings_error", { error: error.message });
+      json(res, 500, { ok: false, error: error.message });
+    }
+    return;
+  }
+  if (req.method === "GET" && req.url.startsWith("/api/discovery/approval-batches")) {
+    try {
+      const parsed = new URL(req.url, "http://localhost");
+      const batches = await listDiscoveryApprovalBatches(parsed.searchParams.get("limit") || 10);
+      json(res, 200, { ok: true, batches });
+    } catch (error) {
+      json(res, 500, { ok: false, error: error.message });
+    }
+    return;
+  }
+  if (req.method === "POST" && req.url === "/api/discovery/title-refine") {
+    try {
+      const body = await readRequestBody(req);
+      const payload = JSON.parse(body || "{}");
+      const canonicalUrl = normalizeDiscoveryUrl(payload.url);
+      const db = await getDiscoveryDb();
+      const row = await db.prepare(`
+        SELECT text_preview AS textPreview FROM thread_discoveries WHERE canonical_url = ?
+      `).get(canonicalUrl);
+      if (!row) throw new Error("대시보드 항목을 찾지 못했습니다.");
+      const job = queueDiscoveryTitleRefine(canonicalUrl, String(row.textPreview || "").trim(), {
+        force: payload.force === true,
+      });
+      if (!job) {
+        json(res, 200, { ok: true, applied: false, reason: "not_eligible" });
+        return;
+      }
+      const result = await job;
+      json(res, 200, { ok: true, ...result });
+    } catch (error) {
+      logEvent("discovery_title_refine_error", { error: error.message });
+      json(res, 500, { ok: false, error: error.message });
+    }
+    return;
+  }
   if (req.method === "POST" && req.url === "/api/discovery/post") {
     if (busy) {
       json(res, 429, { ok: false, error: "다른 미러링 작업이 진행 중입니다." });
@@ -23601,6 +26787,7 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === "GET" && req.url.startsWith("/api/discovery/home-verified-dashboard")) {
     try {
+      if (await maybeProxyHomeVerifiedRequest(req, res)) return;
       json(res, 200, buildHomeVerifiedDashboardData(req.url));
     } catch (error) {
       logEvent("home_verified_dashboard_api_error", { error: error.message });
@@ -23638,12 +26825,30 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         autoDiscoveryEnabled: settings.autoDiscoveryEnabled,
         autoStyleScheduleEnabled: settings.autoStyleScheduleEnabled,
+        scheduleDeliveryMode: settings.scheduleDeliveryMode,
         maxPerScan: DISCOVERY_AUTO_STYLE_SCHEDULE_MAX_PER_SCAN,
         minScore: DISCOVERY_AUTO_STYLE_MIN_SCORE,
         maxFutureHours: DISCOVERY_AUTO_STYLE_MAX_FUTURE_HOURS,
       });
     } catch (error) {
       logEvent("discovery_auto_style_schedule_setting_error", { error: error.message });
+      json(res, 500, { ok: false, error: error.message });
+    }
+    return;
+  }
+  if (req.method === "POST" && req.url === "/api/discovery/schedule-delivery-mode") {
+    try {
+      const body = await readRequestBody(req);
+      const payload = JSON.parse(body || "{}");
+      const settings = setScheduleDeliveryMode(payload.mode || payload.scheduleDeliveryMode);
+      json(res, 200, {
+        ok: true,
+        autoDiscoveryEnabled: settings.autoDiscoveryEnabled,
+        autoStyleScheduleEnabled: settings.autoStyleScheduleEnabled,
+        scheduleDeliveryMode: settings.scheduleDeliveryMode,
+      });
+    } catch (error) {
+      logEvent("discovery_schedule_delivery_mode_error", { error: error.message });
       json(res, 500, { ok: false, error: error.message });
     }
     return;
@@ -23691,6 +26896,51 @@ const server = http.createServer(async (req, res) => {
     }
     return;
   }
+  if (req.method === "POST" && req.url === "/api/discovery/cancel-schedule-batch") {
+    if (busy) {
+      json(res, 429, { ok: false, error: "다른 미러링 작업이 진행 중입니다." });
+      return;
+    }
+    busy = true;
+    try {
+      const body = await readRequestBody(req);
+      const payload = JSON.parse(body || "{}");
+      const result = await cancelDiscoveryScheduledPostsBatch(payload.urls || payload.url);
+      json(res, 200, { ok: true, ...result });
+    } catch (error) {
+      logEvent("discovery_schedule_cancel_batch_error", { error: error.message });
+      json(res, 500, { ok: false, error: error.message });
+    } finally {
+      busy = false;
+    }
+    return;
+  }
+  if (req.method === "POST" && req.url === "/api/discovery/convert-schedule-to-local") {
+    if (busy) {
+      json(res, 429, { ok: false, error: "다른 미러링 작업이 진행 중입니다." });
+      return;
+    }
+    busy = true;
+    try {
+      const body = await readRequestBody(req);
+      const payload = JSON.parse(body || "{}");
+      const result = await convertScheduledDiscoveryRowsToLocal(payload.urls || payload.url);
+      const settings = payload.setMode === false
+        ? loadDiscoverySettings()
+        : setScheduleDeliveryMode(SCHEDULE_DELIVERY_LOCAL_POST);
+      json(res, 200, {
+        ok: true,
+        scheduleDeliveryMode: settings.scheduleDeliveryMode,
+        ...result,
+      });
+    } catch (error) {
+      logEvent("discovery_schedule_convert_local_error", { error: error.message });
+      json(res, 500, { ok: false, error: error.message });
+    } finally {
+      busy = false;
+    }
+    return;
+  }
   if (req.method === "POST" && req.url === "/api/discovery/confirm-x-deleted") {
     try {
       const body = await readRequestBody(req);
@@ -23704,12 +26954,8 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   if (req.method === "POST" && req.url === "/api/discovery/schedule") {
-    if (busy) {
-      json(res, 429, { ok: false, error: "다른 미러링 작업이 진행 중입니다." });
-      return;
-    }
     let canonicalUrl = "";
-    busy = true;
+    let acquiredBusy = false;
     try {
       const body = await readRequestBody(req);
       const payload = JSON.parse(body || "{}");
@@ -23717,19 +26963,40 @@ const server = http.createServer(async (req, res) => {
       if (payload.text && String(payload.text).trim()) {
         await updateDiscoveryTitle(canonicalUrl, payload.text);
       }
+      const scheduleDelivery = assignScheduleDelivery(
+        canonicalUrl,
+        payload.scheduleDelivery || getScheduleDeliveryMode(),
+      );
       logEvent("discovery_manual_schedule_request", {
         canonicalUrl,
         scheduledAtRaw: payload.scheduledAt || null,
         browserTimezone: payload.scheduledAtTimezone || null,
         browserOffsetMinutes: Number.isFinite(Number(payload.scheduledAtOffsetMinutes)) ? Number(payload.scheduledAtOffsetMinutes) : null,
+        scheduleDelivery,
       });
+      if (scheduleDelivery === SCHEDULE_DELIVERY_LOCAL_POST) {
+        const result = await commitLocalDiscoverySchedule(canonicalUrl, payload.scheduledAt, {
+          source: "dashboard_manual_schedule",
+        });
+        json(res, 200, { ok: true, ...result });
+        return;
+      }
+      if (busy) {
+        json(res, 429, { ok: false, error: "다른 미러링 작업이 진행 중입니다." });
+        return;
+      }
+      busy = true;
+      acquiredBusy = true;
       const result = await postDiscoveryRowToX(canonicalUrl, {
         textOverride: payload.text,
         schedule: true,
         scheduledAt: payload.scheduledAt,
+        scheduleDelivery: SCHEDULE_DELIVERY_X_NATIVE,
       });
-      await markDiscoveryScheduled(canonicalUrl, result.mediaCount, result.scheduledAt);
-      json(res, 200, { ok: true, ...result });
+      await markDiscoveryScheduled(canonicalUrl, result.mediaCount, result.scheduledAt, {
+        scheduleDelivery: SCHEDULE_DELIVERY_X_NATIVE,
+      });
+      json(res, 200, { ok: true, scheduleDelivery: SCHEDULE_DELIVERY_X_NATIVE, ...result });
     } catch (error) {
       if (canonicalUrl && shouldMarkDiscoveryScheduleFailed(error)) {
         await markDiscoveryScheduleFailed(canonicalUrl, error);
@@ -23742,7 +27009,7 @@ const server = http.createServer(async (req, res) => {
         json(res, 500, { ok: false, error: error.message });
       }
     } finally {
-      busy = false;
+      if (acquiredBusy) busy = false;
     }
     return;
   }
@@ -23816,12 +27083,18 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && req.url.startsWith("/api/discovery/status")) {
     try {
       const rows = await listDiscoveryRows(50);
+      const groupDistribution = await getDiscoveryGroupDistribution();
       json(res, 200, {
         ok: true,
         mode: "dashboard_manual_post",
         xDraftOnly: false,
         autoDiscoveryEnabled: isAutoDiscoveryEnabled(),
         autoStyleScheduleEnabled: isAutoStyleScheduleEnabled(),
+        scheduleDeliveryMode: getScheduleDeliveryMode(),
+        groupApproval: getGroupApprovalSettings(),
+        groupDistribution,
+        groupApprovalUsage: await countGroupApprovalUsageForKstDay().catch(() => null),
+        groupApprovalDailyCap: effectiveGroupApprovalDailyCap(getGroupApprovalSettings()),
         autoStyleScheduleMaxPerScan: DISCOVERY_AUTO_STYLE_SCHEDULE_MAX_PER_SCAN,
         autoStyleMinScore: DISCOVERY_AUTO_STYLE_MIN_SCORE,
         autoStyleMaxFutureHours: DISCOVERY_AUTO_STYLE_MAX_FUTURE_HOURS,
@@ -23932,9 +27205,13 @@ async function futureScheduledDiscoveryRows() {
   const db = await getDiscoveryDb();
   const rows = await db.prepare(`
     SELECT canonical_url AS canonicalUrl, text_preview AS textPreview,
-      media_count AS mediaCount, scheduled_post_at AS scheduledAt
+      media_count AS mediaCount, scheduled_post_at AS scheduledAt,
+      COALESCE(schedule_delivery, 'x_native') AS scheduleDelivery
     FROM thread_discoveries
-    WHERE status = 'scheduled' AND scheduled_post_at IS NOT NULL AND scheduled_post_at > ?
+    WHERE status = 'scheduled'
+      AND scheduled_post_at IS NOT NULL
+      AND scheduled_post_at > ?
+      AND COALESCE(schedule_delivery, 'x_native') != 'local_post'
     ORDER BY scheduled_post_at ASC
     LIMIT 100
   `).all(new Date().toISOString());
@@ -24298,6 +27575,16 @@ async function runXScheduleMonitor(options = {}) {
 }
 
 function startBackgroundWorkAfterBrowserCleanup() {
+  storyLocalQueue.recover();
+  const dispatchStories = () => {
+    try {
+      const policy = readJsonFile(path.join(__dirname, ".data/story-drafts/operations-policy.json"), {});
+      if (policy.deliveryMode !== "local_post" || policy.dispatchEnabled !== true) return;
+      storyLocalQueue.tick().catch(error => logEvent("story_local_tick_error", { error: error.message }));
+    } catch (error) { logEvent("story_local_tick_error", { error: error.message }); }
+  };
+  setTimeout(dispatchStories, 10_000);
+  setInterval(dispatchStories, 15_000);
   setTimeout(() => {
     try {
       const result = pumpTerafabxOwnPostReplyWriteQueue();
@@ -24318,6 +27605,15 @@ function startBackgroundWorkAfterBrowserCleanup() {
       logEvent("discovery_startup_recovery_scan_error", { error: error.message });
     });
   }, 2000);
+
+  setTimeout(() => {
+    backfillDiscoveryCandidateGroups()
+      .then(() => pruneDiscoveryReviewOutsideVideoStyle())
+      .then(() => backfillDiscoveryTitleVoiceRewrites())
+      .then(() => recoverApprovedDiscoveryQueue())
+      .then(() => drainApprovedDiscoveryRows())
+      .catch(() => {});
+  }, 2500);
 
   setTimeout(() => {
     runDiscoveryScheduleRecovery({ source: "startup" }).catch((error) => {
@@ -24414,6 +27710,24 @@ function startBackgroundWorkAfterBrowserCleanup() {
     });
   }, 60 * 1000);
 
+  setTimeout(() => {
+    maybeDispatchLocalScheduledPosts().catch((error) => {
+      logEvent("local_schedule_dispatch_startup_error", { error: error.message });
+    });
+  }, 8000);
+
+  setInterval(() => {
+    maybeDispatchLocalScheduledPosts().catch((error) => {
+      logEvent("local_schedule_dispatch_tick_error", { error: error.message });
+    });
+  }, LOCAL_SCHEDULE_DISPATCH_INTERVAL_MS);
+
+  setInterval(() => {
+    drainApprovedDiscoveryRows().catch((error) => {
+      logEvent("discovery_group_drain_error", { error: error.message });
+    });
+  }, 60 * 1000);
+
   setInterval(() => {
     runXScheduleMonitor({ source: "timer" }).catch((error) => {
       logEvent("x_schedule_monitor_tick_error", { error: error.message });
@@ -24447,7 +27761,9 @@ function startBackgroundWorkAfterBrowserCleanup() {
         removed: result.removed.map((item) => ({ ...item, dir: path.basename(item.dir) })),
       });
     }
-    cleanupExpiredDiscoveryMediaSnapshots();
+    cleanupExpiredDiscoveryMediaSnapshots().catch((error) => {
+      logEvent("discovery_media_snapshot_ttl_cleanup_error", { error: error.message });
+    });
   }, MEDIA_TEMP_CLEANUP_INTERVAL_MS);
 }
 
@@ -24459,7 +27775,9 @@ function startBackgroundWork() {
     ...mediaCleanup,
     removed: mediaCleanup.removed.map((item) => ({ ...item, dir: path.basename(item.dir) })),
   });
-  cleanupExpiredDiscoveryMediaSnapshots({ reason: "startup" });
+  cleanupExpiredDiscoveryMediaSnapshots({ reason: "startup" }).catch((error) => {
+    logEvent("discovery_media_snapshot_ttl_cleanup_error", { reason: "startup", error: error.message });
+  });
   cleanupOwnedTerafabxGrokBrowserProfiles("startup")
     .then(() => cleanupKnownTerafabxGrokWebSessions("startup"))
     .catch((error) => {
@@ -24525,6 +27843,7 @@ module.exports = {
   cleanupMediaTempDir,
   cleanupOrphanedMediaTempDirs,
   isVideoMediaUrl,
+  isThreadsVideoPosterUrl,
   discoveryThumbnailCachePath,
   downloadMedia,
   discoveryMediaSnapshotKey,
@@ -24538,14 +27857,32 @@ module.exports = {
   classifyThreadSocialLine,
   linkedThreadMediaAttributionLabels,
   validateYouTubeUrl,
+  youtubeDlArgs,
+  youtubeDownloadFailureDetail,
+  resolveHomebrewTool,
+  homebrewBinFromNodeExecPath,
   isYouTubeUrl,
+  firstUsableDiscoveryText,
+  isDiscoveryPlaceholderText,
   normalizeDiscoveryUrl,
+  normalizeDiscoveryScheduleCancelBatchUrls,
   buildYouTubeXText,
   sanitizeYouTubeXTitle,
   dashboardDiscoveryRow,
   DuplicateMirrorError,
   isPublishedDiscoveryRow,
   mergeDiscoveryRowsWithMirrorHistory,
+  normalizeScheduleDelivery,
+  normalizeScheduleDeliveryMode,
+  scheduleDeliveryOf,
+  isLocalScheduleDelivery,
+  assignScheduleDelivery,
+  isDueLocalScheduledRow,
+  canFulfillLocalScheduledMirror,
+  shouldConvertScheduledRowToLocal,
+  SCHEDULE_DELIVERY_X_NATIVE,
+  SCHEDULE_DELIVERY_LOCAL_POST,
+  SCHEDULE_DELIVERY_AB,
   removeCompletedMirror,
   buildTerafabxOwnPostReplyCompletionMetrics,
   enrichDiscoveryRowsWithReplyCompletion,
@@ -24592,6 +27929,7 @@ module.exports = {
   analyzeHomeVerifiedContext,
   analyzeHomeVerifiedContextWithGemini,
   buildHomeVerifiedPreparedCommentRecord,
+  refreshHomeVerifiedWriteReview,
   prepareTerafabxHomeVerifiedComment,
   reviewHomeVerifiedReplyWithGemini,
   closeTerafabxGeminiHeadlessBrowser,
@@ -24686,6 +28024,8 @@ module.exports = {
   normalizeFxTwitterV2Status,
   fetchFxTwitterConversation,
   flattenFxTwitterConversationReplies,
+  isTerafabxOwnPostConversationComplete,
+  mergeTerafabxFxTwitterConversations,
   normalizeTerafabxOwnPostReplyManualQueue,
   terafabxOwnPostReplyQueueItemForUrl,
   terafabxReplyReviewFinalScore,
@@ -24693,6 +28033,7 @@ module.exports = {
   isTerafabxGrokNonJsonLimitText,
   withTerafabxBrowserSetupCleanup,
   xPageReadyState,
+  shouldAbortXPageReadyForRateLimit,
   randomTerafabxOwnPostReplyDelayMs,
   terafabxOwnPostReplyWriterDesiredGapMs,
   terafabxOwnPostReplyWriterDelayMs,
@@ -24734,6 +28075,7 @@ module.exports = {
   scheduledVerificationAttemptDisposition,
   findXScheduledEntry,
   xScheduledTimeNeedles,
+  xScheduledCheckboxMatches,
   xScheduleMonitorBrowserConfig,
   resolveAgentBrowserBin,
   agentBrowserCommandArgs,
@@ -24764,6 +28106,7 @@ module.exports = {
   isThreadsMediaRegression,
   isThreadsInvalidPageText,
   isThreadsUnusableExtraction,
+  isThreadsShellChromeText,
   threadsInvalidPageError,
   isDiscoveryFailureLabel,
   runDiscoveryScheduleRecovery,
@@ -24788,8 +28131,32 @@ module.exports = {
   ensureComposerText,
   verifyComposerText,
   composerTextMatchesExpected,
+  readXComposerState,
+  xUploadSettleDecision,
+  xComposerUploadRetryDecision,
   truncateXText,
   xWeightedLength,
   classifyXScheduleDialogState,
   xScheduleRecoveryAction,
+  AUTO_SCHEDULE_INTERVAL_MS,
+  AUTO_SCHEDULE_MINUTE_STEP,
+  autoScheduleOffsetFromLatest,
+  autoScheduleRandomMinutes,
+  applyAutoScheduleRandomMinute,
+  pickAutoScheduleMinute,
+  classifyDiscoveryGroupByRules,
+  canApproveDiscoveryRow,
+  canUnapproveDiscoveryRow,
+  getGroupApprovalSettings,
+  normalizeGroupApprovalSettings,
+  DISCOVERY_APPROVED_STATUS,
+  effectiveGroupApprovalDailyCap,
+  groupApprovalAllowsApprove,
+  groupApprovalAllowsStanding,
+  selectApprovedRowsForDrain,
+  isGroupApprovalContentConstraint,
+  isDiscoveryMediaExtractFailure,
+  kstDayBounds,
+  discoveryAutoBatchAfterSave,
+  DISCOVERY_AUTO_BATCH_LIMIT,
 };

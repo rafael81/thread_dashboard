@@ -9,6 +9,12 @@ const {
   classifyThreadSocialLine,
   linkedThreadMediaAttributionLabels,
   classifyXScheduleDialogState,
+  AUTO_SCHEDULE_INTERVAL_MS,
+  AUTO_SCHEDULE_MINUTE_STEP,
+  autoScheduleOffsetFromLatest,
+  autoScheduleRandomMinutes,
+  applyAutoScheduleRandomMinute,
+  pickAutoScheduleMinute,
   composerTextMatchesExpected,
   assessTerafabxLanguageQuality,
   assessXScheduledEntry,
@@ -22,6 +28,7 @@ const {
   evaluateTerafabxCommentWorkflow,
   shouldTerafabxCommentMonitorRequestPrefill,
   terafabxGrokQuotaMonitorFinding,
+  findCompletedMirror,
   isPublishedDiscoveryRow,
   isTerafabxQuietPostingTime,
   terafabxDailyCommentProgress,
@@ -30,6 +37,7 @@ const {
   assessTerafabxSourceAnchorGrounding,
   scoreTerafabxClichePenalty,
   selectRootPostMediaCandidates,
+  isThreadsVideoPosterUrl,
   selectThreadSourceText,
   shouldAutoRecoverXScheduledAnomaly,
   findXScheduledEntry,
@@ -44,9 +52,11 @@ const {
   isThreadsMediaRegression,
   isThreadsInvalidPageText,
   isThreadsUnusableExtraction,
+  isThreadsShellChromeText,
   threadsInvalidPageError,
   isDiscoveryFailureLabel,
   xAccountVerificationDisposition,
+  normalizeDiscoveryScheduleCancelBatchUrls,
   mirrorWorkTabRoleAllowsUrl,
   threadPostSnapshotForMirror,
   isConfirmedTerafabxGrokContext,
@@ -62,8 +72,10 @@ const {
   verifyComposerText,
   xWeightedLength,
   xScheduledTimeNeedles,
+  xScheduledCheckboxMatches,
   xScheduleMonitorBrowserConfig,
   xPageReadyState,
+  shouldAbortXPageReadyForRateLimit,
   xScheduleRecoveryAction,
   resolveAgentBrowserBin,
   agentBrowserCommandArgs,
@@ -155,6 +167,25 @@ test('a Threads not-found page is never accepted as post text', () => {
   assert.equal(isThreadsInvalidPageText('아니 저 조그만 머릿속에 지금 물음표 100개 떠 있는 거 아니냐고ㅠㅠ🐱❓'), false);
 });
 
+test('Threads app nav chrome is never accepted as post text', () => {
+  const chrome = '추천\n새로운 스레드\n검색';
+  assert.equal(isThreadsShellChromeText(chrome), true);
+  assert.equal(isThreadsInvalidPageText(chrome), true);
+  assert.equal(isDiscoveryFailureLabel(chrome), true);
+  assert.equal(cleanThreadText(chrome, 'sean970106'), '');
+  assert.equal(cleanThreadTextOverride(chrome), '');
+  assert.equal(cleanThreadText('sean970106\n추천\n새로운 스레드\n검색\n오늘 날씨 좋다', 'sean970106'), '오늘 날씨 좋다');
+  assert.equal(isThreadsShellChromeText('검색해봐'), false);
+  assert.equal(isThreadsUnusableExtraction({
+    targetArticleFound: false,
+    handleFound: false,
+  }, [], 'embedded-looking-caption', chrome), true);
+  assert.equal(isThreadsUnusableExtraction({
+    targetArticleFound: false,
+    handleFound: false,
+  }, ['https://cdn.example/1.jpg'], 'caption', chrome), false);
+});
+
 test('a Threads temporary error page is never accepted as post text', () => {
   const errorPage = [
     '문제가 발생했습니다. 나중에 다시 시도해보세요.',
@@ -206,6 +237,26 @@ test('a user-deleted X schedule has a dedicated local reconciliation route', () 
   assert.match(source, /cancelledReason: "user_deleted_on_x"/);
   assert.match(source, /req\.url === "\/api\/discovery\/confirm-x-deleted"/);
 });
+
+test('user-deleted X schedule history does not keep the dashboard row reserved', () => {
+  const url = 'https://www.youtube.com/shorts/nmKgLmqkj4Q';
+  const now = Date.parse('2026-08-16T05:20:00.000Z');
+  const merged = mergeDiscoveryRowsWithMirrorHistory([{
+    canonicalUrl: url,
+    status: 'review',
+    textPreview: '5만 톤 배가 산을 넘어갑니다, 펌프 하나 없는 물의 계단',
+    scheduledPostAt: null,
+  }], now, [{
+    canonicalUrl: url,
+    status: 'scheduled',
+    scheduledAt: '2026-08-16T05:45:00.000Z',
+    cancelledReason: 'user_deleted_on_x',
+    cancelledAt: '2026-08-16T05:20:00.000Z',
+    mediaCount: 1,
+  }]);
+  assert.equal(merged[0].status, 'review');
+  assert.equal(merged[0].scheduledPostAt, null);
+});
 const {
   agentBrowserInvocation: geminiAgentBrowserInvocation,
   geminiAgentBrowserNamespace,
@@ -252,6 +303,57 @@ test('discovery list supports checkbox selection and ordered batch auto-schedule
   assert.match(dashboardSource, /for \(const row of rowsToQueue\)/);
   assert.match(dashboardSource, /"dashboard_batch_auto_schedule"/);
   assert.match(dashboardSource, /onBatchAutoSchedule=\{queueDiscoveryAutoScheduleBatch\}/);
+});
+
+test('discovery list shows a direct discard button on discovered and posted rows', () => {
+  const tableSource = fs.readFileSync(path.join(__dirname, '..', 'dashboard', 'src', 'components', 'data-table.tsx'), 'utf8');
+  assert.match(tableSource, /isScheduled \? \([\s\S]*onCancelSchedule[\s\S]*\) : \([\s\S]*onDiscard[\s\S]*삭제/);
+  assert.match(tableSource, /variant="destructive"[\s\S]*Trash2Icon[\s\S]*삭제/);
+});
+
+test('discovery list supports selected batch discard for discovered rows', () => {
+  const tableSource = fs.readFileSync(path.join(__dirname, '..', 'dashboard', 'src', 'components', 'data-table.tsx'), 'utf8');
+  const dashboardSource = fs.readFileSync(path.join(__dirname, '..', 'dashboard', 'src', 'main.jsx'), 'utf8');
+
+  assert.match(tableSource, /선택 \{table\.getSelectedRowModel\(\)\.rows\.length\}개 삭제/);
+  assert.match(tableSource, /await props\.onBatchDiscard\(selectedRows\)/);
+  assert.match(dashboardSource, /async function discardDiscoveryRowsBatch\(selectedRows\)/);
+  assert.match(dashboardSource, /\/api\/discovery\/discard/);
+  assert.match(dashboardSource, /onBatchDiscard=\{discardDiscoveryRowsBatch\}/);
+});
+
+test('scheduled list supports checkbox selection and batch X schedule cancel', () => {
+  const tableSource = fs.readFileSync(path.join(__dirname, '..', 'dashboard', 'src', 'components', 'data-table.tsx'), 'utf8');
+  const dashboardSource = fs.readFileSync(path.join(__dirname, '..', 'dashboard', 'src', 'main.jsx'), 'utf8');
+  const serverSource = fs.readFileSync(path.join(__dirname, '..', 'mirror_server.js'), 'utf8');
+
+  assert.match(tableSource, /view === "discovered" \|\| view === "scheduled"/);
+  assert.match(tableSource, /view === "scheduled"\s*&& row\.original\.status === "scheduled"/);
+  assert.match(tableSource, /선택 \{table\.getSelectedRowModel\(\)\.rows\.length\}개 예약 취소/);
+  assert.match(tableSource, /await props\.onBatchCancelSchedule\(selectedRows\)/);
+  assert.match(dashboardSource, /async function cancelDiscoveryScheduledRowsBatch\(selectedRows\)/);
+  assert.match(dashboardSource, /\/api\/discovery\/cancel-schedule-batch/);
+  assert.match(dashboardSource, /onBatchCancelSchedule=\{cancelDiscoveryScheduledRowsBatch\}/);
+  assert.match(serverSource, /req\.url === "\/api\/discovery\/cancel-schedule-batch"/);
+  assert.match(serverSource, /async function cancelDiscoveryScheduledPostsBatch/);
+  assert.match(serverSource, /dashboard_schedule_cancel_batch/);
+});
+
+test('batch schedule cancel URLs are normalized and deduped', () => {
+  assert.deepEqual(normalizeDiscoveryScheduleCancelBatchUrls([
+    " https://www.threads.com/@a/post/AAA?x=1 ",
+    "https://www.threads.com/@a/post/AAA",
+    "https://www.threads.com/@b/post/BBB",
+    "",
+    "https://www.threads.com/@a/post/AAA/",
+  ]), [
+    "https://www.threads.com/@a/post/AAA",
+    "https://www.threads.com/@b/post/BBB",
+  ]);
+  assert.deepEqual(
+    normalizeDiscoveryScheduleCancelBatchUrls("https://www.threads.com/@c/post/CCC"),
+    ["https://www.threads.com/@c/post/CCC"],
+  );
 });
 
 test('ordinary auto comments count posted and pending reservations per author on the KST date', () => {
@@ -329,6 +431,75 @@ test('TerafabX discovery style accepts a short Korean visual entertainment hook'
   assert.equal(result.pass, true);
   assert.ok(result.score >= 6);
   assert.equal(result.signals.entertainment, true);
+});
+
+test('TerafabX discovery style fails closed for personal diary captions', () => {
+  const text = '운동이 인생 0순위인데 강인수 대표님 발 힘무게 1톤은 좀...';
+  const result = assessTerafabxDiscoveryStyle(
+    { likeCount: 8000, textPreview: text },
+    {
+      text,
+      likeCount: 8000,
+      mediaUrls: ['https://cdn.example/video.mp4'],
+      diagnostics: { mediaCandidates: [{ width: 720, height: 1280 }] },
+    },
+  );
+  assert.equal(result.pass, false);
+  assert.equal(result.personalCommentary, true);
+  assert.ok(result.reasons.includes('personal_commentary'));
+});
+
+test('TerafabX discovery style requires cute animal captions and engagement over 1000', () => {
+  const animal = assessTerafabxDiscoveryStyle(
+    { likeCount: 2500, textPreview: '고양이는 처음 봄ㅋㅋ' },
+    {
+      text: '고양이는 처음 봄ㅋㅋ',
+      likeCount: 2500,
+      mediaUrls: ['https://cdn.example/video.mp4'],
+      diagnostics: { mediaCandidates: [{ width: 720, height: 1280 }] },
+    },
+  );
+  assert.equal(animal.pass, true);
+  assert.equal(animal.animalCute, true);
+  assert.equal(animal.engagementOk, true);
+
+  const nonAnimal = assessTerafabxDiscoveryStyle(
+    { likeCount: 9000, textPreview: '리필통 안 씻고 팩 통째로 넣는 거 발견함ㅋㅋ' },
+    {
+      text: '리필통 안 씻고 팩 통째로 넣는 거 발견함ㅋㅋ',
+      likeCount: 9000,
+      mediaUrls: ['https://cdn.example/video.mp4'],
+      diagnostics: { mediaCandidates: [{ width: 720, height: 1280 }] },
+    },
+  );
+  assert.equal(nonAnimal.pass, false);
+  assert.equal(nonAnimal.animalCute, false);
+
+  const low = assessTerafabxDiscoveryStyle(
+    { likeCount: 500, viewCount: 800, textPreview: '강아지 꼬순내 미침ㅋㅋ' },
+    {
+      text: '강아지 꼬순내 미침ㅋㅋ',
+      likeCount: 500,
+      viewCount: 800,
+      mediaUrls: ['https://cdn.example/video.mp4'],
+      diagnostics: { mediaCandidates: [{ width: 720, height: 1280 }] },
+    },
+  );
+  assert.equal(low.pass, false);
+  assert.equal(low.engagementOk, false);
+
+  const timelineKept = assessTerafabxDiscoveryStyle(
+    { likeCount: 1800, textPreview: '강아지 꼬순내 미침ㅋㅋ' },
+    {
+      text: '강아지 꼬순내 미침ㅋㅋ',
+      likeCount: 1,
+      viewCount: 0,
+      mediaUrls: ['https://cdn.example/video.mp4'],
+      diagnostics: { mediaCandidates: [{ width: 720, height: 1280 }] },
+    },
+  );
+  assert.equal(timelineKept.engagementOk, true);
+  assert.equal(timelineKept.engagement, 1800);
 });
 
 test('TerafabX discovery style fails closed for political or promotional posts', () => {
@@ -452,6 +623,7 @@ test('past scheduled discovery row is treated as posted on dashboard', () => {
     status: 'posted',
     postedAt: '2026-07-05T07:40:00.000Z',
     scheduledPostAt: null,
+    scheduleDelivery: 'x_native',
   });
 });
 
@@ -1361,6 +1533,16 @@ test('launchd prepends the active Node directory to child process PATH', () => {
   );
 });
 
+test('launchd Cellar Node path also prepends Homebrew bin so yt-dlp is found', () => {
+  assert.equal(
+    ensureNodeExecutablePath(
+      '/usr/bin:/bin:/usr/sbin:/sbin',
+      '/opt/homebrew/Cellar/node/26.7.0/bin/node',
+    ),
+    '/opt/homebrew/bin:/opt/homebrew/Cellar/node/26.7.0/bin:/usr/bin:/bin:/usr/sbin:/sbin',
+  );
+});
+
 test('Grok namespace cleanup de-duplicates only valid daemon process ids', () => {
   assert.deepEqual(namespaceProcessIds('2871\n2884\n2871\ninvalid\n0\n'), [2871, 2884]);
 });
@@ -1437,6 +1619,18 @@ test('X schedule list is usable when real schedule rows coexist with a stale ret
 
   assert.equal(state.errorVisible, true);
   assert.equal(state.ready, true);
+});
+
+test('X schedule wait does not abort on an incidental 429 before rows appear', () => {
+  const loading = xPageReadyState({
+    bodyText: '예약 게시물',
+    scheduleMarkerCount: 0,
+    rateLimited: true,
+  }, 'schedule');
+  assert.equal(loading.ready, false);
+  assert.equal(shouldAbortXPageReadyForRateLimit(loading, 'schedule'), false);
+  assert.equal(shouldAbortXPageReadyForRateLimit({ rateLimited: true, ready: false }, 'page'), true);
+  assert.equal(shouldAbortXPageReadyForRateLimit({ rateLimited: true, ready: true }, 'schedule'), false);
 });
 
 test('X schedule list remains verifiable when a background request is rate-limited after rows loaded', () => {
@@ -1657,6 +1851,48 @@ test('Threads media extraction rejects images owned by nested reply articles', (
   assert.deepEqual(result.selectedMedia.map((item) => item.src), [rootImage.src]);
 });
 
+test('Threads video first-frame posters are not posted as photos when video exists', () => {
+  const posterEfg = Buffer.from(JSON.stringify({
+    vencode_tag: 'CAROUSEL_ITEM.xpids.640.sdr.video_first_frame_thumbnail.C3',
+  })).toString('base64');
+  const poster = {
+    kind: 'image',
+    src: `https://scontent.cdninstagram.com/v/t51.71878-15/poster.jpg?efg=${posterEfg}`,
+    top: 225, left: 0, width: 210, height: 280,
+    rootOwned: true, matchesTargetPost: true, belowHandle: true,
+  };
+  const video = {
+    kind: 'video',
+    src: 'https://scontent.cdninstagram.com/o1/v/t16/f2/m84/clip.mp4',
+    top: 225, left: 0, width: 210, height: 280,
+    rootOwned: true, matchesTargetPost: true, belowHandle: true,
+  };
+  const photo = {
+    kind: 'image',
+    src: 'https://scontent.cdninstagram.com/v/t51.82787-15/real-photo.jpg',
+    top: 225, left: 40, width: 210, height: 280,
+    rootOwned: true, matchesTargetPost: true, belowHandle: true,
+  };
+
+  assert.equal(isThreadsVideoPosterUrl(poster.src), true);
+  assert.equal(isThreadsVideoPosterUrl(photo.src), false);
+
+  const result = selectRootPostMediaCandidates([poster, photo, video]);
+  assert.deepEqual(result.selectedMedia.map((item) => item.kind), ['video', 'image']);
+  assert.deepEqual(result.selectedMedia.map((item) => item.src), [video.src, photo.src]);
+});
+
+test('orphan Threads video posters are dropped instead of posting stills', () => {
+  const poster = {
+    kind: 'image',
+    src: 'https://scontent.cdninstagram.com/v/t51.71878-15/poster.jpg?stp=dst-jpg_e15_tt6&efg=video_first_frame_thumbnail',
+    top: 100, left: 0, width: 210, height: 280,
+    rootOwned: true, matchesTargetPost: true, belowHandle: true,
+  };
+  const result = selectRootPostMediaCandidates([poster]);
+  assert.equal(result.selectedMedia.length, 0);
+});
+
 test('Threads text-only post does not borrow a related reply image', () => {
   const replyImage = {
     kind: 'image', src: 'https://cdninstagram.com/reply.jpg', top: 919, left: 0,
@@ -1679,6 +1915,16 @@ test('Threads body fallback rejects media below the root reply boundary', () => 
   const result = selectRootPostMediaCandidates([belowReplyComposer]);
 
   assert.equal(result.selectedMedia.length, 0);
+});
+
+test('X schedule cancel checkbox matches titles even when X strips emoji', () => {
+  const needles = ['2026년 8월 30일', '오전 8:00에 전송 예정'];
+  const checkboxText = '2026년 8월 30일 (일) 오전 8:00에 전송 예정 금요일이라 다들 눈 침침하지? 요 통통 뽀짝한 아기 손발 보고 안구정화해';
+  const title = '금요일이라 다들 눈 침침하지? 요 통통 뽀짝한 아기 손발 보고 안구정화해 🥹❤️';
+  assert.equal(xScheduledCheckboxMatches(checkboxText, needles, title), true);
+  assert.equal(xScheduledCheckboxMatches(checkboxText, needles, title.slice(0, 80)), true);
+  assert.equal(xScheduledCheckboxMatches(checkboxText, needles, '다른 제목입니다'), false);
+  assert.equal(xScheduledCheckboxMatches(checkboxText, ['오전 7:00에 전송 예정'], title), false);
 });
 
 test('X schedule monitor finds the exact KST slot and accepts its title', () => {
@@ -2003,6 +2249,44 @@ test('schedule recovery waits out rate limits and never retries hard constraints
     discoveryScheduleRetryDecision({ ...base, attempts: 3, lastError: 'X 작성창 로딩 실패' }, now).reason,
     'attempt_limit',
   );
+});
+
+test('auto-schedule slots are spaced 40 minutes after the latest known future slot', () => {
+  assert.equal(AUTO_SCHEDULE_INTERVAL_MS, 40 * 60 * 1000);
+  const latest = Date.parse('2026-08-29T10:00:00.000Z');
+  const now = Date.parse('2026-08-29T09:00:00.000Z');
+  assert.equal(autoScheduleOffsetFromLatest(latest, now), Date.parse('2026-08-29T10:40:00.000Z'));
+  assert.equal(autoScheduleOffsetFromLatest(0, latest), Date.parse('2026-08-29T10:40:00.000Z'));
+  const source = fs.readFileSync(path.join(__dirname, '..', 'mirror_server.js'), 'utf8');
+  const block = source.slice(
+    source.indexOf('async function nextAutoScheduleTime'),
+    source.indexOf('async function reserveNextAutoScheduleTime'),
+  );
+  assert.match(block, /autoScheduleOffsetFromLatest\(latest, now\)/);
+  assert.match(block, /applyAutoScheduleRandomMinute/);
+  assert.doesNotMatch(block, /30 \* 60 \* 1000/);
+});
+
+test('auto-schedule minutes are random 5-minute steps and never on the hour', () => {
+  assert.equal(AUTO_SCHEDULE_MINUTE_STEP, 5);
+  assert.deepEqual(autoScheduleRandomMinutes(), [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55]);
+  assert.equal(pickAutoScheduleMinute(() => 0), 5);
+  assert.equal(pickAutoScheduleMinute(() => 0.999), 55);
+  const earliest = Date.parse('2026-08-29T11:00:00.000Z');
+  const with25 = applyAutoScheduleRandomMinute(earliest, { minute: 25 });
+  assert.equal(with25.toISOString(), '2026-08-29T11:25:00.000Z');
+  assert.equal(with25.getMinutes() % 5, 0);
+  assert.notEqual(with25.getMinutes(), 0);
+  const afterForty = applyAutoScheduleRandomMinute(Date.parse('2026-08-29T11:40:00.000Z'), { minute: 15 });
+  assert.ok(afterForty.getTime() >= Date.parse('2026-08-29T11:40:00.000Z'));
+  assert.equal(afterForty.getMinutes(), 15);
+  assert.equal(afterForty.toISOString(), '2026-08-29T12:15:00.000Z');
+  for (let i = 0; i < 20; i += 1) {
+    const picked = applyAutoScheduleRandomMinute(earliest, { random: () => (i / 20) });
+    assert.equal(picked.getMinutes() % 5, 0);
+    assert.notEqual(picked.getMinutes(), 0);
+    assert.ok(picked.getTime() >= earliest);
+  }
 });
 
 test('legacy and current dashboard auto-schedule requests both use the queue path', () => {
