@@ -129,12 +129,12 @@ test("same content under another ID and out-of-window slots are rejected atomica
 });
 
 
-test("daily cap blocks a 31st legacy root but permits the 30th root's reply", async t => {
+test("daily cap blocks a 16th legacy root but permits the 15th root's reply", async t => {
   const f = fixture(t, async o => { o.beforeSubmit(); o.onReceipt({url: "https://x.com/terafabXai/status/101"}); });
   await f.queue.enqueue([f.input]); f.advance(300000);
   const file = path.join(f.root, ".data/story-drafts/local-queue.json");
   const state = f.queue.read();
-  for (let i=0;i<30;i++) state.items.push({id: "done-"+i, operatingDate:f.input.operatingDate, status:"posted", postUrl:"https://x.com/terafabXai/status/"+(i+10)});
+  for (let i=0;i<15;i++) state.items.push({id: "done-"+i, operatingDate:f.input.operatingDate, status:"posted", postUrl:"https://x.com/terafabXai/status/"+(i+10)});
   fs.writeFileSync(file, JSON.stringify(state));
   assert.equal((await f.queue.tick()).skipped, "daily_limit");
   assert.equal(f.calls.length, 0);
@@ -145,15 +145,15 @@ test("daily cap blocks a 31st legacy root but permits the 30th root's reply", as
   assert.deepEqual(f.calls,["https://x.com/terafabXai/status/100"]);
 });
 
-test("thirty originals are allowed when no curation is available; 31st import is rejected", async t => {
+test("fifteen originals are allowed when no curation is available; 16th import is rejected", async t => {
   const f=fixture(t,async()=>{});
   const file=path.join(f.root,".data/story-drafts/local-queue.json");
-  const items=Array.from({length:29},(_,i)=>({id:"old-"+i,operatingDate:f.input.operatingDate,type:"fiction",status:"scheduled",text:"different-"+i,scheduledAt:new Date(Date.parse(f.input.scheduledAt)+(i+1)*60000).toISOString()}));
+  const items=Array.from({length:14},(_,i)=>({id:"old-"+i,operatingDate:f.input.operatingDate,type:"fiction",status:"scheduled",text:"different-"+i,scheduledAt:new Date(Date.parse(f.input.scheduledAt)+(i+1)*60000).toISOString()}));
   fs.writeFileSync(file,JSON.stringify({version:1,items}));
   assert.equal((await f.queue.enqueue([f.input])).added.length,1);
   fs.writeFileSync(path.join(f.root,f.input.storyDir,"post.txt"),"별개의 사연");
-  await assert.rejects(f.queue.enqueue([{...f.input,id:"thirty-first",scheduledAt:"2026-09-27T10:00:00+09:00"}]),/Daily 30/);
-  assert.equal(f.queue.read().items.length,30);
+  await assert.rejects(f.queue.enqueue([{...f.input,id:"sixteenth",scheduledAt:"2026-09-27T10:00:00+09:00"}]),/Daily 15/);
+  assert.equal(f.queue.read().items.length,15);
 });
 
 function carousel(f, count = 3) {
@@ -225,4 +225,65 @@ test('separate stories wait a full minute after the previous story, even after r
   assert.equal((await f.queue.tick()).skipped,'story_post_interval');assert.equal(f.calls.length,0);
   f.advance(59999);const restarted=createStoryQueue(f.args);assert.equal((await restarted.tick()).skipped,'story_post_interval');
   f.advance(1);assert.equal((await restarted.tick()).posted,f.input.id);assert.equal(f.calls.length,2);
+});
+
+function enableImageReview(f) {
+  fs.writeFileSync(path.join(f.root, ".data/story-drafts/operations-policy.json"), JSON.stringify({ requireStoryImageReview: true }));
+}
+function inspectFixtureImage(f) {
+  const dir = path.join(f.root, f.input.storyDir);
+  const rootImageSha256 = require("node:crypto").createHash("sha256").update(fs.readFileSync(path.join(dir, "image.png"))).digest("hex");
+  fs.writeFileSync(path.join(dir, "image-review.json"), JSON.stringify({ version: 1, status: "passed", method: "visual_inspection",
+    reviewer: "test fixture", reviewedAt: new Date().toISOString(), rootImageSha256,
+    checks: { limb_count: true, limb_connections: true, hands_and_grips: true } }));
+}
+test("image review is required before queue registration", async t => {
+  const f = fixture(t, async () => {}); enableImageReview(f);
+  await assert.rejects(f.queue.enqueue([f.input]), /visual review required/);
+  assert.equal(f.queue.read().items.length, 0);
+  inspectFixtureImage(f); await f.queue.enqueue([f.input]);
+  assert.equal(f.queue.read().items.length, 1);
+});
+test("changing an image and its queue hash does not reuse the old visual inspection", async t => {
+  const f = fixture(t, async () => { throw new Error("must not publish"); });
+  enableImageReview(f); inspectFixtureImage(f); await f.queue.enqueue([f.input]);
+  const state = f.queue.read(), file = state.items[0].media[0].path;
+  fs.writeFileSync(file, "replacement without visual review");
+  state.items[0].media[0].sha256 = require("node:crypto").createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+  fs.writeFileSync(path.join(f.root, ".data/story-drafts/local-queue.json"), JSON.stringify(state));
+  f.advance(300000);
+  assert.equal((await f.queue.tick()).reason, "image_visual_review");
+  assert.equal(f.calls.length, 0); assert.equal(f.queue.read().items[0].status, "needs_review");
+});
+test("valid inspected image publishes and lost inspection does not prevent an existing root's reply", async t => {
+  const f = fixture(t, async (o, n) => {
+    if (n === 2) throw new Error("reply composer not ready");
+    o.beforeSubmit(); o.onReceipt({ url: o.targetUrl ? "https://x.com/terafabXai/status/2" : "https://x.com/terafabXai/status/1" });
+  });
+  enableImageReview(f); inspectFixtureImage(f); await f.queue.enqueue([f.input]);
+  f.advance(300000); await f.queue.tick();
+  fs.unlinkSync(path.join(f.root, f.input.storyDir, "image-review.json"));
+  f.advance(60000); assert.equal((await f.queue.tick()).posted, f.input.id);
+  assert.deepEqual(f.calls, [null, "https://x.com/terafabXai/status/1", "https://x.com/terafabXai/status/1"]);
+});
+
+test("curation quota defaults to one and allows three only with configured policy", async t => {
+  const f = fixture(t, async () => { throw new Error("must not publish"); });
+  const base = path.join(f.root, ".data/story-drafts");
+  const inputs = Array.from({ length: 4 }, (_, i) => {
+    const dir = path.join(base, `issue-${i}`); fs.mkdirSync(dir);
+    for (const [name, value] of Object.entries({
+      "post.txt": `Recent issue ${i}`, "body.txt": `Opening ${i}`,
+      "reply_01.txt": `Verified ending ${i}`, "image.png": "image-fixture",
+      "source.json": JSON.stringify({ type: "curation", source: { url: `https://example.com/issue/${i}` } }),
+    })) fs.writeFileSync(path.join(dir, name), value);
+    return { ...f.input, id: `issue-${i}`, storyDir: path.relative(f.root, dir), scheduledAt: `2026-09-27T0${7 + i}:00:00+09:00`.replace("T010:", "T10:") };
+  });
+  await f.queue.enqueue([inputs[0]]);
+  await assert.rejects(f.queue.enqueue([inputs[1]]), /maximum 1 curation/);
+  fs.writeFileSync(path.join(base, "operations-policy.json"), JSON.stringify({ curationCount: 3 }));
+  assert.equal((await f.queue.enqueue([inputs[1], inputs[2]])).added.length, 2);
+  await assert.rejects(f.queue.enqueue([inputs[3]]), /maximum 3 curation/);
+  assert.equal(f.queue.read().items.length, 3);
+  assert.equal(f.calls.length, 0);
 });
