@@ -46,6 +46,17 @@ test("daily posted archive supplies body, replies, provenance, and real receipt 
   assert.equal(rows[0].story.sourceUrl,"https://aagag.com/issue/?idx=123");
   assert.throws(()=>dailyStoryMedia(root,"daily-ten:../../etc:01"),/Invalid/);
 });
+test("stopped or missed lineup slots leave the scheduled view while posts stay posted", t => {
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),"daily-stopped-"));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  const base=path.join(root,".data/story-drafts/daily-ten"), dir=path.join(base,"2026-10-30/03");fs.mkdirSync(dir,{recursive:true});
+  const key="daily-ten:2026-10-30:03";
+  fs.writeFileSync(path.join(dir,"post.txt"),"첫 문장");fs.writeFileSync(path.join(dir,"source.json"),JSON.stringify({type:"fiction",review:{passed:true}}));
+  fs.writeFileSync(path.join(base,"lineup.json"),JSON.stringify({items:[{key,scheduledAt:"2026-10-29T23:00:00Z"}]}));
+  const early=Date.parse("2026-10-29T00:00:00Z");
+  assert.equal(mergeDailyDashboardRows([],root,early,{dispatchActive:false})[0].status,"review");
+  assert.equal(mergeDailyDashboardRows([],root,Date.parse("2026-10-31T00:00:00Z"))[0].status,"review");
+  assert.equal(mergeDailyDashboardRows([{canonicalUrl:key,status:"posted",xPostUrl:"https://x.com/terafabXai/status/1"}],root,early,{dispatchActive:false})[0].status,"posted");
+});
 test("one-off publication stays linked to its archived text and own reply", t => {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),"oneoff-dashboard-"));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
   const dir=path.join(root,".data/story-drafts/oneoff");fs.mkdirSync(dir,{recursive:true});

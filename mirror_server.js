@@ -19915,23 +19915,31 @@ function nextAutoScheduleCandidate(latestMs, nowMs, scheduleDelivery) {
   return candidate;
 }
 
+// Story and daily-ten rows use their own queues; their placeholders must not push
+// discovery reservations days into the future.
+function isStoryScheduleKey(canonicalUrl) {
+  return /^(story|daily-ten|creative):/.test(String(canonicalUrl || ""));
+}
+
 async function nextAutoScheduleTime(scheduleDelivery = getScheduleDeliveryMode() === SCHEDULE_DELIVERY_LOCAL_POST
   ? SCHEDULE_DELIVERY_LOCAL_POST : SCHEDULE_DELIVERY_X_NATIVE) {
   const now = Date.now();
   const times = [
     ...loadScheduleSlots().map((entry) => entry.scheduledAt),
-    ...loadMirrorHistory().filter((entry) => entry.status === "scheduled").map((entry) => entry.scheduledAt),
+    ...loadMirrorHistory().filter((entry) => entry.status === "scheduled" && !isStoryScheduleKey(entry.canonicalUrl))
+      .map((entry) => entry.scheduledAt),
   ]
     .map((value) => new Date(value).getTime())
     .filter((time) => Number.isFinite(time) && time > now);
   try {
     const db = await getDiscoveryDb();
     const rows = await db.prepare(`
-      SELECT scheduled_post_at AS scheduledAt
+      SELECT canonical_url AS canonicalUrl, scheduled_post_at AS scheduledAt
       FROM thread_discoveries
       WHERE scheduled_post_at IS NOT NULL
     `).all();
     for (const row of rows) {
+      if (isStoryScheduleKey(row.canonicalUrl)) continue;
       const time = new Date(row.scheduledAt).getTime();
       if (Number.isFinite(time) && time > now) times.push(time);
     }
@@ -24246,10 +24254,13 @@ async function getDiscoveryDashboardData(requestUrl = "/api/discovery/dashboard"
   const autoDiscoveryEnabled = isAutoDiscoveryEnabled();
   const autoStyleScheduleEnabled = isAutoStyleScheduleEnabled();
   const nowMs = Date.now();
+  const storyPolicy = readJsonFile(path.join(__dirname, ".data/story-drafts/operations-policy.json"), {});
+  const dailyPolicy = readJsonFile(path.join(__dirname, ".data/story-drafts/daily-ten-policy.json"), {});
   const allRows = mergeDailyDashboardRows(mergeStoryDashboardRows(
     mergeDiscoveryRowsWithMirrorHistory(await listDiscoveryRows(300), nowMs),
     storyLocalQueue.read().items, __dirname,
-  ), __dirname, nowMs);
+    { dispatchActive: storyPolicy.deliveryMode === "local_post" && storyPolicy.dispatchEnabled === true },
+  ), __dirname, nowMs, { dispatchActive: dailyPolicy.enabled === true });
   const requestedTimelineDate = String(parsedUrl.searchParams.get("date") || "").trim();
   const timelineDate = requestedTimelineDate === "all" || /^\d{4}-\d{2}-\d{2}$/.test(requestedTimelineDate)
     ? requestedTimelineDate
