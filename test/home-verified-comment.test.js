@@ -350,7 +350,10 @@ test("mirror_server re-exports home-verified classifiers", () => {
   assert.equal(status.enabled, false);
   assert.equal(status.policy.blueVerifiedOnly, true);
   assert.equal(status.policy.homeTimelineOriginalOnly, true);
-  assert.equal(status.policy.geminiTextOnlyContextAndDraft, true);
+  assert.equal(status.policy.geminiTextOnlyContextAndDraft, false);
+  assert.equal(status.policy.mediaReviewer, "codex");
+  assert.equal(status.policy.commentWriter, "gemini");
+  assert.equal(status.policy.geminiReceivesMedia, false);
   assert.equal(status.policy.lengthTonePolish, false);
   assert.equal(status.policy.preferStage1Draft, true);
   assert.equal(status.policy.draftQualityViaLlmAndPromptOnly, true);
