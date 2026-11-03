@@ -29,6 +29,17 @@ test("prompt with media frames requires scene over caption translation", () => {
   assert.doesNotMatch(prompt, /영상 프레임이 없다/);
 });
 
+test("text-only prompt translates foreign captions without inventing scenes", () => {
+  const prompt = buildDiscoveryTitleRefinePrompt("要不是超市有罐罐，我才不来呢。");
+  assert.match(prompt, /要不是超市有罐罐/);
+  assert.match(prompt, /영상은 보지 않는다/);
+  assert.match(prompt, /자연스러운 한국어로 옮긴다/);
+  assert.match(prompt, /기계번역처럼 어색한 한국어/);
+  assert.match(prompt, /추측해서 덧붙이지 않는다/);
+  assert.doesNotMatch(prompt, /빈 결과로 둔다/);
+  assert.doesNotMatch(prompt, /첨부 이미지/);
+});
+
 test("vague captions include foreign fluff and emotion-only lines", () => {
   assert.equal(isVagueDiscoveryCaption("정말 웃고 울게 해요 🤣🤣🤣"), true);
   assert.equal(isVagueDiscoveryCaption("Blue Therapy 🩵"), true);
@@ -115,6 +126,7 @@ test("mirror server wires media frames into refine and title-refine API", () => 
   assert.match(refineBlock, /status IN/);
   assert.match(refineBlock, /prepareDiscoveryTitleRefineMedia/);
   assert.match(refineBlock, /needs_media_context/);
+  assert.match(refineBlock, /DISCOVERY_TITLE_REFINE_USE_MEDIA\s*\?\s*await prepareDiscoveryTitleRefineMedia/);
   assert.match(refineBlock, /--image/);
   assert.match(refineBlock, /hasMediaFrames/);
   assert.match(source, /extractDiscoveryTitleRefineFrames/);

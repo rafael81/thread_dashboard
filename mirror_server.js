@@ -337,6 +337,9 @@ const TERAFABX_HOME_VERIFIED_COMMENT_X_LOCK_PATH = process.env.TERAFABX_HOME_VER
   || path.join(os.tmpdir(), `terafabx-home-verified-comment-x${TERAFABX_HOME_VERIFIED_COMMENT_X_PORT}.lock`);
 const TERAFABX_HOME_VERIFIED_COMMENT_GEMINI_PORT_BASE = Number(process.env.TERAFABX_HOME_VERIFIED_COMMENT_GEMINI_PORT_BASE || 9374);
 const DISCOVERY_TITLE_REFINE_GEMINI_PORT = Number(process.env.DISCOVERY_TITLE_REFINE_GEMINI_PORT || 9384);
+// Gemini Web stalls after frame uploads, so titles are rewritten from caption text only
+// unless DISCOVERY_TITLE_REFINE_USE_MEDIA=1.
+const DISCOVERY_TITLE_REFINE_USE_MEDIA = process.env.DISCOVERY_TITLE_REFINE_USE_MEDIA === "1";
 const DISCOVERY_TITLE_REFINE_TIMEOUT_MS = Math.max(60_000, Number(process.env.DISCOVERY_TITLE_REFINE_TIMEOUT_MS || 180_000));
 const DISCOVERY_GROUP_CLASSIFY_GEMINI_PORT = Number(process.env.DISCOVERY_GROUP_CLASSIFY_GEMINI_PORT || 9385);
 const DISCOVERY_SCAN_CHROME_PORT = Number(process.env.DISCOVERY_SCAN_CHROME_PORT || 9386);
@@ -22213,7 +22216,8 @@ async function prepareDiscoveryTitleRefineMedia(canonicalUrl, row, criteria = {}
  * 대시보드에 저장된 글 제목(text_preview)을 Gemini Web 헤드리스로 1회 다듬는다.
  * fail-closed: 검증을 통과한 재작성만 적용하고, 사용자가 이미 제목을 고쳤거나
  * 행 상태가 review를 벗어났으면 건드리지 않는다.
- * 외국어·감정만 있는 캡션은 영상 프레임을 같이 보고 장면을 쓴다.
+ * 기본은 캡션 글만 보고 자연스러운 한국어로 옮긴다. DISCOVERY_TITLE_REFINE_USE_MEDIA=1이면
+ * 영상 프레임을 같이 보고 장면을 쓴다.
  */
 async function refineDiscoveryTitleOnce(canonicalUrl, originalTitle, options = {}) {
   if (isAagagUrl(canonicalUrl)) return { applied: false, reason: "manual_aagag_article" };
@@ -22250,10 +22254,12 @@ async function refineDiscoveryTitleOnce(canonicalUrl, originalTitle, options = {
   const runId = `discovery-title-refine-${new Date().toISOString().replace(/[:.]/g, "-")}-${crypto.randomBytes(3).toString("hex")}`;
   const runDir = path.join(TERAFABX_GEMINI_REVIEW_DIR, runId);
   fs.mkdirSync(runDir, { recursive: true });
-  const mediaPrep = await prepareDiscoveryTitleRefineMedia(canonicalUrl, row, criteria, runDir);
+  const mediaPrep = DISCOVERY_TITLE_REFINE_USE_MEDIA
+    ? await prepareDiscoveryTitleRefineMedia(canonicalUrl, row, criteria, runDir)
+    : { frames: [] };
   const framePaths = mediaPrep.frames || [];
   const hasMediaFrames = framePaths.length > 0;
-  if (isVagueDiscoveryCaption(sourceTitle) && !hasMediaFrames) {
+  if (DISCOVERY_TITLE_REFINE_USE_MEDIA && isVagueDiscoveryCaption(sourceTitle) && !hasMediaFrames) {
     const marker = {
       at: new Date().toISOString(),
       from: sourceTitle.slice(0, 240),
