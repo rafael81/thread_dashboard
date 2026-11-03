@@ -1363,6 +1363,13 @@ function Dashboard() {
     }
   }
 
+  function changeScheduleDeliveryMode(mode) {
+    return runAction("schedule-delivery-mode", () => api("/api/discovery/schedule-delivery-mode", {
+      method: "POST",
+      body: JSON.stringify({ mode }),
+    }), "예약 방식 변경됨");
+  }
+
   function rowText(row, textOverride) {
     const value = (textOverride ?? titleEdits[row.canonicalUrl] ?? row.textPreview ?? "").trim();
     return ["(본문 없음)", "수집 중"].includes(value) ? "" : value;
@@ -1680,6 +1687,8 @@ function Dashboard() {
       scheduleEdits={scheduleEdits}
       busy={busy}
       autoScheduleSubmitting={autoScheduleSubmitting}
+      scheduleDeliveryMode={summary.scheduleDeliveryMode || "ab"}
+      onScheduleDeliveryModeChange={changeScheduleDeliveryMode}
       onViewChange={changeView}
       onGroupChange={setGroup}
       onApproveGroup={(nextGroup, groupRows) =>
@@ -1915,14 +1924,14 @@ function Dashboard() {
                   <CardHeader>
                     <CardTitle>수동 추가</CardTitle>
                     <CardDescription>
-                      Android 공유 없이 Threads 또는 YouTube URL을 대시보드에 바로 넣습니다.
+                      Threads, YouTube, AAGAG 링크를 넣고 본문과 미디어를 확인한 뒤 X에 게시하세요.
                     </CardDescription>
                   </CardHeader>
                   <CardContent className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto]">
                     <Input
                       value={urlInput}
                       onChange={(event) => setUrlInput(event.target.value)}
-                      placeholder="Threads 또는 YouTube Shorts URL"
+                      placeholder="Threads · YouTube · AAGAG URL"
                     />
                     <Button
                       disabled={!urlInput.trim() || controlsBusy}
@@ -1994,23 +2003,18 @@ function Dashboard() {
                       단계 {summary.groupApproval?.rolloutStage || "shadow"} · 일일 상한 {summary.groupApproval?.dailyPostCap || 8} · 승인된 A/B만 예약. C와 미승인 행은 게시하지 않습니다.
                     </p>
                     <div className="col-span-2 grid gap-2">
-                      <Label htmlFor="schedule-delivery-mode">예약 전달 A/B</Label>
+                      <Label htmlFor="schedule-delivery-mode">예약 방식</Label>
                       <Select
                         value={summary.scheduleDeliveryMode || "ab"}
-                        onValueChange={(mode) =>
-                          runAction("schedule-delivery-mode", () => api("/api/discovery/schedule-delivery-mode", {
-                            method: "POST",
-                            body: JSON.stringify({ mode }),
-                          }), "예약 전달 방식 변경됨")
-                        }
-                        disabled={controlsBusy}
+                        onValueChange={changeScheduleDeliveryMode}
+                        disabled={controlsBusy || autoScheduleSubmitting.length > 0}
                       >
                         <SelectTrigger id="schedule-delivery-mode" className="w-full">
                           <SelectValue placeholder="예약 전달 방식" />
                         </SelectTrigger>
                         <SelectContent>
                           <SelectItem value="ab">A/B 50:50 · URL 해시 고정</SelectItem>
-                          <SelectItem value="x_native">X 네이티브 예약만</SelectItem>
+                          <SelectItem value="x_native">X 예약 · 40분 간격</SelectItem>
                           <SelectItem value="local_post">로컬 직접게시만</SelectItem>
                         </SelectContent>
                       </Select>

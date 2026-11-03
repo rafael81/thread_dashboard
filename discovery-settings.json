@@ -1,7 +1,7 @@
 {
   "autoDiscoveryEnabled": false,
   "autoStyleScheduleEnabled": false,
-  "scheduleDeliveryMode": "local_post",
+  "scheduleDeliveryMode": "x_native",
   "groupApproval": {
     "enabled": true,
     "rolloutStage": "manual_batch",
