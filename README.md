@@ -6,6 +6,32 @@ The server scans Threads, stores media posts for manual review, and can post a
 selected card to X through a headed Chrome session. It also keeps the legacy
 Threads video downloader script.
 
+## AAGAG 링크 수동 게시
+
+`/discovery`의 **수동 추가**에 `https://aagag.com/issue/?idx=1621842_1` 같은
+AAGAG 이슈 링크를 넣는다. 서버는 Chrome 9224에서 본문 영역만 읽고, 원문 순서대로
+최대 4개의 이미지/영상을 저장한다. 광고·댓글·영상 컨트롤은 본문에서 제외하며
+WebP 이미지는 X에 첨부할 JPEG로 변환한다. 링크 추가 요청은 즉시 반환된다.
+
+수집된 행을 열어 본문과 미디어를 확인하고 **게시**를 누르면 `@terafabXai` 계정을
+검증한 뒤 기존 X 작성창 경로로 게시한다. 추가만으로 자동 게시하거나 초안을 만들지 않는다.
+같은 이슈의 다른 리비전(`_0`, `_1`)도 게시 이력에서 중복 확인한다.
+수동 AAGAG 글에는 Threads 자동 발굴용 동물/조회수 필터와 자동 제목 재작성을 적용하지 않아,
+서버를 재시작해도 검토 목록과 원문 본문이 유지된다.
+
+수집 모듈은 `lib/aagag-source.js`, 보관 미디어는 `.data/generated-media/aagag-*/`에 있다.
+미디어가 누락되면 텍스트만 게시하지 않고 재수집을 안내한다.
+
+실제 게시 없이 작성창까지 확인하려면 수집 완료 후 아래 요청을 사용한다. 계정 확인,
+본문 입력, 미디어 업로드와 게시 버튼 활성화를 검사하고 작업 탭·임시 파일을 정리한다.
+이 검증은 실제 게시/예약 확정 E2E를 대체하지 않는다.
+
+```sh
+curl -H 'content-type: application/json' \
+  -d '{"url":"https://aagag.com/issue/?idx=1621842_1"}' \
+  http://127.0.0.1:3131/api/discovery/verify-compose
+```
+
 ## Windows 운영
 
 Requirements:

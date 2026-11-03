@@ -38,6 +38,13 @@ const {
   scoreTerafabxClichePenalty,
   selectRootPostMediaCandidates,
   isThreadsVideoPosterUrl,
+  isThreadsBlobMediaUrl,
+  isThreadsNetworkVideoUrl,
+  normalizeThreadsNetworkVideoUrl,
+  collectThreadsNetworkVideoUrls,
+  countThreadsBlobVideos,
+  threadsEmbeddedPostMedia,
+  resolveThreadsExtractedMedia,
   selectThreadSourceText,
   shouldAutoRecoverXScheduledAnomaly,
   findXScheduledEntry,
@@ -747,7 +754,8 @@ test('TerafabX Gemini rewrite prompt does not ask the rewriting model to score i
 
   assert.doesNotMatch(prompt, /"score"\s*:/);
   assert.match(prompt, /이 단계에서 점수를 매기지 않는다/);
-  assert.match(prompt, /8~45자/);
+  assert.match(prompt, /길이 하한 없이 최대 45자/);
+  assert.doesNotMatch(prompt, /12~30자|8~45자/);
   assert.match(prompt, /길이를 늘리기보다 원문의 구체적인/);
 });
 
@@ -1893,6 +1901,107 @@ test('orphan Threads video posters are dropped instead of posting stills', () =>
   assert.equal(result.selectedMedia.length, 0);
 });
 
+test('a video+photo carousel whose video slide lacks a DOM src recovers the video from embedded JSON', () => {
+  const videoUrl = 'https://scontent.cdninstagram.com/o1/v/t16/f2/m84/clip.mp4';
+  const photo1 = 'https://scontent.cdninstagram.com/v/t51.82787-15/photo-1.jpg';
+  const photo2 = 'https://scontent.cdninstagram.com/v/t51.82787-15/photo-2.jpg';
+  const embeddedMedia = threadsEmbeddedPostMedia({
+    code: 'DeVqNOZk1Rs',
+    media_type: 8,
+    carousel_media: [
+      { media_type: 2, video_versions: [{ url: videoUrl }], image_versions2: { candidates: [{ url: 'https://scontent.cdninstagram.com/v/t51.71878-15/poster.jpg' }] } },
+      { media_type: 1, image_versions2: { candidates: [{ url: photo1 }] } },
+      { media_type: 1, image_versions2: { candidates: [{ url: photo2 }] } },
+    ],
+  });
+  assert.deepEqual(embeddedMedia.map((item) => item.kind), ['video', 'image', 'image']);
+
+  const resolved = resolveThreadsExtractedMedia({
+    videoUrls: [],
+    imageUrls: ['https://dom/photo-1.jpg', 'https://dom/photo-2.jpg'],
+    mediaUrls: ['https://dom/photo-1.jpg', 'https://dom/photo-2.jpg'],
+    embeddedMedia,
+  });
+  assert.equal(resolved.source, 'embedded_json');
+  assert.deepEqual(resolved.videoUrls, [videoUrl]);
+  assert.deepEqual(resolved.mediaUrls, [videoUrl, photo1, photo2]);
+
+  const missing = resolveThreadsExtractedMedia({
+    videoUrls: [],
+    imageUrls: [photo1],
+    mediaUrls: [photo1],
+    embeddedMedia: [{ kind: 'video', src: '' }, { kind: 'image', src: photo1 }],
+  });
+  assert.equal(missing.source, 'dom');
+  assert.equal(missing.expectedVideoCount > missing.videoUrls.length, true);
+
+  const source = fs.readFileSync(path.join(__dirname, '..', 'mirror_server.js'), 'utf8');
+  const extractBlock = source.slice(
+    source.indexOf('async function extractThreadPost'),
+    source.indexOf('async function discoverThreadsTimeline'),
+  );
+  assert.match(extractBlock, /videoUrls\.length < resolvedMedia\.expectedVideoCount/);
+  assert.match(extractBlock, /사진만 저장하지 않습니다/);
+  assert.match(extractBlock, /threads_video_resolved_from_network/);
+  assert.match(extractBlock, /blobVideoCount/);
+});
+
+test('blob-only Threads video DOM recovers https mp4 from network and does not post the poster', () => {
+  const blob = 'blob:https://www.threads.com/95eb436f-bcc2-483f-8c5f-4198d6d63c23';
+  const poster = 'https://scontent-ssn1-1.cdninstagram.com/v/t51.82787-15/844252602_poster.jpg?stp=dst-jpg_e15_tt6';
+  const mp4Short = 'https://scontent-ssn1-1.cdninstagram.com/o1/v/t2/f2/m78/clip-low.mp4';
+  const mp4High = 'https://scontent-ssn1-1.cdninstagram.com/o1/v/t2/f2/m367/clip-high-quality-longer-url.mp4?_nc_cat=109';
+  const mp4Range = `${mp4High}&bytestart=100&byteend=200`;
+
+  assert.equal(isThreadsBlobMediaUrl(blob), true);
+  assert.equal(isThreadsNetworkVideoUrl(mp4High), true);
+  assert.equal(isThreadsNetworkVideoUrl(poster), false);
+  assert.equal(normalizeThreadsNetworkVideoUrl(mp4Range), mp4High);
+  assert.equal(countThreadsBlobVideos({
+    videos: [blob],
+    selectedMedia: [{ kind: 'video', src: blob }],
+    diagnostics: { mediaCandidates: [{ kind: 'video', src: blob }] },
+  }), 1);
+
+  const page = {
+    events: [
+      { method: 'Network.responseReceived', params: { response: { url: mp4Short } } },
+      { method: 'Network.requestWillBeSent', params: { request: { url: mp4Range } } },
+      { method: 'Network.responseReceived', params: { response: { url: poster } } },
+    ],
+  };
+  const networkVideoUrls = collectThreadsNetworkVideoUrls(page, [mp4High, poster]);
+  assert.deepEqual(networkVideoUrls, [mp4High, mp4Short]);
+
+  // unique() strips blob:, leaving empty DOM video URLs — the previous failure mode.
+  const resolved = resolveThreadsExtractedMedia({
+    videoUrls: [],
+    imageUrls: [poster],
+    mediaUrls: [],
+    embeddedMedia: [],
+    networkVideoUrls,
+    blobVideoCount: 1,
+  });
+  assert.equal(resolved.source, 'network');
+  assert.deepEqual(resolved.videoUrls, [mp4High]);
+  assert.deepEqual(resolved.mediaUrls, [mp4High]);
+  assert.equal(resolved.expectedVideoCount, 1);
+  assert.deepEqual(resolved.imageUrls, []);
+  assert.deepEqual(resolved.networkMediaUrls, [mp4High, mp4Short]);
+
+  const stillMissing = resolveThreadsExtractedMedia({
+    videoUrls: [],
+    imageUrls: [poster],
+    mediaUrls: [],
+    embeddedMedia: [],
+    networkVideoUrls: [],
+    blobVideoCount: 1,
+  });
+  assert.equal(stillMissing.source, 'dom');
+  assert.equal(stillMissing.expectedVideoCount, 1);
+  assert.equal(stillMissing.videoUrls.length, 0);
+});
+
 test('Threads text-only post does not borrow a related reply image', () => {
   const replyImage = {
     kind: 'image', src: 'https://cdninstagram.com/reply.jpg', top: 919, left: 0,
@@ -2259,10 +2368,10 @@ test('auto-schedule slots are spaced 40 minutes after the latest known future sl
   assert.equal(autoScheduleOffsetFromLatest(0, latest), Date.parse('2026-08-29T10:40:00.000Z'));
   const source = fs.readFileSync(path.join(__dirname, '..', 'mirror_server.js'), 'utf8');
   const block = source.slice(
-    source.indexOf('async function nextAutoScheduleTime'),
+    source.indexOf('function nextAutoScheduleCandidate'),
     source.indexOf('async function reserveNextAutoScheduleTime'),
   );
-  assert.match(block, /autoScheduleOffsetFromLatest\(latest, now\)/);
+  assert.match(block, /autoScheduleOffsetFromLatest\(latestMs, nowMs\)/);
   assert.match(block, /applyAutoScheduleRandomMinute/);
   assert.doesNotMatch(block, /30 \* 60 \* 1000/);
 });
