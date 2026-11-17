@@ -2513,6 +2513,15 @@ test("TerafabX Chrome launches use the installed browser's native user agent", (
   }
 });
 
+test("TerafabX Chrome launches block the on-device AI model download", () => {
+  const args = terafabxChromeLaunchArgs({ port: 9299, profileDir: "/tmp/terafabx-no-model", headless: true });
+  assert.ok(args.includes("--disable-component-update"));
+  const features = args.find((arg) => arg.startsWith("--disable-features="));
+  assert.match(features, /OptimizationGuideModelDownloading/);
+  assert.match(features, /OptimizationGuideOnDeviceModel/);
+  assert.equal(args.filter((arg) => arg.startsWith("--disable-features=")).length, 1);
+});
+
 test("automatic pending comments always use the persistent quick writer path", () => {
   assert.equal(typeof terafabxAutoCommentQuickPostOptions, "function");
   assert.deepEqual(terafabxAutoCommentQuickPostOptions(), {

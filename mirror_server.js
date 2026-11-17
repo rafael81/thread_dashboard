@@ -2192,8 +2192,8 @@ function loadTerafabxState() {
   loaded.commentPrefillOnly = false;
   loaded.verifiedCommentReviewEnabled = false;
   loaded.ownPostReplyEnabled = false;
-  // 상대방 파란체크 원글 자동댓글은 서버 로드 시 항상 켜고 실제 게시까지 수행한다.
-  loaded.homeVerifiedCommentEnabled = true;
+  // 상대방 원글 자동댓글은 기본으로 켜지만, 명시적으로 끈 상태(2026-11-03 사용자 중단)는 재시작해도 유지한다.
+  loaded.homeVerifiedCommentEnabled = loaded.homeVerifiedCommentEnabled !== false;
   loaded.homeVerifiedCommentPrefillOnly = false;
   loaded.homeVerifiedCommentBacklog = homeVerifiedCommentLib.normalizeHomeVerifiedCandidateBacklog(
     loaded.homeVerifiedCommentBacklog,
@@ -2847,7 +2847,15 @@ async function fetchCommentSourceStatus(url) {
   const id = parseXStatusUrl(url)?.id;
   const data = await requestExternalJson(`${FXTWITTER_API_BASE.replace(/\/$/, "")}/2/status/${id}?about_account=1`, 20000);
   if (Number(data?.code) !== 200 || !data.status?.id) throw new Error(data?.message || "댓글 원문 확보 실패");
-  const alternative = await requestExternalJson(`https://api.vxtwitter.com/Twitter/status/${encodeURIComponent(id)}`, 20000);
+  // vxtwitter occasionally answers with an error body (no tweetID); retry before
+  // treating it as an ID/author mismatch, which discards the reply.
+  let alternative = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    alternative = await requestExternalJson(`https://api.vxtwitter.com/Twitter/status/${encodeURIComponent(id)}`, 20000).catch(error => ({ error: error.message }));
+    if (String(alternative?.tweetID || "") === String(id)) break;
+    logEvent("terafabx_comment_source_alternative_retry", { targetUrl: url, id, attempt: attempt + 1, got: String(alternative?.tweetID || alternative?.error || alternative?.message || "").slice(0, 120) });
+    await new Promise(resolve => setTimeout(resolve, 1500 * (attempt + 1)));
+  }
   const verified = commentMedia.reconcileSourceText(data.status, alternative);
   if (verified.comment_text_verification.extended) logEvent("terafabx_comment_source_text_extended", { targetUrl: url, id, verification: verified.comment_text_verification });
   return verified;
@@ -5706,6 +5714,64 @@ function parseTerafabxGrokResult(raw) {
   return normalizeTerafabxGrokResult({ reply: firstLine, rawPreview: source });
 }
 
+// Own story posts withhold the twist in the root and reveal it in the author's
+// first self-reply. Readers' comments often react to that ending, so replies and
+// their grounding review must see it (2026-11-09: "왜 내글 대댓글 안달아?").
+let ownStoryEndingCache = { mtimeMs: -1, byPostId: new Map() };
+function ownStoryEndingForRoot(rootPostUrl) {
+  const id = /\/status\/(\d+)/.exec(String(rootPostUrl || ""))?.[1];
+  if (!id) return "";
+  try {
+    const historyPath = path.join(__dirname, "mirror-history.json");
+    const mtimeMs = fs.statSync(historyPath).mtimeMs;
+    if (mtimeMs !== ownStoryEndingCache.mtimeMs) {
+      const byPostId = new Map();
+      for (const entry of JSON.parse(fs.readFileSync(historyPath, "utf8"))) {
+        const postId = /\/status\/(\d+)/.exec(String(entry?.postUrl || ""))?.[1];
+        if (postId) byPostId.set(postId, entry);
+      }
+      ownStoryEndingCache = { mtimeMs, byPostId };
+    }
+    const entry = ownStoryEndingCache.byPostId.get(id);
+    if (!entry) return "";
+    let ending = String(entry.replyReceipts?.[0]?.text || "").trim();
+    if (!ending && entry.storyDir) {
+      const file = path.join(__dirname, entry.storyDir, "reply_01.txt");
+      if (fs.existsSync(file)) ending = fs.readFileSync(file, "utf8").trim();
+    }
+    return cleanSocialText(ending);
+  } catch {
+    return "";
+  }
+}
+
+commentMedia.setAuthorEndingResolver(ownStoryEndingForRoot);
+
+// Our own replies to readers under this story (recent first). Readers often answer
+// them again, so their comments are collected too (2026-11-10 "내 글 대댓글에 달린 댓글도").
+const OWN_REPLY_THREAD_MAX_AGE_MS = 4 * 86400000;
+const OWN_REPLY_THREAD_MAX_PER_ROOT = 15;
+const OWN_REPLY_PER_AUTHOR_PER_ROOT = 2;
+function ownReplyIdsUnderRoot(rootPostUrl, state = loadTerafabxState(), nowMs = Date.now()) {
+  const rootId = parseXStatusUrl(rootPostUrl)?.id;
+  if (!rootId) return [];
+  return (state.ownPostReplyHistory || [])
+    .filter(record => parseXStatusUrl(record?.rootPostUrl || "")?.id === rootId && record?.replyUrl
+      && nowMs - Date.parse(record.postedAt || record.at || 0) <= OWN_REPLY_THREAD_MAX_AGE_MS)
+    .sort((a, b) => Date.parse(b.postedAt || b.at || 0) - Date.parse(a.postedAt || a.at || 0))
+    .map(record => parseXStatusUrl(record.replyUrl)?.id).filter(Boolean)
+    .slice(0, OWN_REPLY_THREAD_MAX_PER_ROOT);
+}
+
+function ownStoryReplyIdsForRoot(rootPostUrl) {
+  const id = /\/status\/(\d+)/.exec(String(rootPostUrl || ""))?.[1];
+  if (!id) return [];
+  ownStoryEndingForRoot(rootPostUrl); // refreshes the history cache
+  const entry = ownStoryEndingCache.byPostId.get(id);
+  const urls = [...(entry?.replyUrls || []), ...(entry?.replyReceipts || []).map(item => item?.url)];
+  return [...new Set(urls.map(url => /\/status\/(\d+)/.exec(String(url || ""))?.[1]).filter(Boolean))];
+}
+
 function terafabxPromptContextLines(target = {}, options = {}) {
   const mediaLines = options.generationOnly ? commentMedia.generationContextLines(target) : commentMedia.mediaContextLines(target);
   const speechHistory = commentSpeechHistoryLines(target.recentReplyTexts);
@@ -5721,6 +5787,13 @@ function terafabxPromptContextLines(target = {}, options = {}) {
       "대상 댓글이 주어·장면을 생략하면 부모 원글에서 상속하고, 이미 보이는 대상을 누구·무엇·어떤 대상인지 모르는 듯 되묻지 마라. 단, 대상 댓글 작성자가 직접 물은 내용을 함께 궁금해하는 맞장구는 가능하다.",
       `부모 원글 URL: ${rootPostUrl}`,
       `부모 원글: ${rootPostText.slice(0, 1800)}`,
+      ...(() => {
+        const ending = ownStoryEndingForRoot(rootPostUrl);
+        return ending ? [
+          `원글 작성자가 직접 단 결말 답글(이야기의 반전·결말, 사실 근거로 사용): ${ending.slice(0, 1200)}`,
+          "결말 답글 규칙: 독자 댓글이 결말·범인·이유를 묻거나 결말에 반응하면 위 결말 답글 내용을 근거로 답한다. 결말에 없는 사실은 새로 만들지 않는다.",
+        ] : [];
+      })(),
       `답글 대상 댓글 URL: ${target.url || ""}`,
       `답글 대상 댓글: ${targetText.slice(0, 1800)}`,
     ];
@@ -6404,6 +6477,8 @@ function assessTerafabxSourceAnchorGrounding(anchorValue = "", target = {}) {
     target.targetText,
     target.text,
     target.quotePostText,
+    // The author's own ending reply is part of the story's source (2026-11-10).
+    target.rootPostUrl ? ownStoryEndingForRoot(target.rootPostUrl) : "",
     terafabxTrustedSourceContext(target),
   ].filter(Boolean).join(" ")).normalize("NFKC").toLowerCase();
   if (!source || !anchor) {
@@ -6851,12 +6926,19 @@ function seedTerafabxOwnPostReplyGeminiProfiles(workerIndexes = []) {
   return results;
 }
 
+// Chrome otherwise downloads its ~4GB on-device AI model into every automation profile.
+const TERAFABX_CHROME_NO_MODEL_DOWNLOAD_ARGS = [
+  "--disable-component-update",
+  "--disable-features=OptimizationGuideModelDownloading,OptimizationGuideOnDeviceModel,OptimizationHintsFetching,OptimizationTargetPrediction",
+];
+
 function terafabxChromeLaunchArgs({ port, profileDir, headless = true } = {}) {
   return [
     `--remote-debugging-port=${port}`,
     `--user-data-dir=${profileDir}`,
     ...(headless ? ["--headless=new"] : ["--window-position=-20000,-20000"]),
     "--disable-gpu",
+    ...TERAFABX_CHROME_NO_MODEL_DOWNLOAD_ARGS,
     "--lang=ko-KR",
     "--window-size=1440,900",
     "--no-first-run",
@@ -7000,7 +7082,24 @@ async function reviewTerafabxReplyWithGemini(target, grokInput, options = {}) {
     if (!fs.existsSync(outPath)) throw new Error("Gemini Web 댓글 검수 출력 파일이 생성되지 않았습니다.");
     let review = parseTerafabxGeminiReview(fs.readFileSync(outPath, "utf8"));
     logEvent("terafabx_gemini_review_ok", { targetUrl: target.url, grokReply: grok.reply, finalReply: review.finalReply, decision: review.decision, reason: review.reason, runDir });
-    let finalJudge = await judgeTerafabxReplyWithGeminiHeadless(target, grok, review.finalReply, { ...options, cleanupBrowser: false });
+    let finalJudge;
+    try {
+      finalJudge = await judgeTerafabxReplyWithGeminiHeadless(target, grok, review.finalReply, { ...options, cleanupBrowser: false });
+    } catch (judgeError) {
+      // The judge throws on any failure, which skipped the repair branch below. When the
+      // only problem is the '~네요/~군요' commentary ending, rewrite just the ending in
+      // context and judge again instead of discarding a high-scoring reply (2026-11-10).
+      const message = String(judgeError?.message || "");
+      const score = Number(/탈락: (\d+)점/.exec(message)?.[1] || 0);
+      const speechOnly = /speech_commentary_ending/.test(message) && !/치명적 오류/.test(message) && score >= 80;
+      if (!speechOnly || Number(options.repairAttempt || 0) >= 1) throw judgeError;
+      finalJudge = {
+        passed: false, score,
+        flaggedQualityIssues: ["speech_commentary_ending"],
+        reason: "말투만 수정: 내용·사실·맞장구 의도는 그대로 두고, '~네요/~군요'(+웃음)로 끝나는 감상형 종결만 상대에게 직접 건네는 자연스러운 구어체 한 문장으로 바꿔라. '~네요/~군요'로 끝내지 말고, 너무 짧은 한두 단어 말고 12자 이상의 완결된 문장으로 써라.",
+      };
+      logEvent("terafabx_gemini_speech_only_repair", { targetUrl: target.url, finalReply: review.finalReply, score });
+    }
     if (!finalJudge.passed && Number(options.repairAttempt || 0) < 1) {
       const repairPromptPath = path.join(runDir, "repair-prompt.md");
       const repairOutPath = path.join(runDir, "gemini-repair.txt");
@@ -8784,7 +8883,7 @@ function isTerafabxGifOnlyReply(tweet = {}) {
     && Number(tweet.videoCount || 0) === gifCount;
 }
 
-function classifyTerafabxOwnPostReplies({ rootUrl, tweets = [], state = {}, requiredHandle = REQUIRED_X_HANDLE, verifiedOnly = false } = {}) {
+function classifyTerafabxOwnPostReplies({ rootUrl, tweets = [], state = {}, requiredHandle = REQUIRED_X_HANDLE, verifiedOnly = false, anchorIds = [] } = {}) {
   const root = parseXStatusUrl(rootUrl);
   const required = String(requiredHandle || "").replace(/^@/, "").toLowerCase();
   if (!root?.id || root.handle.toLowerCase() !== required) {
@@ -8801,15 +8900,28 @@ function classifyTerafabxOwnPostReplies({ rootUrl, tweets = [], state = {}, requ
     if (parsed?.id) repliedTargetIds.add(parsed.id);
   }
 
-  const directReplies = tweets.filter((tweet) => String(tweet?.replyingToStatus || "") === root.id);
+  // Readers also comment under the author's own ending reply; treat those as
+  // replies to the story (2026-11-09: comments on the ending were never answered).
+  const anchors = new Set([root.id, ...anchorIds.map(String)]);
+  const directReplies = tweets.filter((tweet) => anchors.has(String(tweet?.replyingToStatus || "")));
   const ownComments = directReplies.filter((tweet) => String(tweet?.authorHandle || "").toLowerCase() === required);
   const thirdPartyDirectReplies = directReplies.filter((tweet) => String(tweet?.authorHandle || "").toLowerCase() !== required);
   const alreadyReplied = thirdPartyDirectReplies.filter((tweet) => repliedTargetIds.has(String(tweet.id || "")));
   const banned = thirdPartyDirectReplies.filter((tweet) => TERAFABX_COMMENT_TARGET_BANNED_RE.test(String(tweet.text || "")));
   const advertisements = thirdPartyDirectReplies.filter((tweet) => isTerafabxOwnPostSpamReply(tweet));
   const unverified = thirdPartyDirectReplies.filter((tweet) => tweet?.authorVerified !== true);
+  // Loop guard: at most OWN_REPLY_PER_AUTHOR_PER_ROOT replies to one reader per story.
+  const repliesPerAuthor = new Map();
+  for (const record of state.ownPostReplyHistory || []) {
+    if (parseXStatusUrl(record?.rootPostUrl || "")?.id !== root.id || !record?.replyUrl) continue;
+    const author = String(record.targetAuthor || parseXStatusUrl(record.targetUrl || "")?.handle || "").toLowerCase();
+    if (author) repliesPerAuthor.set(author, (repliesPerAuthor.get(author) || 0) + 1);
+  }
+  const capped = (tweet) => anchorIds.length > 0
+    && (repliesPerAuthor.get(String(tweet?.authorHandle || "").toLowerCase()) || 0) >= OWN_REPLY_PER_AUTHOR_PER_ROOT;
   const candidates = thirdPartyDirectReplies.filter((tweet) => (
     tweet?.id
+    && !capped(tweet)
     && (cleanSocialText(tweet.text || "") || isTerafabxImageOnlyReply(tweet) || isTerafabxGifOnlyReply(tweet))
     && !repliedTargetIds.has(String(tweet.id))
     && !TERAFABX_COMMENT_TARGET_BANNED_RE.test(String(tweet.text || ""))
@@ -8825,7 +8937,7 @@ function classifyTerafabxOwnPostReplies({ rootUrl, tweets = [], state = {}, requ
     banned,
     advertisements,
     unverified,
-    nestedCount: tweets.filter((tweet) => tweet?.replyingToStatus && String(tweet.replyingToStatus) !== root.id).length,
+    nestedCount: tweets.filter((tweet) => tweet?.replyingToStatus && !anchors.has(String(tweet.replyingToStatus))).length,
     repliedTargetIds: Array.from(repliedTargetIds),
   };
 }
@@ -9820,10 +9932,13 @@ function buildTerafabxOwnPostTargetSharedContext(rootContextInput, target = {}) 
   const rootContext = normalizeTerafabxContextResult(rootContextInput);
   const targetText = cleanSocialText(target.targetText || "");
   const rootText = cleanSocialText(target.rootPostText || "");
+  const ending = ownStoryEndingForRoot(target.rootPostUrl);
   const contextSummary = [
     rootContext.contextSummary || (rootText ? `부모 원글: ${rootText}` : ""),
+    // The cached root analysis only saw the root; the author's own ending reply is part of the same story.
+    ending ? `원글 작성자가 직접 단 결말 답글(이야기의 결말, 사실 근거로 사용): ${ending.slice(0, 500)}` : "",
     targetText ? `답글 대상 댓글은 "${targetText}"이며, 이 댓글의 톤과 표현에 짧게 맞장구쳐야 한다.` : "답글 대상 댓글은 이미지/미디어 중심 반응일 수 있다.",
-  ].filter(Boolean).join(" ").slice(0, 1200);
+  ].filter(Boolean).join(" ").slice(0, 1800);
   const keyPoints = [
     ...(rootContext.keyPoints || []),
     targetText ? `대상 댓글: ${targetText.slice(0, 180)}` : "대상 댓글: 텍스트 없음",
@@ -10064,11 +10179,25 @@ async function collectTerafabxOwnPostConversation(postUrl, options = {}) {
       if (String(conversation.rootPost.authorHandle || "").toLowerCase() !== REQUIRED_X_HANDLE) {
         throw new Error(`대상 원문 계정 검증 실패: @${conversation.rootPost.authorHandle || "unknown"}`);
       }
+      const endingIds = ownStoryReplyIdsForRoot(normalizedPostUrl);
+      const anchorIds = [...new Set([...endingIds, ...ownReplyIdsUnderRoot(normalizedPostUrl)])];
+      for (const endingId of anchorIds) {
+        try {
+          const endingConversation = await fetchFxTwitterConversation(`https://x.com/${REQUIRED_X_HANDLE}/status/${endingId}`, {
+            ...conversationOptions, rankingMode: "recency", maxItems: 1_000, maxPages: 10,
+          });
+          conversation = mergeTerafabxFxTwitterConversations(conversation, endingConversation);
+          logEvent("terafabx_own_post_reply_ending_thread_merge", { postUrl: normalizedPostUrl, endingId, kind: endingIds.includes(endingId) ? "ending" : "own_reply", collectedReplyCount: endingConversation.collectedReplyCount });
+        } catch (error) {
+          logEvent("terafabx_own_post_reply_ending_thread_error", { postUrl: normalizedPostUrl, endingId, error: error.message });
+        }
+      }
       const classification = classifyTerafabxOwnPostReplies({
         rootUrl: normalizedPostUrl,
         tweets: conversation.tweets,
         state: loadTerafabxState(),
         verifiedOnly: options.verifiedOnly !== false,
+        anchorIds,
       });
       logEvent("terafabx_own_post_reply_candidates_api", {
         postUrl: normalizedPostUrl,
@@ -14097,6 +14226,7 @@ async function ensureNaverAdpostBrowser() {
   const child = spawn(chromeExecutablePath(), [
     `--remote-debugging-port=${NAVER_ADPOST_CHROME_PORT}`,
     `--user-data-dir=${NAVER_ADPOST_PROFILE_DIR}`,
+    ...TERAFABX_CHROME_NO_MODEL_DOWNLOAD_ARGS,
     "--no-first-run",
     "--no-default-browser-check",
     NAVER_ADPOST_MAIN_URL,
@@ -24265,7 +24395,7 @@ async function getDiscoveryDashboardData(requestUrl = "/api/discovery/dashboard"
   const allRows = mergeDailyDashboardRows(mergeStoryDashboardRows(
     mergeDiscoveryRowsWithMirrorHistory(await listDiscoveryRows(300), nowMs),
     storyLocalQueue.read().items, __dirname,
-    { dispatchActive: storyPolicy.deliveryMode === "local_post" && storyPolicy.dispatchEnabled === true },
+    { dispatchActive: storyPolicy.deliveryMode === "local_post" && (storyPolicy.dispatchEnabled === true || storyPolicy.headlessDispatchEnabled === true) },
   ), __dirname, nowMs, { dispatchActive: dailyPolicy.enabled === true });
   const requestedTimelineDate = String(parsedUrl.searchParams.get("date") || "").trim();
   const timelineDate = requestedTimelineDate === "all" || /^\d{4}-\d{2}-\d{2}$/.test(requestedTimelineDate)
@@ -28365,12 +28495,6 @@ function startBackgroundWorkAfterBrowserCleanup() {
   }, 15_000);
 
   setTimeout(() => {
-    runXScheduleMonitor({ source: "startup" }).catch((error) => {
-      logEvent("x_schedule_monitor_startup_error", { error: error.message });
-    });
-  }, 30000);
-
-  setTimeout(() => {
     runTerafabxCommentMonitor({ source: "startup" }).catch((error) => {
       logEvent("terafabx_comment_monitor_startup_error", { error: error.message });
     });
@@ -28471,11 +28595,7 @@ function startBackgroundWorkAfterBrowserCleanup() {
     });
   }, 60 * 1000);
 
-  setInterval(() => {
-    runXScheduleMonitor({ source: "timer" }).catch((error) => {
-      logEvent("x_schedule_monitor_tick_error", { error: error.message });
-    });
-  }, X_SCHEDULE_MONITOR_INTERVAL_MS);
+  // X schedule monitor timer removed (2026-11-05): its X 429s paused all comment writes for 30 min.
 
   setInterval(() => {
     runDiscoveryScheduleRecovery({ source: "timer" }).catch((error) => {
@@ -28578,6 +28698,8 @@ if (require.main === module) {
 }
 
 module.exports = {
+  collectTerafabxOwnPostConversation,
+  classifyTerafabxOwnPostReplies,
   // Local maintenance scripts reuse the same native X UI, account checks and locks.
   nativeScheduleMaintenance: {
     newPage, verifyXAccount, readXScheduledEntries, findXScheduledEntry, openXScheduledEntry,

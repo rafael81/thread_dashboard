@@ -361,9 +361,10 @@ test("mirror_server re-exports home-verified classifiers", () => {
   assert.equal(status.policy.geminiReviewAndJudge, true);
 });
 
-test("server load turns on live home-verified comments on other people's posts", () => {
+test("server load keeps home-verified comments on unless the user explicitly disabled them", () => {
   const source = fs.readFileSync(path.join(__dirname, "../mirror_server.js"), "utf8");
-  assert.match(source, /loaded\.homeVerifiedCommentEnabled = true/);
+  assert.match(source, /loaded\.homeVerifiedCommentEnabled = loaded\.homeVerifiedCommentEnabled !== false/);
+  assert.doesNotMatch(source, /loaded\.homeVerifiedCommentEnabled = true;/);
   assert.match(source, /loaded\.homeVerifiedCommentPrefillOnly = false/);
   assert.match(source, /fallback: "local"/);
   const defaults = homeVerifiedCommentLib.defaultHomeVerifiedStateSlice();
