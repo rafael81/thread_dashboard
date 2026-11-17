@@ -110,6 +110,7 @@ export type DashboardRow = {
     sourceUrl?: string | null
     replyUrls?: string[]
     replyFormat?: "text" | "images"
+    series?: string
     body: string
     replies: string[]
     status: string
@@ -210,11 +211,20 @@ function storyStatusLabel(status: string) {
 function StoryLabels({ story }: { story: NonNullable<DashboardRow["story"]> }) {
   const category = story.category || (story.type === "curation" ? "curation" : "general")
   const daily = story.id.startsWith("daily-ten:")
-  const imageReply = story.replyFormat === "images" || story.format === "image_carousel"
+  // Legacy carousel roots can now carry a plain text reply (replyFormat "text").
+  const imageReply = story.replyFormat === "images" || (story.format === "image_carousel" && story.replyFormat !== "text")
+  if (story.type === "info") {
+    return (
+      <span className="inline-flex flex-wrap items-center gap-1.5" aria-label="해설글">
+        <Badge variant="outline" className="border-sky-300 bg-sky-50 text-sky-700 dark:border-sky-700 dark:bg-sky-950 dark:text-sky-200">해설글</Badge>
+        <Badge variant="secondary">단일 글</Badge>
+      </span>
+    )
+  }
   return (
     <span className="inline-flex flex-wrap items-center gap-1.5" aria-label="사연 분류와 댓글 형식">
       <Badge variant="outline" className={category === "twist" ? "border-violet-300 bg-violet-50 text-violet-700 dark:border-violet-700 dark:bg-violet-950 dark:text-violet-200" : ""}>
-        {daily ? (story.type === "curation" ? "AAGAG" : "창작") : category === "twist" ? "반전 사연" : category === "curation" ? "큐레이션" : "일반 사연"}
+        {story.series || (daily ? (story.type === "curation" ? "AAGAG" : "창작") : category === "twist" ? "반전 사연" : category === "curation" ? "큐레이션" : "일반 사연")}
       </Badge>
       <Badge variant="secondary">{imageReply ? "이미지 댓글 · 캐러셀" : "텍스트 댓글"}</Badge>
     </span>
@@ -699,7 +709,8 @@ export function DataTable(props: DataTableProps) {
   const previousViewRef = React.useRef(view)
   const [openRowUrl, setOpenRowUrl] = React.useState<string | null>(null)
   const [onlyDailyPlans, setOnlyDailyPlans] = React.useState(true)
-  const dailyPlans = React.useMemo(() => rows.filter(row => row.canonicalUrl.startsWith("daily-ten:")), [rows])
+  // Own planned posts: daily 썰, daily info posts (해설글) and released legacy image 썰.
+  const dailyPlans = React.useMemo(() => rows.filter(row => /^(daily-ten:|info-post:|story:)/.test(row.canonicalUrl)), [rows])
   const displayRows = view === "scheduled" && onlyDailyPlans && dailyPlans.length ? dailyPlans : rows
   const openRow = React.useMemo(
     () => rows.find((row) => row.canonicalUrl === openRowUrl) || null,
