@@ -14,6 +14,7 @@ const { slotAt, slotsFor, scheduleFor } = require("../lib/daily-publishing");
 const { assertDailyStoryMediaReview } = require("../lib/daily-story-media-review");
 const { assertDailyStoryNarrativeReview } = require("../lib/daily-story-narrative-review");
 const { assertDailyStoryComprehensionReview } = require("../lib/daily-story-comprehension-review");
+const { assertDailyStoryHookReview } = require("../lib/daily-story-hook-review");
 function assertCurationFreshness(source, policy, { planning = false, alreadyPosted = false, now = Date.now() } = {}) {
   const rule = policy.curationFreshnessPolicy;
   if (planning || alreadyPosted || source.type !== "curation" || !rule?.enabled) return;
@@ -23,6 +24,19 @@ function assertCurationFreshness(source, policy, { planning = false, alreadyPost
   if (!Number.isFinite(started) || started > now || now - started > rule.originalStartMaxAgeHours * 3600000) {
     throw new Error("AAGAG original S: start must be verified within 48 hours; recent recirculation E: is insufficient");
   }
+}
+function hookSiblings(operatingDate) {
+  const lineup = read(path.join(base, "daily-ten", "lineup.json"));
+  return lineup.items.filter(item => item.operatingDate === operatingDate && item.type === "fiction" && item.status !== "cancelled")
+    .map(item => {
+      const storyDir = path.resolve(root, item.storyDir);
+      const hookFile = path.join(storyDir, "hook-review.json"), replyFile = path.join(storyDir, "reply_01.txt");
+      return {
+        key: item.key,
+        endingType: fs.existsSync(hookFile) ? read(hookFile).endingType : null,
+        reply: fs.existsSync(replyFile) ? fs.readFileSync(replyFile, "utf8").trim() : "",
+      };
+    });
 }
 function runTool(name, dir) {
   const result = spawnSync(process.execPath, [path.join(base, "daily-ten-tools", name), dir], { cwd: root, stdio: "inherit", timeout: 150000 });
@@ -60,6 +74,7 @@ function main() {
   const receiptFile = path.join(dir, "root-receipt.json");
   assertDailyStoryNarrativeReview({ policy: policy.narrativePolicy, alreadyPosted: Boolean(owned), source, post, reply, dir });
   assertDailyStoryComprehensionReview({ policy: policy.editorialQualityPolicy, alreadyPosted: Boolean(owned), source, post, reply, dir });
+  assertDailyStoryHookReview({ policy: policy.fictionHookPolicy, alreadyPosted: Boolean(owned), source, post, reply, dir, key, siblings: policy.fictionHookPolicy?.enabled && source.type === "fiction" ? hookSiblings(source.operatingDate) : [] });
   assertCurationFreshness(source, policy, { planning, alreadyPosted: Boolean(owned) });
   if (owned && (!fs.existsSync(receiptFile) || read(receiptFile).url !== owned.postUrl)) throw new Error("This slot already has a different or uncheckpointed root; reconcile instead of reposting");
   const start = Date.parse(`${source.operatingDate}T06:00:00+09:00`), end = start + 24 * 3600000;

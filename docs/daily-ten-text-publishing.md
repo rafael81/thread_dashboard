@@ -1,5 +1,9 @@
 # 하루20편 운영 — 새 제작은 창작만
 
+2026-11-03 23:41 지시: “창작글 게시할때 gemini, codex 역할 제외”, 답변 “로컬 예약 실행”, “AI 검수 단계 삭제”. Codex 자동화 `5-aagag5`는 창작 게시에서 제외(PAUSED)하고, Gemini 독해·결말 예측·판정 게이트(`editorialQualityPolicy`, `fictionHookPolicy`)는 `enabled=false`로 끈다. 기존 증거 파일은 보존한다. 게시 재개 시 게시 주체는 로컬 launchd `com.terafabx.daily-ten-publisher`(`scripts/daily-ten-local-publisher.cjs`, 슬롯 시각 1분·20분)이며 도래한 `planned` 슬롯 하나만 `publish-daily-ten.cjs`로 올리고 `daily-ten/local-publisher.log`에 남긴다. 23:45 “응, 재개해”로 `enabled=true`, `publishingPause.active=false`가 되어 로컬 예약 실행이 11/3 19번(00:00)부터 게시한다.
+
+2026-11-03 최신 지시: “지금 부터 앞으로 토요일까지 편성해봐”와 질문 답변 “편성하고 게시도 재개”, “창작 20편”, “좋은 것만 고쳐서 재사용”. 창작글 게시를 재개한다(`enabled=true`, `planningPause.active=false`, 자동화 `5-aagag5` 활성). 편성은 11월3일 18~20번과 11월4~7일 운영일 하루 창작20편이며 모두 아래 결말 예측·후킹 검사를 통과해야 한다. 취소된 원고 중 좋은 소재만 새 결말로 다시 쓰고 `reusedFrom`에 원래 키를 남긴다. 덮어쓴 취소 원고는 `daily-ten/replan-2026-11-03-hook/superseded/`에 보존한다. 작업 스크립트(`prep.py`, `run-gemini.cjs`, `finalize.py`)와 배치별 원응답도 같은 폴더에 있다. 아래 11월2일 중단 문단은 과거 기록이다. 결과: 83슬롯(11/3 3편, 11/4~7 각 20편) 모두 plan-check 통과, 취소 원고 재사용 7편, 요약은 `replan-2026-11-03-hook/preparation-verification.json`. 결말 예측 검사는 배치마다 뻔한 원고를 실제로 걸러냈고(첫 시도 기준 3편 중 1, 20편 중 9 등) 걸린 원응답은 배치 폴더에 보존한다. 11/3 18번은 23:00 heartbeat가 판정 사유 오독·settingEvidence(인물 호칭)·수동 사유 근거 공백으로 보류했고(`heartbeat-result.json`), 원고 보완과 새 독해·예측·판정 후 45분 창 안에 같은 게시 스크립트로 23:17 실게시했다(root 2117622245984288952, reply 2117622284336910614, `final-verification.json`·`manual-recheck.json`). 나머지 슬롯도 같은 기준으로 판정 사유와 장소 인용을 재감사했다.
+
 2026-11-02 추가 지시: “예정편성도 다 중단”. 미게시 편성48건을 `cancelled`로 변경했다. 향후 창작44건과 과거 보류 AAGAG4건이며, 원고·검수·보류 근거는 보존한다. 취소 편성을 자동 복원하지 않는다.
 
 2026-11-02 최신 지시: “창작글 게시 중단”. 창작글 게시를 중단하고 `daily-ten-policy.json.enabled=false`, 자동화 `5-aagag5`를 일시중지한다. 사용자의 명시적 재개 지시 전에는 게시하지 않는다. 기존 원고·게시물·영수증·이력과 AAGAG/기존212편 보류를 보존한다. 아래 운영 승인은 중단 전 기록이다.
@@ -39,6 +43,23 @@ Gemini 원응답이 유효한 JSON 배열로 반환된 경우도 원본 파일·
 이번 재검수 23편 중 4편(10/31-19, 11/01-05·12·19)은 소재 교체, 1편(11/01-13)은 독립 검수의 인용 근거 불일치로 재검수 보류했다. 변경 전 자료와 사유는 `editorial-comprehension-2026-10-31/revision-manifest.json`에 보존한다. 게시 가능한 수와 하루 목표 수를 구분하며 부족분을 완료로 보고하지 않는다.
 
 매 실행 전에 AGENTS.md와 로컬 AI memory, 전체 큐·게시 이력·최근 daily-ten 원고를 읽어 사건과 결말이 겹치는 소재를 제외한다. 창작은 인물 이름만 바꾼 재사용을 금지한다. 짧은 구어체와 대사로 상황을 진행하되 첫 글에서는 의문을 남기고 반전은 바로 다음 자기 답글에서 공개한다. 실제 제보나 본인 경험이라고 보증하지 않는다.
+
+### 결말 예측·후킹 검사 (2026-11-03)
+
+2026-11-02~04 창작 44편이 거의 모두 "선 넘는 요구 → 정중한 거절 → 상대 즉시 수긍" 구조였고 37편이 답글을 따옴표 거절 대사로 시작했다. 원인은 이전 `fictionEditorialPolicy.focus/rootReplyRule`의 "답글 첫머리에서 거절·합의로 해소" 규칙이다. `fictionEditorialPolicy.version=2026-11-03-hook-v1`부터 이 규칙을 바꾸고 `daily-ten-policy.json.fictionHookPolicy`를 따른다. 이전 문구는 `previousFocus/previousRootReplyRule`에 보존한다.
+
+- 결말 유형(`endingType`)과 하루 최대 편수: `reversal` 5, `comeback` 4, `punchline` 4, `self_own` 3, `open_verdict` 2, `heartwarming` 2, `polite_refusal` 2.
+- 원글: 이상한 첫 장면, 큰 판돈, 상대가 한 번 더 버팀, "한마디 했음"이 아니라 결말이 열린 구체적 순간에서 끊는다.
+- 답글: 결과·반전 장면으로 시작한다. 따옴표 대사 시작은 `punchline/polite_refusal`만 허용하고 하루 4편까지. 마지막 줄은 펀치라인이나 뒤집기이며 교훈형 정리는 쓰지 않는다.
+- 해외 생활 편은 그 나라에서만 생기는 사정(비자·시차·직장 문화·언어 실수·집주인)을 갈등 중심에 둔다.
+
+각 창작 원고의 `hook-review.json`에는 정책 `version`, `passed`, 최종 `postSha256/replySha256`, `endingType`, `manual.{rootEndsOnConcreteMoment,stakesConcrete,lastLineIsPayoff,reviewedAt,reason}`, `predictionReader.{provider:gemini_web_headless,inputFile,inputSha256,responseFile,responseSha256,id}`, `predictionJudge.{provider:gemini_web_headless,inputFile,inputSha256,responseFile,responseSha256,id}`를 저장한다.
+
+1. 예측 독자: 입력은 `{items:[{id,root}]}`만 허용한다(제목·답글·출처·이미지 금지). 원글만 보고 결말을 한 줄로 쓰게 해 `{items:[{id,predictedEnding}]}` 원응답을 보존한다.
+2. 예측 판정: 별도 호출에 `{items:[{id,predictedEnding,reply}]}`를 주고 실제 답글과 사실상 같은 결말인지 `{items:[{id,matches,reason}]}`로 받는다. `matches=true`이면 뻔한 결말로 반려하고 원글 또는 답글을 다시 쓴 뒤 두 단계를 새로 받는다.
+3. `lib/daily-story-hook-review.js`가 `plan-check/check/publish`에서 해시·증거·유형·따옴표 시작·같은 운영일 lineup(취소 제외)의 유형 상한과 따옴표 시작 상한을 검사한다. 원고를 고치면 해시만 바꾸지 않고 예측·판정을 다시 받는다. 이미 게시된 원고는 소급 강제하지 않는다.
+
+2026-11-02 편성 중단으로 취소된 44편은 자동 재활성화하지 않으며, 재사용하려면 이 검사를 새로 통과해야 한다. 이 검사의 실게시 E2E는 창작 게시 재개 후 첫 정상 슬롯에서 확인한다.
 
 ### 2026-10-30 창작 개편
 
